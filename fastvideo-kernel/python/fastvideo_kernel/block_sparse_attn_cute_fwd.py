@@ -1,8 +1,10 @@
-"""CuTe-DSL block-sparse attention forward kernel.
+"""Autograd-enabled CuTe-DSL block-sparse attention.
 
-Thin wrapper around `flash_attn.cute.interface._flash_attn_fwd` that adapts
+Thin wrapper around ``flash_attn.cute`` that adapts
 VSA's `(block_map, variable_block_sizes)` inputs into FA4's
-`BlockSparseTensorsTorch` representation and the per-KV-block validity mask.
+``BlockSparseTensorsTorch`` representation and the per-KV-block validity mask.
+The forward pass uses FA4's CuTe kernel and the backward pass uses FA4's native
+block-sparse backward with the transposed Q-by-KV index.
 
 Both [B, H, S, D] (BHSD) and [B, S, H, D] (BSHD) entrypoints are provided.
 The BSHD variant is preferred from VSA-256 callers to avoid layout
@@ -40,10 +42,10 @@ def _load_fa4_cute():
     """
     try:
         from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-        from flash_attn.cute.interface import _flash_attn_fwd
+        from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(_FA4_IMPORT_HINT) from exc
-    return BlockSparseTensorsTorch, _flash_attn_fwd
+    return BlockSparseTensorsTorch, _flash_attn_fwd, _flash_attn_bwd
 
 
 # Q-side tile size; kv_block_size comes from the caller's VSA logical KV block.
@@ -141,6 +143,196 @@ def _build_vbs_mask_mod(kv_block_size: int):
     return _vbs_mask_mod
 
 
+def _make_sparse_tensors(
+    mask_block_cnt: torch.Tensor,
+    mask_block_idx: torch.Tensor,
+    full_block_cnt: torch.Tensor,
+    full_block_idx: torch.Tensor,
+    q_sparse_block_size: int,
+    kv_block_size: int,
+):
+    BlockSparseTensorsTorch, _, _ = _load_fa4_cute()
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_sparse_block_size, kv_block_size),
+    )
+
+
+@torch.library.custom_op(
+    "fastvideo_kernel::block_sparse_attn_cute",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _block_sparse_attn_cute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask_block_cnt: torch.Tensor,
+    mask_block_idx: torch.Tensor,
+    full_block_cnt: torch.Tensor,
+    full_block_idx: torch.Tensor,
+    q_mask_block_cnt: torch.Tensor,
+    q_mask_block_idx: torch.Tensor,
+    q_full_block_cnt: torch.Tensor,
+    q_full_block_idx: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    q_sparse_block_size: int,
+    kv_block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run FA4 CuTe forward with BSHD tensors and sparse metadata."""
+    _, _flash_attn_fwd, _ = _load_fa4_cute()
+    sparse_tensors = _make_sparse_tensors(
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        q_sparse_block_size,
+        kv_block_size,
+    )
+    out, lse = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        tile_mn=(_M_BLOCK_SIZE_DEFAULT, kv_block_size),
+        mask_mod=_build_vbs_mask_mod(kv_block_size),
+        block_sparse_tensors=sparse_tensors,
+        aux_tensors=[variable_block_sizes],
+        causal=False,
+        return_lse=True,
+    )[:2]
+    return out, lse
+
+
+@torch.library.register_fake("fastvideo_kernel::block_sparse_attn_cute")
+def _block_sparse_attn_cute_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask_block_cnt: torch.Tensor,
+    mask_block_idx: torch.Tensor,
+    full_block_cnt: torch.Tensor,
+    full_block_idx: torch.Tensor,
+    q_mask_block_cnt: torch.Tensor,
+    q_mask_block_idx: torch.Tensor,
+    q_full_block_cnt: torch.Tensor,
+    q_full_block_idx: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    q_sparse_block_size: int,
+    kv_block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del (
+        k,
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        q_mask_block_cnt,
+        q_mask_block_idx,
+        q_full_block_cnt,
+        q_full_block_idx,
+        variable_block_sizes,
+        q_sparse_block_size,
+        kv_block_size,
+    )
+    out = q.new_empty(q.shape[:-1] + (v.shape[-1],))
+    lse = q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
+    return out, lse
+
+
+def _setup_context_cute(ctx, inputs, output) -> None:
+    (
+        q,
+        k,
+        v,
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        q_mask_block_cnt,
+        q_mask_block_idx,
+        q_full_block_cnt,
+        q_full_block_idx,
+        variable_block_sizes,
+        q_sparse_block_size,
+        kv_block_size,
+    ) = inputs
+    del (
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+    )
+    out, lse = output
+    ctx.save_for_backward(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        q_mask_block_cnt,
+        q_mask_block_idx,
+        q_full_block_cnt,
+        q_full_block_idx,
+        variable_block_sizes,
+    )
+    ctx.q_sparse_block_size = q_sparse_block_size
+    ctx.kv_block_size = kv_block_size
+
+
+def _backward_cute(ctx, grad_out, grad_lse):
+    del grad_lse
+    (
+        q,
+        k,
+        v,
+        out,
+        lse,
+        q_mask_block_cnt,
+        q_mask_block_idx,
+        q_full_block_cnt,
+        q_full_block_idx,
+        variable_block_sizes,
+    ) = ctx.saved_tensors
+    if grad_out is None:
+        grad_out = torch.zeros_like(out)
+    _, _, _flash_attn_bwd = _load_fa4_cute()
+    sparse_tensors_bwd = _make_sparse_tensors(
+        q_mask_block_cnt,
+        q_mask_block_idx,
+        q_full_block_cnt,
+        q_full_block_idx,
+        ctx.q_sparse_block_size,
+        ctx.kv_block_size,
+    )
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        grad_out.contiguous(),
+        lse,
+        softmax_scale=None,
+        causal=False,
+        softcap=0.0,
+        window_size_left=None,
+        window_size_right=None,
+        deterministic=False,
+        mask_mod=_build_vbs_mask_mod(ctx.kv_block_size),
+        aux_tensors=[variable_block_sizes],
+        block_sparse_tensors=sparse_tensors_bwd,
+    )
+    return dq, dk, dv, *((None,) * 11)
+
+
+_block_sparse_attn_cute.register_autograd(
+    _backward_cute,
+    setup_context=_setup_context_cute,
+)
+
+
 def _cute_forward(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
@@ -152,7 +344,6 @@ def _cute_forward(
     kv_block_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Internal: FA4 CuTe BSA fwd with BSHD inputs."""
-    BlockSparseTensorsTorch, _flash_attn_fwd = _load_fa4_cute()
     q_sparse_candidate = _choose_q_sparse_block_size(q_bshd.shape[1])
     q_sparse_block_size = max(
         q_block_size,
@@ -173,27 +364,31 @@ def _cute_forward(
     full_block_idx, full_block_cnt = _map_to_index(full_map)
     mask_block_idx, mask_block_cnt = _map_to_index(mask_map)
 
-    sparse_tensors = BlockSparseTensorsTorch(
-        full_block_cnt=full_block_cnt.to(torch.int32).contiguous(),
-        full_block_idx=full_block_idx.to(torch.int32).contiguous(),
-        mask_block_cnt=mask_block_cnt.to(torch.int32).contiguous(),
-        mask_block_idx=mask_block_idx.to(torch.int32).contiguous(),
-        block_size=(q_sparse_block_size, kv_block_size),
+    # FA4 backward iterates the transposed sparse map: each KV block stores
+    # the query blocks that selected it.
+    q_full_block_idx, q_full_block_cnt = _map_to_index(
+        full_map.transpose(-2, -1).contiguous()
+    )
+    q_mask_block_idx, q_mask_block_cnt = _map_to_index(
+        mask_map.transpose(-2, -1).contiguous()
     )
 
-    # _flash_attn_fwd returns (out, lse, p, row_max); keep the first two.
-    out, lse = _flash_attn_fwd(
+    return _block_sparse_attn_cute(
         q_bshd,
         k_bshd,
         v_bshd,
-        tile_mn=(_M_BLOCK_SIZE_DEFAULT, kv_block_size),
-        mask_mod=_build_vbs_mask_mod(kv_block_size),
-        block_sparse_tensors=sparse_tensors,
-        aux_tensors=[variable_block_sizes],
-        causal=False,
-        return_lse=True,
-    )[:2]
-    return out, lse
+        mask_block_cnt.to(torch.int32).contiguous(),
+        mask_block_idx.to(torch.int32).contiguous(),
+        full_block_cnt.to(torch.int32).contiguous(),
+        full_block_idx.to(torch.int32).contiguous(),
+        q_mask_block_cnt.to(torch.int32).contiguous(),
+        q_mask_block_idx.to(torch.int32).contiguous(),
+        q_full_block_cnt.to(torch.int32).contiguous(),
+        q_full_block_idx.to(torch.int32).contiguous(),
+        variable_block_sizes.to(torch.int32).contiguous(),
+        q_sparse_block_size,
+        kv_block_size,
+    )
 
 
 def block_sparse_attn_cute_fwd(
@@ -203,7 +398,7 @@ def block_sparse_attn_cute_fwd(
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CuTe forward-only block-sparse attention with [B, H, S, D] inputs."""
+    """Autograd-enabled CuTe block-sparse attention for [B, H, S, D]."""
     if block_map.dim() == 3:
         block_map = block_map.unsqueeze(0)
     q_block_size = q.shape[2] // block_map.shape[2]
@@ -229,7 +424,7 @@ def block_sparse_attn_cute_fwd(
             device=q.device,
         )
     else:
-        lse = lse_bshd.transpose(1, 2).contiguous()
+        lse = lse_bshd
     return out, lse
 
 
@@ -240,7 +435,7 @@ def block_sparse_attn_cute_fwd_bshd(
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CuTe forward-only block-sparse attention with [B, S, H, D] inputs."""
+    """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
     if block_map.dim() == 3:
         block_map = block_map.unsqueeze(0)
     q_block_size = q.shape[1] // block_map.shape[2]
@@ -262,5 +457,5 @@ def block_sparse_attn_cute_fwd_bshd(
             device=q.device,
         )
     else:
-        lse = lse_bshd.transpose(1, 2).contiguous()
+        lse = lse_bshd
     return out, lse

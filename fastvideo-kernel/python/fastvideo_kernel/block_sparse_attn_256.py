@@ -4,7 +4,7 @@ The default 256-block path is Triton: it expands the logical 256-block map
 to the existing 64-block Triton kernel via a dense 4x4 expansion per logical
 edge ("route A"), and requires no optional dependencies.
 
-The FA4 CuTe block-sparse fastpath (intended for Blackwell sm_100+) is
+The autograd-enabled FA4 CuTe block-sparse fastpath (intended for Blackwell sm_100+) is
 *opt-in* via ``FASTVIDEO_VSA_CUTEDSL=1``. It routes to
 :mod:`fastvideo_kernel.block_sparse_attn_cute_fwd`, which natively operates
 on 128-token KV blocks (this wrapper expands the logical 256-block map /

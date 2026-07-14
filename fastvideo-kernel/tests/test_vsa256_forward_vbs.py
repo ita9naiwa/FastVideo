@@ -1,4 +1,4 @@
-"""VSA-256 CuTe correctness with variable KV block sizes (<256)."""
+"""VSA-256 CuTe forward/backward correctness with partial KV blocks."""
 
 from __future__ import annotations
 
@@ -41,9 +41,23 @@ def _torch_vsa256_reference(
     q_c = q.view(bsz, heads, q_blocks, q_block, dim)
     k_c = k.view(bsz, heads, kv_blocks, kv_block, dim)
     v_c = v.view(bsz, heads, kv_blocks, kv_block, dim)
-    q_c = (q_c.float().sum(dim=3) / q_var.view(1, 1, -1, 1)).to(q.dtype)
-    k_c = (k_c.float().sum(dim=3) / kv_var.view(1, 1, -1, 1)).to(k.dtype)
-    v_c = (v_c.float().sum(dim=3) / kv_var.view(1, 1, -1, 1)).to(v.dtype)
+    q_valid = (
+        torch.arange(q_block, device=q.device).view(1, -1)
+        < q_var.view(-1, 1)
+    ).view(1, 1, q_blocks, q_block, 1)
+    kv_valid = (
+        torch.arange(kv_block, device=k.device).view(1, -1)
+        < kv_var.view(-1, 1)
+    ).view(1, 1, kv_blocks, kv_block, 1)
+    q_c = (
+        (q_c.float() * q_valid).sum(dim=3) / q_var.view(1, 1, -1, 1)
+    ).to(q.dtype)
+    k_c = (
+        (k_c.float() * kv_valid).sum(dim=3) / kv_var.view(1, 1, -1, 1)
+    ).to(k.dtype)
+    v_c = (
+        (v_c.float() * kv_valid).sum(dim=3) / kv_var.view(1, 1, -1, 1)
+    ).to(v.dtype)
 
     scores = torch.matmul(q_c, k_c.transpose(-2, -1)) / math.sqrt(dim)
     attn = torch.softmax(scores, dim=-1)
@@ -77,8 +91,16 @@ def _torch_vsa256_reference(
     return out_c + out_s
 
 
+def _metrics(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
+    diff = (a - b).abs()
+    return (
+        diff.mean().item(),
+        (diff.max() / (a.abs().mean() + 1e-6)).item(),
+    )
+
+
 @pytest.mark.cuda
-def test_vsa256_cute_variable_block_size_vs_torch_ref() -> None:
+def test_vsa256_cute_variable_block_size_forward_backward_vs_torch_ref() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
@@ -94,9 +116,10 @@ def test_vsa256_cute_variable_block_size_vs_torch_ref() -> None:
     sq = q_blocks_256 * q_block
     skv = kv_blocks_256 * kv_block
 
-    q = torch.randn(bsz, heads, sq, dim, device=device, dtype=dtype)
-    k = torch.randn(bsz, heads, skv, dim, device=device, dtype=dtype)
-    v = torch.randn(bsz, heads, skv, dim, device=device, dtype=dtype)
+    q_base = torch.randn(bsz, heads, sq, dim, device=device, dtype=dtype)
+    k_base = torch.randn(bsz, heads, skv, dim, device=device, dtype=dtype)
+    v_base = torch.randn(bsz, heads, skv, dim, device=device, dtype=dtype)
+    grad_out = torch.randn_like(q_base)
 
     q_var = torch.full((q_blocks_256,), q_block, dtype=torch.int32, device=device)
     kv_var = torch.randint(16, kv_block + 1, (kv_blocks_256,), dtype=torch.int32, device=device)
@@ -104,9 +127,12 @@ def test_vsa256_cute_variable_block_size_vs_torch_ref() -> None:
     kv_valid = token_idx.view(1, -1) < kv_var.view(-1, 1)
     kv_valid = kv_valid.view(1, 1, kv_blocks_256, kv_block, 1)
     kv_valid = kv_valid.expand(bsz, heads, kv_blocks_256, kv_block, dim).reshape(bsz, heads, skv, dim)
-    k = k * kv_valid.to(k.dtype)
-    v = v * kv_valid.to(v.dtype)
+    k_base = k_base * kv_valid.to(k_base.dtype)
+    v_base = v_base * kv_valid.to(v_base.dtype)
 
+    q = q_base.detach().clone().requires_grad_(True)
+    k = k_base.detach().clone().requires_grad_(True)
+    v = v_base.detach().clone().requires_grad_(True)
     out = video_sparse_attn(
         q, k, v,
         kv_var,
@@ -115,15 +141,34 @@ def test_vsa256_cute_variable_block_size_vs_torch_ref() -> None:
         block_size=(4, 8, 8),
         compress_attn_weight=None,
     )
-    out_ref = _torch_vsa256_reference(q, k, v, q_var, kv_var, topk_logical)
+    (out * grad_out).sum().backward()
 
-    diff = (out - out_ref).abs()
-    avg_abs = diff.mean().item()
-    max_rel = (diff.max() / (out_ref.abs().mean() + 1e-6)).item()
+    q_ref = q_base.detach().clone().requires_grad_(True)
+    k_ref = k_base.detach().clone().requires_grad_(True)
+    v_ref = v_base.detach().clone().requires_grad_(True)
+    out_ref = _torch_vsa256_reference(
+        q_ref, k_ref, v_ref, q_var, kv_var, topk_logical
+    )
+    (out_ref * grad_out).sum().backward()
+
+    for tensor in (out, q.grad, k.grad, v.grad):
+        assert tensor is not None
+        assert torch.isfinite(tensor).all().item()
+
+    m_out = _metrics(out_ref, out)
+    m_dq = _metrics(q_ref.grad, q.grad)
+    m_dk = _metrics(k_ref.grad, k.grad)
+    m_dv = _metrics(v_ref.grad, v.grad)
     print(
         f"[vsa256-cute-vbs] kv_var[min={int(kv_var.min().item())}, "
         f"max={int(kv_var.max().item())}], "
-        f"avg_abs={avg_abs:.6e}, max_rel={max_rel:.6e}"
+        f"out(avg_abs={m_out[0]:.6e}, max_rel={m_out[1]:.6e}), "
+        f"dq(avg_abs={m_dq[0]:.6e}, max_rel={m_dq[1]:.6e}), "
+        f"dk(avg_abs={m_dk[0]:.6e}, max_rel={m_dk[1]:.6e}), "
+        f"dv(avg_abs={m_dv[0]:.6e}, max_rel={m_dv[1]:.6e})"
     )
 
-    assert avg_abs < 1e-3 and max_rel < 0.2
+    assert m_out[0] < 1e-3 and m_out[1] < 0.2
+    assert m_dq[0] < 2e-2 and m_dq[1] < 0.5
+    assert m_dk[0] < 2e-2 and m_dk[1] < 0.5
+    assert m_dv[0] < 2e-2 and m_dv[1] < 0.5
