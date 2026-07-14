@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dense LingBot-Video T2V pipeline configuration."""
+"""LingBot-Video T2V and TI2V pipeline configurations."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -9,25 +9,22 @@ import torch
 from fastvideo.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from fastvideo.configs.models.dits.lingbot_video import LingBotVideoConfig
 from fastvideo.configs.models.encoders import BaseEncoderOutput
-from fastvideo.configs.models.encoders.lingbot_video import LingBotVideoQwen3VLTextConfig
+from fastvideo.configs.models.encoders.lingbot_video import LingBotVideoQwen3VLConfig
 from fastvideo.configs.models.vaes import WanVAEConfig
 from fastvideo.configs.pipelines.base import PipelineConfig
 
-
 PROMPT_CROP_START = 140
-PROMPT_TEMPLATE = (
-    "<|im_start|>system\nGiven a user input that may include a text prompt alone, "
-    "a text prompt with an image reference, or a text prompt with a video reference "
-    'or a video reference alone, generate an "Enhanced prompt" that provides detailed '
-    "visual descriptions suitable for video generation. Evaluate the level of detail "
-    "in the user's input: if it is simple, enrich it by adding specifics about colors, "
-    "shapes, sizes, textures, lighting, motion dynamics, camera movement, temporal "
-    "progression, and spatial relationships to create vivid, concrete, and temporally "
-    "coherent scenes to create vivid and concrete scenes. Please generate only the "
-    "enhanced description for the prompt below and avoid including any additional "
-    "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
+PROMPT_TEMPLATE = ("<|im_start|>system\nGiven a user input that may include a text prompt alone, "
+                   "a text prompt with an image reference, or a text prompt with a video reference "
+                   'or a video reference alone, generate an "Enhanced prompt" that provides detailed '
+                   "visual descriptions suitable for video generation. Evaluate the level of detail "
+                   "in the user's input: if it is simple, enrich it by adding specifics about colors, "
+                   "shapes, sizes, textures, lighting, motion dynamics, camera movement, temporal "
+                   "progression, and spatial relationships to create vivid, concrete, and temporally "
+                   "coherent scenes to create vivid and concrete scenes. Please generate only the "
+                   "enhanced description for the prompt below and avoid including any additional "
+                   "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
+                   "<|im_start|>assistant\n")
 
 
 def preprocess_lingbot_video_prompt(prompt: str) -> str:
@@ -57,10 +54,10 @@ class LingBotVideoT2VConfig(PipelineConfig):
 
     dit_config: DiTConfig = field(default_factory=LingBotVideoConfig)
     vae_config: VAEConfig = field(default_factory=WanVAEConfig)
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(default_factory=lambda: (LingBotVideoQwen3VLTextConfig(),))
-    preprocess_text_funcs: tuple[Callable, ...] = field(default_factory=lambda: (preprocess_lingbot_video_prompt,))
-    postprocess_text_funcs: tuple[Callable, ...] = field(default_factory=lambda: (postprocess_lingbot_video_text,))
-    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(default_factory=lambda: (LingBotVideoQwen3VLConfig(), ))
+    preprocess_text_funcs: tuple[Callable, ...] = field(default_factory=lambda: (preprocess_lingbot_video_prompt, ))
+    postprocess_text_funcs: tuple[Callable, ...] = field(default_factory=lambda: (postprocess_lingbot_video_text, ))
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16", ))
     dit_precision: str = "bf16"
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = "fp32"
@@ -73,4 +70,14 @@ class LingBotVideoT2VConfig(PipelineConfig):
     def __post_init__(self) -> None:
         """Load only the VAE decoder for the T2V workload."""
         self.vae_config.load_encoder = False
+        self.vae_config.load_decoder = True
+
+
+@dataclass
+class LingBotVideoTI2VConfig(LingBotVideoT2VConfig):
+    """TI2V wiring with the compound Qwen3-VL model and VAE encoder."""
+
+    def __post_init__(self) -> None:
+        """Load both VAE directions while custom stages preserve LingBot geometry."""
+        self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
