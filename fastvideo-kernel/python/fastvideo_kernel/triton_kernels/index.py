@@ -51,12 +51,17 @@ def map_to_index_kernel(
     index_ptr_base = index_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride
     map_ptr_base = map_ptr + b * map_bs_stride + h * map_h_stride + q * map_q_stride
 
+    # Compact each chunk in parallel while retaining ascending KV traversal.
     num = 0
-    for i in tl.range(num_kv_blocks):
-        map_entry = tl.load(map_ptr_base + i * map_kv_stride)
-        if map_entry:
-            tl.store(index_ptr_base + num * index_kv_stride, i)
-            num += 1
+    lanes = tl.arange(0, 256)
+    for start in tl.range(0, num_kv_blocks, 256):
+        positions = start + lanes
+        selected = tl.load(map_ptr_base + positions * map_kv_stride,
+                           mask=positions < num_kv_blocks, other=0) != 0
+        ranks = tl.cumsum(selected.to(tl.int32))
+        tl.store(index_ptr_base + (num + ranks - 1) * index_kv_stride,
+                 positions, mask=selected)
+        num += tl.sum(selected.to(tl.int32))
 
     tl.store(index_num_ptr + b * index_num_bs_stride + h * index_num_h_stride + q * index_num_q_stride, num)
 
