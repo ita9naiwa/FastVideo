@@ -11,6 +11,7 @@ from .block_sparse_attn_256 import (
 )
 from .triton_kernels.st_attn_triton import sliding_tile_attention_triton
 from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask, _fork_block_mean_bshd, _combine_weighted_bshd
+from .triton_kernels.fused_compress_topk import _ForkBlockMeanBHSD, _fork_bhsd_admitted
 
 # Try to load the C++ extension
 try:
@@ -111,9 +112,14 @@ def video_sparse_attn(
                          f"got {q_variable_block_sizes.numel()}")
 
     # Compression branch (fused Triton: bf16 read → fp32 accumulate → div → bf16 write)
-    q_c = fused_block_mean(q, q_variable_block_sizes, block_elements)
-    k_c = fused_block_mean(k, variable_block_sizes, block_elements)
-    v_c = fused_block_mean(v, variable_block_sizes, block_elements)
+    if _fork_bhsd_admitted((q, k, v), variable_block_sizes, q_variable_block_sizes, block_elements):
+        q, q_c = _ForkBlockMeanBHSD.apply(q, q_variable_block_sizes, block_elements)
+        k, k_c = _ForkBlockMeanBHSD.apply(k, variable_block_sizes, block_elements)
+        v, v_c = _ForkBlockMeanBHSD.apply(v, variable_block_sizes, block_elements)
+    else:
+        q_c = fused_block_mean(q, q_variable_block_sizes, block_elements)
+        k_c = fused_block_mean(k, variable_block_sizes, block_elements)
+        v_c = fused_block_mean(v, variable_block_sizes, block_elements)
 
     scores = torch.matmul(q_c, k_c.transpose(-2, -1)) / (dim**0.5)
     attn = torch.softmax(scores, dim=-1)

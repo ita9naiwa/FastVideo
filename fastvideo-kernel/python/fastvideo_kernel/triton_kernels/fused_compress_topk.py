@@ -206,6 +206,49 @@ class _FusedBlockMeanAutograd(torch.autograd.Function):
         return _fused_block_mean_bwd(grad_output, variable_block_sizes, block_elements), None, None
 
 
+class _ForkBlockMeanBHSD(_FusedBlockMeanAutograd):
+    """Join fine and pooled gradients without changing the BHSD mean operator."""
+
+    @staticmethod
+    def forward(ctx, x, sizes, block):
+        ctx.set_materialize_grads(False)
+        pooled = _FusedBlockMeanAutograd.forward(ctx, x, sizes, block)
+        return x.view_as(x), pooled
+
+    @staticmethod
+    def backward(ctx, fine, coarse):
+        if coarse is None:
+            return fine, None, None
+        if (fine is None or torch.is_grad_enabled()
+                or not (fine.is_contiguous() or fine.transpose(1, 2).is_contiguous())):
+            expanded, _, _ = _FusedBlockMeanAutograd.backward(ctx, coarse)
+            return expanded if fine is None else fine + expanded, None, None
+        sizes, = ctx.saved_tensors
+        coarse = coarse.contiguous()
+        b, h, nb, d = coarse.shape
+        out = torch.empty_like(fine)
+        _fused_block_mean_bwd_kernel[(nb, b * h)](
+            coarse, out, sizes, coarse.stride(1), coarse.stride(2),
+            out.stride(0), out.stride(1), h, out.stride(2), nb,
+            BLOCK_ELEMENTS=ctx.block_elements, HEAD_DIM=d,
+            OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[coarse.dtype], EXACT_DIV=False,
+            FineGrad_ptr=fine,
+        )
+        return out, None, None
+
+
+def _fork_bhsd_admitted(tensors, sizes, qsizes, block):
+    if not (torch.is_grad_enabled() and any(x.requires_grad for x in tensors)
+            and block == 128 and all(x.is_cuda and x.device == tensors[0].device and x.dtype == torch.bfloat16
+                and x.shape[-1] == 128 and (x.is_contiguous() or x.transpose(1, 2).is_contiguous())
+                for x in tensors)
+            and all(s.is_contiguous() and s.device == tensors[0].device
+                and s.dtype in (torch.int32, torch.int64) for s in (sizes, qsizes))):
+        return False
+    spans = [(x.data_ptr(), x.data_ptr() + x.numel() * x.element_size()) for x in tensors]
+    return all(a1 <= b0 or b1 <= a0 for i, (a0, a1) in enumerate(spans) for b0, b1 in spans[i + 1:])
+
+
 def fused_block_mean(
     x: torch.Tensor,
     variable_block_sizes: torch.Tensor,
