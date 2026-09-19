@@ -367,14 +367,14 @@ class _FusedBlockMeanBSHD(torch.autograd.Function):
         assert x.stride(-1) == 1 and d in (64, 128) and seq % block == 0
         ctx.save_for_backward(sizes)
         ctx.block = block
-        out = torch.empty(b, h, seq // block, d, device=x.device, dtype=x.dtype)
-        _fused_block_mean_kernel[(seq // block, b * h)](
-            x, out, sizes, x.stride(0), x.stride(2), h, x.stride(1),
-            out.stride(1), out.stride(2), seq // block,
-            BLOCK_ELEMENTS=block, HEAD_DIM=d, OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[x.dtype],
-            EXACT_DIV=True,
-        )
-        return out
+        # Preserve ATen's reduction order: cancellation can otherwise change
+        # discrete top-k routes. Accumulate in FP32 without a full FP32 copy.
+        blocks = x.view(b, seq // block, block, h, d)
+        # Match original float() conversion for strided or offset inputs.
+        pooled = (blocks.sum(dim=2, dtype=torch.float32) if x.is_contiguous() and x.storage_offset() == 0 and x.data_ptr() % 16 == 0
+                  else blocks.float().sum(dim=2))
+        pooled = (pooled / sizes.view(1, -1, 1, 1)).to(x.dtype)
+        return pooled.permute(0, 2, 1, 3).contiguous()
 
     @staticmethod
     def backward(ctx, grad):
@@ -397,7 +397,7 @@ class _FusedBlockMeanBSHD(torch.autograd.Function):
 
 
 def fused_block_mean_bshd(x: torch.Tensor, sizes: torch.Tensor, block: int) -> torch.Tensor:
-    """Compress BSHD blocks directly to BHND without a full FP32 temporary.
+    """Compress BSHD blocks to BHND; aligned contiguous inputs avoid an FP32 copy.
 
     As in the original compression expression, padding participates in the sum
     and backward broadcasts to every padded slot. The caller supplies zero

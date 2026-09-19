@@ -195,8 +195,10 @@ This package also includes kernels from [TurboDiffusion](https://github.com/thu-
 
 ## BSHD VSA compression and optional output fusion
 
-`video_sparse_attn_bshd` reuses the fused block-mean kernels for 128/256-token
-blocks without materializing full FP32 Q/K/V copies. Padding must remain zero,
+`video_sparse_attn_bshd` uses native FP32 accumulation and fused broadcast
+gradients for 128/256-token blocks. Aligned contiguous inputs with zero storage
+offset avoid full FP32 Q/K/V copies; other layouts retain the original forward
+expression. Cancellation tests cover pooled values and top-k routing. Padding must remain zero,
 just as in the original expression; gradients are broadcast to every padded
 slot. Unsupported layouts retain the PyTorch expression.
 
