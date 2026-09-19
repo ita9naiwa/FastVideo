@@ -103,6 +103,26 @@ def topk_index_to_map(index: torch.Tensor, num_kv_blocks: int, transpose_map: bo
     return block_map
 
 
+@triton.jit
+def _map_to_index_parallel_kernel(
+    map_ptr, index_ptr, count_ptr,
+    stride_b: tl.constexpr, stride_h: tl.constexpr,
+    stride_q: tl.constexpr, stride_k: tl.constexpr,
+    H: tl.constexpr, Q: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    b, h, q = row // (H * Q), row // Q % H, row % Q
+    col = tl.arange(0, BLOCK)
+    selected = tl.load(map_ptr + b * stride_b + h * stride_h + q * stride_q + col * stride_k,
+                       col < N, other=False)
+    rank = tl.cumsum(selected.to(tl.int32), 0) - 1
+    count = tl.sum(selected.to(tl.int32), 0)
+    # Selected entries and padding own disjoint destinations.
+    tl.store(index_ptr + row * N + col, -1, (col < N) & (col >= count))
+    tl.store(index_ptr + row * N + rank, col, selected)
+    tl.store(count_ptr + row, count)
+
+
 def map_to_index(block_map: torch.Tensor):
     """
     Convert a block map to indices and counts.
@@ -118,6 +138,16 @@ def map_to_index(block_map: torch.Tensor):
             The number of blocks for each q block.
     """
     bs, h, num_q_blocks, num_kv_blocks = block_map.shape
+
+    if block_map.dtype == torch.bool and num_kv_blocks <= 4096:
+        index = torch.empty(block_map.shape, dtype=torch.int32, device=block_map.device)
+        index_num = torch.empty((bs, h, num_q_blocks), dtype=torch.int32, device=block_map.device)
+        if bs * h * num_q_blocks:
+            _map_to_index_parallel_kernel[(bs * h * num_q_blocks,)](
+                block_map, index, index_num, *block_map.stride(), h, num_q_blocks,
+                num_kv_blocks, triton.next_power_of_2(max(1, num_kv_blocks)),
+            )
+        return index, index_num
 
     index = torch.full((block_map.shape), -1, dtype=torch.int32, device=block_map.device)
     index_num = torch.empty((bs, h, num_q_blocks), dtype=torch.int32, device=block_map.device)
