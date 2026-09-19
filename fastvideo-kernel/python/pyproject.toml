@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastvideo-kernel"
+version = "0.3.5"
+description = "FastVideo Python VSA and VC adapters without compiled extensions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "torch>=2.14,<2.15",
+    "triton>=2.0.0; sys_platform == 'linux'",
+    "einops",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastvideo_kernel*"]
+
+[tool.setuptools.package-data]
+fastvideo_kernel = ["py.typed"]
