@@ -225,6 +225,12 @@ Other layouts use the eager path. Each new shape can incur compilation cost;
 warm up the chosen shapes before CUDA Graph capture or steady-state timing.
 The attention backend and sparse routing are unchanged.
 
+The native 256-token BSHD training path also accepts aligned BF16 views such as
+packed QKV, sequence strides and head transposes: the last stride must be one,
+the pointer 16-byte aligned, and outer strides positive multiples of eight
+elements. Existing contiguous admission is preserved. Inference and unsupported
+layouts retain their previous dispatch; the public auxiliary LSE stays detached.
+
 ## Acknowledgement
 
 This package structure and build system are based on [sgl-kernel](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) from the SGLang project.

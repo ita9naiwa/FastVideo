@@ -241,7 +241,9 @@ def block_sparse_attn_256_bshd(
             and q.shape[0] == k.shape[0] == v.shape[0]
             and q.shape[2] == k.shape[2] == v.shape[2]
             and k.shape[1] == v.shape[1]
-            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+            and all(t.is_contiguous() or (t.stride(-1) == 1 and t.data_ptr() % 16 == 0
+                                         and all(s > 0 and s % 8 == 0 for s in t.stride()[:-1]))
+                    for t in (q, k, v))
             and q.shape[1] == logical_block_map_256.shape[2] * 256
             and k.shape[1] == logical_block_map_256.shape[3] * 256
             and logical_block_map_256.shape[:2] == (q.shape[0], q.shape[2])
