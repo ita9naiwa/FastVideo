@@ -42,8 +42,9 @@ def _fused_block_mean_kernel(
     Out is [B*H, num_blocks, HEAD_DIM] contiguous.
     2D load + parallel tl.sum reduction, accumulates in fp32.
     """
-    block_idx = tl.program_id(0)
-    bh_idx = tl.program_id(1)
+    # Widen before stride products: supported tensors can exceed 2**31 elements.
+    block_idx = tl.program_id(0).to(tl.int64)
+    bh_idx = tl.program_id(1).to(tl.int64)
 
     if block_idx >= num_blocks:
         return
@@ -88,8 +89,8 @@ def _fused_block_mean_bwd_kernel(
     GradX  is [B*H, num_blocks*BLOCK_ELEMENTS, HEAD_DIM].
     2D store writes all BLOCK_ELEMENTS rows in parallel.
     """
-    block_idx = tl.program_id(0)
-    bh_idx = tl.program_id(1)
+    block_idx = tl.program_id(0).to(tl.int64)
+    bh_idx = tl.program_id(1).to(tl.int64)
 
     if block_idx >= num_blocks:
         return
