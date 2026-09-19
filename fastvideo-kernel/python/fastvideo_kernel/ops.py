@@ -10,8 +10,15 @@ from .block_sparse_attn_256 import (
     block_sparse_attn_256_bshd,
 )
 from .triton_kernels.st_attn_triton import sliding_tile_attention_triton
-from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask, _fork_block_mean_bshd, _combine_weighted_bshd
-from .triton_kernels.fused_compress_topk import _ForkBlockMeanBHSD, _fork_bhsd_admitted
+from .triton_kernels.fused_compress_topk import (
+    _ForkBlockMeanBHSD,
+    _combine_weighted_bshd,
+    _fork_bhsd_admitted,
+    _fork_block_mean_bshd,
+    fused_block_mean,
+    fused_block_mean_bshd,
+    fused_topk_mask,
+)
 
 # Try to load the C++ extension
 try:
@@ -65,6 +72,31 @@ def sliding_tile_attention(
     return output[:, :, :seq_length]
 
 
+def _validate_vsa_inputs(q, k, v, variable_block_sizes, q_variable_block_sizes, block_elements, *, seq_axis):
+    """Share shape checks between BHSD (axis 2) and BSHD (axis 1)."""
+    head_axis = 3 - seq_axis
+    batch, heads = q.shape[0], q.shape[head_axis]
+    q_seq_len, kv_seq_len = q.shape[seq_axis], k.shape[seq_axis]
+    if k.shape[0] != batch or v.shape[0] != batch or k.shape[head_axis] != heads or v.shape[head_axis] != heads:
+        raise ValueError("Expected q/k/v to have the same batch and head dimensions.")
+    if v.shape[seq_axis] != kv_seq_len:
+        raise ValueError(f"Expected k and v to have the same sequence length, got "
+                         f"k.shape[{seq_axis}]={kv_seq_len}, v.shape[{seq_axis}]={v.shape[seq_axis]}")
+
+    if q_seq_len % block_elements != 0 or kv_seq_len % block_elements != 0:
+        raise ValueError(f"q_seq_len and kv_seq_len must be divisible by block_elements={block_elements}, "
+                         f"got q_seq_len={q_seq_len}, kv_seq_len={kv_seq_len}")
+    q_num_blocks = q_seq_len // block_elements
+    kv_num_blocks = kv_seq_len // block_elements
+    if variable_block_sizes.numel() != kv_num_blocks:
+        raise ValueError(f"variable_block_sizes must have length kv_num_blocks={kv_num_blocks}, "
+                         f"got {variable_block_sizes.numel()}")
+    if q_variable_block_sizes.numel() != q_num_blocks:
+        raise ValueError(f"q_variable_block_sizes must have length q_num_blocks={q_num_blocks}, "
+                         f"got {q_variable_block_sizes.numel()}")
+    return q_num_blocks
+
+
 def video_sparse_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -92,24 +124,9 @@ def video_sparse_attn(
     block_elements = block_size[0] * block_size[1] * block_size[2]
 
     batch, heads, q_seq_len, dim = q.shape
-    kv_seq_len = k.shape[2]
-    if k.shape[0] != batch or v.shape[0] != batch or k.shape[1] != heads or v.shape[1] != heads:
-        raise ValueError("Expected q/k/v to have the same batch and head dimensions.")
-    if v.shape[2] != kv_seq_len:
-        raise ValueError(f"Expected k and v to have the same sequence length, got "
-                         f"k.shape[2]={kv_seq_len}, v.shape[2]={v.shape[2]}")
-
-    if q_seq_len % block_elements != 0 or kv_seq_len % block_elements != 0:
-        raise ValueError(f"q_seq_len and kv_seq_len must be divisible by block_elements={block_elements}, "
-                         f"got q_seq_len={q_seq_len}, kv_seq_len={kv_seq_len}")
-    q_num_blocks = q_seq_len // block_elements
-    kv_num_blocks = kv_seq_len // block_elements
-    if variable_block_sizes.numel() != kv_num_blocks:
-        raise ValueError(f"variable_block_sizes must have length kv_num_blocks={kv_num_blocks}, "
-                         f"got {variable_block_sizes.numel()}")
-    if q_variable_block_sizes.numel() != q_num_blocks:
-        raise ValueError(f"q_variable_block_sizes must have length q_num_blocks={q_num_blocks}, "
-                         f"got {q_variable_block_sizes.numel()}")
+    q_num_blocks = _validate_vsa_inputs(
+        q, k, v, variable_block_sizes, q_variable_block_sizes, block_elements, seq_axis=2,
+    )
 
     # Compression branch (fused Triton: bf16 read → fp32 accumulate → div → bf16 write)
     forked = _fork_bhsd_admitted((q, k, v), variable_block_sizes, q_variable_block_sizes, block_elements)
@@ -204,24 +221,10 @@ def video_sparse_attn_bshd(
         raise ValueError("video_sparse_attn_bshd is only defined for block_elements=128 or 256 "
                          f"(got {block_elements}); use video_sparse_attn for the 64-block path.")
 
-    batch, q_seq_len, heads, dim = q.shape
-    kv_seq_len = k.shape[1]
-    if k.shape[0] != batch or v.shape[0] != batch or k.shape[2] != heads or v.shape[2] != heads:
-        raise ValueError("Expected q/k/v to have the same batch and head dimensions.")
-    if v.shape[1] != kv_seq_len:
-        raise ValueError(f"Expected k and v to have the same sequence length, got "
-                         f"k.shape[1]={kv_seq_len}, v.shape[1]={v.shape[1]}")
-    if q_seq_len % block_elements != 0 or kv_seq_len % block_elements != 0:
-        raise ValueError(f"q_seq_len and kv_seq_len must be divisible by block_elements={block_elements}, "
-                         f"got q_seq_len={q_seq_len}, kv_seq_len={kv_seq_len}")
-    q_num_blocks = q_seq_len // block_elements
-    kv_num_blocks = kv_seq_len // block_elements
-    if variable_block_sizes.numel() != kv_num_blocks:
-        raise ValueError(f"variable_block_sizes must have length kv_num_blocks={kv_num_blocks}, "
-                         f"got {variable_block_sizes.numel()}")
-    if q_variable_block_sizes.numel() != q_num_blocks:
-        raise ValueError(f"q_variable_block_sizes must have length q_num_blocks={q_num_blocks}, "
-                         f"got {q_variable_block_sizes.numel()}")
+    _, _, _, dim = q.shape
+    _validate_vsa_inputs(
+        q, k, v, variable_block_sizes, q_variable_block_sizes, block_elements, seq_axis=1,
+    )
 
     # Compression branch (BSHD-native: match fused_block_mean's semantics).
     # Padding values are expected to be zero; gradients are broadcast across
