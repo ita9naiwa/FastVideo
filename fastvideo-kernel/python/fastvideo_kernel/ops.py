@@ -112,7 +112,8 @@ def video_sparse_attn(
                          f"got {q_variable_block_sizes.numel()}")
 
     # Compression branch (fused Triton: bf16 read → fp32 accumulate → div → bf16 write)
-    if _fork_bhsd_admitted((q, k, v), variable_block_sizes, q_variable_block_sizes, block_elements):
+    forked = _fork_bhsd_admitted((q, k, v), variable_block_sizes, q_variable_block_sizes, block_elements)
+    if forked:
         q, q_c = _ForkBlockMeanBHSD.apply(q, q_variable_block_sizes, block_elements)
         k, k_c = _ForkBlockMeanBHSD.apply(k, variable_block_sizes, block_elements)
         v, v_c = _ForkBlockMeanBHSD.apply(v, variable_block_sizes, block_elements)
@@ -133,12 +134,29 @@ def video_sparse_attn(
     # Sparse branch (fused Triton topk mask)
     mask = fused_topk_mask(scores, topk)
 
-    if block_elements in (128, 256):
+    use_bshd_fine = (forked and broadcast_coarse and 2**25 <= q.numel() <= 2**31 - 1
+                     and all(t.shape == q.shape and t.dtype == q.dtype and t.device == q.device
+                             and t.transpose(1, 2).is_contiguous()
+                             for t in (q, k, v, compress_attn_weight)))
+    if use_bshd_fine:
+        from .block_sparse_attn_256 import _resolve_backend
+        use_bshd_fine = _resolve_backend() == "cutedsl"
+    if use_bshd_fine:
+        out_s = block_sparse_attn_128_bshd(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                          mask, variable_block_sizes)[0].transpose(1, 2)
+    elif block_elements in (128, 256):
         attention = block_sparse_attn_128 if block_elements == 128 else block_sparse_attn_256
         out_s = attention(q, k, v, mask, variable_block_sizes)[0]
     else:
         out_s = block_sparse_attn(q, k, v, mask, variable_block_sizes)[0]
 
+    # The generic backend consumes BSHD: retain that layout through the weighted
+    # branch. Direct BHSD callers receive a view with the same logical shape.
+    if use_bshd_fine:
+        coarse_bshd = out_c.squeeze(3).permute(0, 2, 1, 3).contiguous()
+        return _combine_weighted_bshd(out_s.transpose(1, 2), coarse_bshd,
+                                      compress_attn_weight.transpose(1, 2), block_elements,
+                                      _combine_bshd).transpose(1, 2)
     if broadcast_coarse:
         fine = out_s.reshape(batch, heads, q_num_blocks, block_elements, dim)
         weighted = out_c * compress_attn_weight.reshape_as(fine)
