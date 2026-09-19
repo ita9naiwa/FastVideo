@@ -27,6 +27,33 @@ _OUT_TOL = (1e-3, 0.2)
 _GRAD_TOL = (1e-3, 0.25)
 
 
+@pytest.mark.parametrize("block,factor", [(128, 1), (128, 2), (256, 1), (256, 2)])
+def test_vsa_backward_shared_indices_preserve_active_lists(block, factor):
+    from fastvideo_kernel import block_sparse_attn_cute_fwd as adapter
+
+    routes = [[True, True, False, True], [True, False, True, True], [False, True, True, False]]
+    sizes = [0, block, block - 1, 1]
+    forward, backward = adapter._build_sparse_tensors(
+        torch.tensor(routes, device="cuda", dtype=torch.bool)[None, None],
+        torch.tensor(sizes, device="cuda", dtype=torch.int32),
+        q_len=3 * block - 7, q_block_size=block, kv_block_size=block,
+        need_forward=False, need_backward=True, force_q_sparse_block_size=block * factor,
+    )
+    assert forward is None
+    assert backward.full_block_idx.data_ptr() == backward.mask_block_idx.data_ptr()
+    for kv, size in enumerate(sizes):
+        selected = [start // factor for start in range(0, 3, factor)
+                    if any(routes[q][kv] for q in range(start, min(start + factor, 3)))]
+        for counts, indices, active in (
+            (backward.full_block_cnt, backward.full_block_idx, size == block),
+            (backward.mask_block_cnt, backward.mask_block_idx, 0 < size < block),
+        ):
+            expected = selected if active else []
+            assert counts.dtype == torch.int32
+            assert counts[0, 0, kv].item() == len(expected)
+            assert indices[0, 0, kv, :len(expected)].tolist() == expected
+
+
 @pytest.fixture(autouse=True)
 def _require_cute_backend(monkeypatch):
     pytest.importorskip(

@@ -210,10 +210,9 @@ def _build_sparse_tensors(
     """Build the Q-owned forward and KV-owned backward sparse metadata.
 
     ``need_backward`` is False on inference-only calls: the backward metadata
-    is a pair of dense ``[B, H, kv_blocks, q_blocks]`` int32 index tensors that
-    FA4 keeps alive on its autograd ctx until backward runs, so building it
-    when nothing requires grad is pure overhead (~80 MiB per call at Wan-14B
-    720p shape).
+    retains a dense ``[B, H, kv_blocks, q_blocks]`` int32 index tensor shared
+    by the full and partial lists until backward runs. Building it when
+    nothing requires grad is pure overhead.
     """
     BlockSparseTensorsTorch, _, _, _ = _load_fa4_cute()
     if force_q_sparse_block_size is None:
@@ -256,9 +255,14 @@ def _build_sparse_tensors(
     # FA4 backward is KV-owned: for each physical KV tile, list the sparse
     # query tiles that selected it. Full and partial KV tiles stay separate
     # so the token-level validity mask only runs for padded tiles.
-    backward_sparse_tensors = from_maps(
-        (sparse_map & kv_full).transpose(2, 3),
-        (sparse_map & kv_partial).transpose(2, 3),
+    # Validity is constant across each KV-owned row: only one list is active.
+    shared_idx, shared_count = _map_to_index(sparse_map.transpose(2, 3).contiguous())
+    backward_sparse_tensors = BlockSparseTensorsTorch(
+        full_block_cnt=shared_count * kv_full.reshape(1, 1, -1),
+        full_block_idx=shared_idx,
+        mask_block_cnt=shared_count * kv_partial.reshape(1, 1, -1),
+        mask_block_idx=shared_idx,
+        block_size=(q_sparse_block_size, kv_block_size),
     )
     return forward_sparse_tensors, backward_sparse_tensors
 
