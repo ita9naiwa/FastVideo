@@ -24,7 +24,9 @@ def _fused_block_mean_kernel(
     X_ptr,
     Out_ptr,
     VBS_ptr,
-    stride_x_bh,
+    stride_x_b,
+    stride_x_h,
+    num_heads: tl.constexpr,
     stride_x_seq,
     stride_o_bh,
     stride_o_blk,
@@ -32,10 +34,11 @@ def _fused_block_mean_kernel(
     BLOCK_ELEMENTS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
+    EXACT_DIV: tl.constexpr = False,
 ):
     """Fused block mean: one program computes mean of one block for one (b,h).
 
-    X is viewed as [B*H, num_blocks*BLOCK_ELEMENTS, HEAD_DIM] contiguous.
+    X uses separate batch/head strides, supporting both BHSD and BSHD.
     Out is [B*H, num_blocks, HEAD_DIM] contiguous.
     2D load + parallel tl.sum reduction, accumulates in fp32.
     """
@@ -47,13 +50,14 @@ def _fused_block_mean_kernel(
 
     vbs = tl.load(VBS_ptr + block_idx).to(tl.float32)
 
-    x_base = X_ptr + bh_idx * stride_x_bh + block_idx * BLOCK_ELEMENTS * stride_x_seq
+    x_base = X_ptr + (bh_idx // num_heads) * stride_x_b + (bh_idx % num_heads) * stride_x_h + block_idx * BLOCK_ELEMENTS * stride_x_seq
 
     row_offsets = tl.arange(0, BLOCK_ELEMENTS)
     dim_offsets = tl.arange(0, HEAD_DIM)
     offsets = row_offsets[:, None] * stride_x_seq + dim_offsets[None, :]
     block_data = tl.load(x_base + offsets).to(tl.float32)
-    acc = tl.sum(block_data, axis=0) / vbs
+    total = tl.sum(block_data, axis=0)
+    acc = tl.div_rn(total, vbs) if EXACT_DIV else total / vbs
 
     out_base = Out_ptr + bh_idx * stride_o_bh + block_idx * stride_o_blk + dim_offsets
     tl.store(out_base, acc.to(OUTPUT_DTYPE))
@@ -66,12 +70,15 @@ def _fused_block_mean_bwd_kernel(
     VBS_ptr,
     stride_go_bh,
     stride_go_blk,
-    stride_gx_bh,
+    stride_gx_b,
+    stride_gx_h,
+    num_heads: tl.constexpr,
     stride_gx_seq,
     num_blocks,
     BLOCK_ELEMENTS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
+    EXACT_DIV: tl.constexpr = False,
 ):
     """Backward of block mean: broadcast grad_out / vbs to each token in the block.
 
@@ -90,10 +97,11 @@ def _fused_block_mean_bwd_kernel(
 
     dim_offsets = tl.arange(0, HEAD_DIM)
     go_base = GradOut_ptr + bh_idx * stride_go_bh + block_idx * stride_go_blk
-    grad_val = tl.load(go_base + dim_offsets).to(tl.float32) / vbs
+    grad = tl.load(go_base + dim_offsets).to(tl.float32)
+    grad_val = tl.div_rn(grad, vbs) if EXACT_DIV else grad / vbs
 
     row_offsets = tl.arange(0, BLOCK_ELEMENTS)
-    gx_base = GradX_ptr + bh_idx * stride_gx_bh + block_idx * BLOCK_ELEMENTS * stride_gx_seq
+    gx_base = GradX_ptr + (bh_idx // num_heads) * stride_gx_b + (bh_idx % num_heads) * stride_gx_h + block_idx * BLOCK_ELEMENTS * stride_gx_seq
     offsets = row_offsets[:, None] * stride_gx_seq + dim_offsets[None, :]
     grad_2d = tl.broadcast_to(grad_val[None, :], [BLOCK_ELEMENTS, HEAD_DIM])
     tl.store(gx_base + offsets, grad_2d.to(OUTPUT_DTYPE))
@@ -127,8 +135,10 @@ def _fused_block_mean_bwd(
         variable_block_sizes,
         go_flat.stride(0),
         go_flat.stride(1),
-        gx_flat.stride(0),
-        gx_flat.stride(1),
+        grad_x.stride(0),
+        grad_x.stride(1),
+        H,
+        grad_x.stride(2),
         num_blocks,
         BLOCK_ELEMENTS=block_elements,
         HEAD_DIM=D,
@@ -159,8 +169,10 @@ def _fused_block_mean_fwd(
         x_flat,
         out_flat,
         variable_block_sizes,
-        x_flat.stride(0),
-        x_flat.stride(1),
+        x.stride(0),
+        x.stride(1),
+        H,
+        x.stride(2),
         out_flat.stride(0),
         out_flat.stride(1),
         num_blocks,
@@ -346,3 +358,56 @@ def fused_topk_mask(
     )
 
     return mask
+
+
+class _FusedBlockMeanBSHD(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, sizes, block):
+        b, seq, h, d = x.shape
+        assert x.stride(-1) == 1 and d in (64, 128) and seq % block == 0
+        ctx.save_for_backward(sizes)
+        ctx.block = block
+        out = torch.empty(b, h, seq // block, d, device=x.device, dtype=x.dtype)
+        _fused_block_mean_kernel[(seq // block, b * h)](
+            x, out, sizes, x.stride(0), x.stride(2), h, x.stride(1),
+            out.stride(1), out.stride(2), seq // block,
+            BLOCK_ELEMENTS=block, HEAD_DIM=d, OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[x.dtype],
+            EXACT_DIV=True,
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        sizes, = ctx.saved_tensors
+        b, h, nb, d = grad.shape
+        if torch.is_grad_enabled():
+            # Preserve the original expression for higher-order autograd.
+            per_block = (grad.float() / sizes.view(1, 1, nb, 1)).to(grad.dtype)
+            expanded = per_block.permute(0, 2, 1, 3).unsqueeze(2)
+            return expanded.expand(b, nb, ctx.block, h, d).reshape(b, nb * ctx.block, h, d), None, None
+        grad = grad.contiguous()
+        out = torch.empty(b, nb * ctx.block, h, d, device=grad.device, dtype=grad.dtype)
+        _fused_block_mean_bwd_kernel[(nb, b * h)](
+            grad, out, sizes, grad.stride(1), grad.stride(2),
+            out.stride(0), out.stride(2), h, out.stride(1), nb,
+            BLOCK_ELEMENTS=ctx.block, HEAD_DIM=d,
+            OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[grad.dtype], EXACT_DIV=True,
+        )
+        return out, None, None
+
+
+def fused_block_mean_bshd(x: torch.Tensor, sizes: torch.Tensor, block: int) -> torch.Tensor:
+    """Compress BSHD blocks directly to BHND without a full FP32 temporary.
+
+    As in the original compression expression, padding participates in the sum
+    and backward broadcasts to every padded slot. The caller supplies zero
+    padding and valid divisors. Unsupported layouts use that original expression.
+    """
+    b, seq, h, d = x.shape
+    if (x.is_cuda and x.dtype in _TORCH_TO_TRITON_DTYPE and d in (64, 128)
+            and x.stride(-1) == 1 and sizes.device == x.device
+            and sizes.dtype in (torch.int32, torch.int64) and block in (128, 256)):
+        return _FusedBlockMeanBSHD.apply(x, sizes.reshape(-1).contiguous(), block)
+    pooled = x.view(b, seq // block, block, h, d).float().sum(dim=2)
+    pooled = (pooled / sizes.view(1, -1, 1, 1)).to(x.dtype)
+    return pooled.permute(0, 2, 1, 3).contiguous()

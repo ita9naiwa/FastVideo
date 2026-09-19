@@ -8,7 +8,7 @@ from .block_sparse_attn_256 import (
     block_sparse_attn_256_bshd,
 )
 from .triton_kernels.st_attn_triton import sliding_tile_attention_triton
-from .triton_kernels.fused_compress_topk import fused_block_mean, fused_topk_mask
+from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask
 
 # Try to load the C++ extension
 try:
@@ -178,15 +178,9 @@ def video_sparse_attn_bshd(
     # Compression branch (BSHD-native: match fused_block_mean's semantics).
     # Padding values are expected to be zero; gradients are broadcast across
     # the full padded block, just like the BHSD fused common path.
-    q_c = q.view(batch, q_num_blocks, block_elements, heads, dim)
-    k_c = k.view(batch, kv_num_blocks, block_elements, heads, dim)
-    v_c = v.view(batch, kv_num_blocks, block_elements, heads, dim)
-    q_c = (q_c.float().sum(dim=2) / q_variable_block_sizes.view(1, -1, 1, 1)).to(q.dtype)
-    k_c = (k_c.float().sum(dim=2) / variable_block_sizes.view(1, -1, 1, 1)).to(k.dtype)
-    v_c = (v_c.float().sum(dim=2) / variable_block_sizes.view(1, -1, 1, 1)).to(v.dtype)
-    q_ch = q_c.permute(0, 2, 1, 3).contiguous()
-    k_ch = k_c.permute(0, 2, 1, 3).contiguous()
-    v_ch = v_c.permute(0, 2, 1, 3).contiguous()
+    q_ch = fused_block_mean_bshd(q, q_variable_block_sizes, block_elements)
+    k_ch = fused_block_mean_bshd(k, variable_block_sizes, block_elements)
+    v_ch = fused_block_mean_bshd(v, variable_block_sizes, block_elements)
 
     scores = torch.matmul(q_ch, k_ch.transpose(-2, -1)) / (dim**0.5)
     attn = torch.softmax(scores, dim=-1)
