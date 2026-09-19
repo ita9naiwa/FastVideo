@@ -36,10 +36,12 @@ def test_bshd_compression_strides_and_gradient(block, dtype, dim):
 
 
 @pytest.mark.parametrize('block', [128, 256])
-def test_bshd_wrapper_changed_graph(block, monkeypatch):
+@pytest.mark.parametrize('compiled', [False, True])
+def test_bshd_wrapper_changed_graph(block, compiled, monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip('SM10x required')
     monkeypatch.setenv('FASTVIDEO_VSA_PACK_TAILS', '0')
+    monkeypatch.setenv('FASTVIDEO_VSA_COMPILE_COMBINE', '1' if compiled else '0')
     torch.manual_seed(516)
     sizes = torch.tensor([block, 67, block, 17], device='cuda', dtype=torch.int32)
     n = 4 * block
@@ -70,6 +72,7 @@ def test_bshd_wrapper_changed_graph(block, monkeypatch):
                 x.fill_(float('nan'))
         with monkeypatch.context() as patch:
             patch.setattr(ops, 'fused_block_mean_bshd', _reference)
+            patch.setenv('FASTVIDEO_VSA_COMPILE_COMBINE', '0')
             ref = call()
         graph.replay()
         for a, b in zip(ref, captured):

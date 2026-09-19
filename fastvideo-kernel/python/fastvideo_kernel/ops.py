@@ -1,4 +1,6 @@
 import math
+import os
+from functools import lru_cache
 import torch
 from .block_sparse_attn import block_sparse_attn
 from .block_sparse_attn_256 import (
@@ -133,6 +135,21 @@ def video_sparse_attn(
     return out_c + out_s
 
 
+def _combine_bshd(fine, coarse, gate, block):
+    batch, seq, heads, dim = fine.shape
+    fine = fine.view(batch, seq // block, block, heads, dim)
+    coarse = coarse.unsqueeze(2)
+    out = fine + coarse if gate is None else fine + coarse * gate.view_as(fine)
+    return out.reshape(batch, seq, heads, dim)
+
+
+@lru_cache(maxsize=1)
+def _compiled_bshd_combine():
+    # Native Inductor normally removes BF16 round trips between operators.
+    # Retain them here to match the existing multiply-then-add expression.
+    return torch.compile(_combine_bshd, fullgraph=True, options={"emulate_precision_casts": True})
+
+
 def video_sparse_attn_bshd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -192,12 +209,15 @@ def video_sparse_attn_bshd(
     attention = block_sparse_attn_128_bshd if block_elements == 128 else block_sparse_attn_256_bshd
     out_s, _ = attention(q, k, v, mask, variable_block_sizes)
 
-    # Out-of-place: ``out_s`` is the tensor FA4's autograd node saved for its
-    # backward, so mutating it in place invalidates the graph.
-    out_view = out_s.view(batch, q_num_blocks, block_elements, heads, dim)
-    if compress_attn_weight is not None:
-        gate_view = compress_attn_weight.view(batch, q_num_blocks, block_elements, heads, dim)
-        out = out_view + out_c_blk.unsqueeze(2) * gate_view
-    else:
-        out = out_view + out_c_blk.unsqueeze(2)
-    return out.view(batch, q_seq_len, heads, dim)
+    # Out-of-place: FA4 saves out_s for backward. The optional compiled path
+    # has a per-shape cold-compile cost and is limited to the validated layout.
+    combine = _combine_bshd
+    if (os.environ.get("FASTVIDEO_VSA_COMPILE_COMBINE") == "1" and out_s.is_cuda
+            and out_s.dtype == torch.bfloat16 and dim == 128 and out_s.is_contiguous()
+            and out_c_blk.is_contiguous()
+            and (compress_attn_weight is None
+                 or (compress_attn_weight.dtype == out_s.dtype
+                     and compress_attn_weight.shape == out_s.shape
+                     and compress_attn_weight.is_contiguous()))):
+        combine = _compiled_bshd_combine()
+    return combine(out_s, out_c_blk, compress_attn_weight, block_elements)

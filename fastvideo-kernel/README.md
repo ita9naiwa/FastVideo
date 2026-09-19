@@ -193,6 +193,22 @@ This package also includes kernels from [TurboDiffusion](https://github.com/thu-
   - `CUDACXX` must be set (for example, `$CUDA_HOME/bin/nvcc`)
   - C++20 compatible compiler (GCC 10+, Clang 11+)
 
+## BSHD VSA compression and optional output fusion
+
+`video_sparse_attn_bshd` reuses the fused block-mean kernels for 128/256-token
+blocks without materializing full FP32 Q/K/V copies. Padding must remain zero,
+just as in the original expression; gradients are broadcast to every padded
+slot. Unsupported layouts retain the PyTorch expression.
+
+For repeated BF16, head-dimension-128 training calls, set
+`FASTVIDEO_VSA_COMPILE_COMBINE=1` to compile only the final coarse-output
+broadcast, gate multiplication and addition. This is optional and defaults off.
+It requires contiguous tensors and PyTorch Inductor's `emulate_precision_casts`
+option, which preserves the BF16 rounding between multiplication and addition.
+Other layouts use the eager path. Each new shape can incur compilation cost;
+warm up the chosen shapes before CUDA Graph capture or steady-state timing.
+The attention backend and sparse routing are unchanged.
+
 ## Acknowledgement
 
 This package structure and build system are based on [sgl-kernel](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) from the SGLang project.
