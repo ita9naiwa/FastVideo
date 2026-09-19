@@ -119,7 +119,10 @@ def video_sparse_attn(
     attn = torch.softmax(scores, dim=-1)
     out_c = torch.matmul(attn, v_c)
     out_c = out_c.view(batch, heads, q_num_blocks, 1, dim)
-    out_c = out_c.repeat(1, 1, 1, block_elements, 1).view(batch, heads, q_seq_len, dim)
+    broadcast_coarse = (block_elements == 128 and q.dtype == torch.bfloat16 and dim in (64, 128)
+                        and compress_attn_weight is not None and compress_attn_weight.shape == q.shape)
+    if not broadcast_coarse:
+        out_c = out_c.repeat(1, 1, 1, block_elements, 1).view(batch, heads, q_seq_len, dim)
 
     # Sparse branch (fused Triton topk mask)
     mask = fused_topk_mask(scores, topk)
@@ -130,6 +133,10 @@ def video_sparse_attn(
     else:
         out_s = block_sparse_attn(q, k, v, mask, variable_block_sizes)[0]
 
+    if broadcast_coarse:
+        fine = out_s.reshape(batch, heads, q_num_blocks, block_elements, dim)
+        weighted = out_c * compress_attn_weight.reshape_as(fine)
+        return (weighted + fine).reshape(batch, heads, q_seq_len, dim)
     if compress_attn_weight is not None:
         return out_c * compress_attn_weight + out_s
     return out_c + out_s
