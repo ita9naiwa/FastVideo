@@ -258,9 +258,9 @@ class VideoSparseAttentionImpl(AttentionImpl):
         valid until the next ``tile()`` / ``preprocess_qkv`` call on the
         same ``attn_metadata``.  Callers must consume (or copy) the
         result before invoking another VSA layer with the same metadata.
-        Today both call sites materialize copies via
-        ``.transpose(...).contiguous()`` inside ``forward()``, so the
-        contract holds; future callers must preserve it.
+        Training normally disables caching because attention can retain
+        QKV views until backward. The 128-token CuTe path retains copies
+        when caching and gradient recording are both enabled.
         """
         num_tiles = attn_metadata.num_tiles
         t_padded_size = num_tiles[0] * VSA_TILE_SIZE[0]
@@ -327,11 +327,22 @@ class VideoSparseAttentionImpl(AttentionImpl):
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")
-        # Default 64-element-tile path (unchanged): BHSD round-trip.
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
-        gate_compress = gate_compress.transpose(1, 2).contiguous()
+        # The 128-token CuTe path can consume transpose views. Cached training
+        # buffers, 64-token kernels and Triton retain their snapshots.
+        use_views = False
+        if block_elements == 128 and not (torch.is_grad_enabled() and attn_metadata.cache_tile_buf):
+            try:
+                from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
+            except ImportError:
+                pass
+            else:
+                use_views = _resolve_backend() == "cutedsl"
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        gate_compress = gate_compress.transpose(1, 2)
+        if not use_views:
+            query, key, value, gate_compress = (x.contiguous() for x in (query, key, value, gate_compress))
         return video_sparse_attn(query,
                                  key,
                                  value,

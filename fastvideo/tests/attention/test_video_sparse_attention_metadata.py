@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 import torch
 
 from fastvideo.attention.backends import video_sparse_attn as vsa_module
@@ -109,3 +111,61 @@ def test_vsa_cur_topk_clamps_to_valid_block_range():
 
     metadata.VSA_sparsity = -0.01
     assert _compute_cur_topk(metadata) == num_kv_blocks
+
+
+@pytest.mark.parametrize("block", [64, 128])
+@pytest.mark.parametrize("kernel_backend", ["triton", "cutedsl"])
+@pytest.mark.parametrize("cache", [False, True])
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_vsa128_view_dispatch_preserves_fallbacks(monkeypatch, block, kernel_backend, cache, grad_enabled):
+    kernel = pytest.importorskip("fastvideo_kernel.block_sparse_attn_256")
+    monkeypatch.setattr(kernel, "_resolve_backend", lambda: kernel_backend)
+    tile = (4, 4, 4) if block == 64 else (4, 8, 4)
+    monkeypatch.setattr(vsa_module, "VSA_TILE_SIZE", tile)
+    metadata = _build_metadata(cache, raw_latent_shape=(4, 8, 16))
+    n = metadata.variable_block_sizes.numel() * block
+    x = torch.randn(1, n, 3, 64)
+    seen = []
+
+    def fake(q, k, v, sizes, qsizes, topk, block_size, compress_attn_weight):
+        seen.append((q.is_contiguous(), q.data_ptr() == x.data_ptr()))
+        return q
+
+    monkeypatch.setattr(vsa_module, "video_sparse_attn", fake)
+    impl = object.__new__(VideoSparseAttentionImpl)
+    with torch.set_grad_enabled(grad_enabled):
+        impl.forward(x, x, x, x, metadata)
+    views = block == 128 and kernel_backend == "cutedsl" and not (grad_enabled and cache)
+    assert seen == [(not views, views)]
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+def test_vsa128_backend_views_match_cached_training_snapshots(monkeypatch, dim):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM10x required")
+    kernel = pytest.importorskip("fastvideo_kernel.block_sparse_attn_256")
+    monkeypatch.setattr(kernel, "_resolve_backend", lambda: "cutedsl")
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "0")
+    monkeypatch.setattr(vsa_module, "VSA_TILE_SIZE", (4, 8, 4))
+    torch.manual_seed(934)
+    metadata = _build_metadata(False, raw_latent_shape=(4, 8, 32), VSA_sparsity=.75)
+    sizes = torch.tensor([128, 67, 17, 127] * 2, device="cuda", dtype=torch.int32)
+    metadata.variable_block_sizes = sizes
+    packed = torch.randn(8, 1024, 3, dim, device="cuda", dtype=torch.bfloat16)
+    valid = (torch.arange(1024, device="cuda") % 128 < sizes[torch.arange(1024, device="cuda") // 128])
+    packed.mul_(valid[None, :, None, None])
+    packed[6:].mul_(.1)
+    packed.requires_grad_()
+    q, k, v, gate = packed.chunk(4)
+    dy = torch.randn_like(gate)
+    impl = object.__new__(VideoSparseAttentionImpl)
+    got = impl.forward(q, k, v, gate, metadata)
+    metadata.cache_tile_buf = True
+    ref = impl.forward(q, k, v, gate, metadata)
+    got_grad = torch.autograd.grad(got, packed, dy)[0]
+    ref_grad = torch.autograd.grad(ref, packed, dy)[0]
+    for actual, expected in ((got, ref), (got_grad, ref_grad)):
+        diff = (actual.float() - expected.float()).abs()
+        assert torch.isfinite(actual).all()
+        assert diff.mean() < 1e-3
+        assert diff.max() / (expected.float().abs().mean() + 1e-6) < .25

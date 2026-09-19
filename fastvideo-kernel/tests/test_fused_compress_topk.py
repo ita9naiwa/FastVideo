@@ -399,3 +399,25 @@ class TestVideoSparseAttnEquivalence:
 
         assert (fused_mask.sum(dim=-1) == topk).all(), "row count mismatch"
         assert match_rate > 0.99, f"match rate too low: {match_rate:.2%}"
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("layout", ["bshd", "batch_head_swap", "channel_step2"])
+def test_bhsd_block_mean_strided_layouts(dim, layout):
+    _require_cuda()
+    from fastvideo_kernel.triton_kernels.fused_compress_topk import fused_block_mean
+    torch.manual_seed(934)
+    if layout == "bshd":
+        x = torch.randn(2, 512, 3, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    elif layout == "batch_head_swap":
+        x = torch.randn(3, 2, 512, dim, device="cuda", dtype=torch.bfloat16).transpose(0, 1)
+    else:
+        x = torch.randn(2, 3, 512, dim * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    x.requires_grad_()
+    sizes = torch.tensor([128, 67, 17, 127], device="cuda", dtype=torch.int32)
+    got = fused_block_mean(x, sizes, 128)
+    ref = fused_block_mean(x.contiguous(), sizes, 128)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    dy = torch.randn_like(got)
+    torch.testing.assert_close(torch.autograd.grad(got, x, dy)[0],
+                               torch.autograd.grad(ref, x, dy)[0], atol=0, rtol=0)

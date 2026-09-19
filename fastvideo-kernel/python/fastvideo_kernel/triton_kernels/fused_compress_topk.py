@@ -163,16 +163,17 @@ def _fused_block_mean_fwd(
     num_blocks = seq_len // block_elements
     assert seq_len % block_elements == 0
 
-    x = x.contiguous()
+    if not (block_elements == 128 and x.dtype == torch.bfloat16 and D in (64, 128) and x.stride(-1) == 1
+            and x.data_ptr() % 16 == 0 and all(s > 0 and s % 8 == 0 for s in x.stride()[:-1])):
+        x = x.contiguous()
     out = torch.empty(B, H, num_blocks, D, dtype=x.dtype, device=x.device)
 
-    x_flat = x.view(B * H, seq_len, D)
     out_flat = out.view(B * H, num_blocks, D)
 
     grid = (num_blocks, B * H)
 
     _fused_block_mean_kernel[grid](
-        x_flat,
+        x,
         out_flat,
         variable_block_sizes,
         x.stride(0),
