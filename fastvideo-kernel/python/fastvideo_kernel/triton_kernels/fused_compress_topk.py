@@ -376,9 +376,13 @@ class _FusedBlockMeanBSHD(torch.autograd.Function):
         # Preserve ATen's reduction order: cancellation can otherwise change
         # discrete top-k routes. Accumulate in FP32 without a full FP32 copy.
         blocks = x.view(b, seq // block, block, h, d)
-        # Match original float() conversion for strided or offset inputs.
-        pooled = (blocks.sum(dim=2, dtype=torch.float32) if x.is_contiguous() and x.storage_offset() == 0 and x.data_ptr() % 16 == 0
-                  else blocks.float().sum(dim=2))
+        # ATen output vec4 requires 8-byte BF16 pointer alignment, including
+        # contiguous views with nonzero storage offsets. Other layouts keep
+        # the original float() conversion and its reduction order.
+        direct_sum = x.is_contiguous() and (
+            (x.dtype == torch.bfloat16 and x.data_ptr() % 8 == 0)
+            or (x.storage_offset() == 0 and x.data_ptr() % 16 == 0))
+        pooled = blocks.sum(dim=2, dtype=torch.float32) if direct_sum else blocks.float().sum(dim=2)
         pooled = (pooled / sizes.view(1, -1, 1, 1)).to(x.dtype)
         return pooled.permute(0, 2, 1, 3).contiguous()
 

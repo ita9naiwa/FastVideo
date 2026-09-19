@@ -196,9 +196,10 @@ This package also includes kernels from [TurboDiffusion](https://github.com/thu-
 ## BSHD VSA compression and optional output fusion
 
 `video_sparse_attn_bshd` uses native FP32 accumulation and fused broadcast
-gradients for 128/256-token blocks. Aligned contiguous inputs with zero storage
-offset avoid full FP32 Q/K/V copies; other layouts retain the original forward
-expression. Cancellation tests cover pooled values and top-k routing. Padding must remain zero,
+gradients for 128/256-token blocks. Contiguous BF16 inputs with an 8-byte-aligned
+actual pointer avoid full FP32 Q/K/V copies, including nonzero-offset views.
+Other dtypes retain the zero-offset, 16-byte-alignment guard; other layouts
+retain the original forward expression. Cancellation tests cover pooled values and top-k routing. Padding must remain zero,
 just as in the original expression; gradients are broadcast to every padded
 slot. Unsupported layouts retain the PyTorch expression.
 

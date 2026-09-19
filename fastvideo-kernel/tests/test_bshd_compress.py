@@ -155,7 +155,7 @@ def test_bshd_cancellation_preserves_routes_and_compression_gradient(block, monk
 
 
 @pytest.mark.parametrize('block', [128, 256])
-@pytest.mark.parametrize('layout', ['aligned', 'sequence_stride', 'head_transpose', 'offset'])
+@pytest.mark.parametrize('layout', ['aligned', 'sequence_stride', 'head_transpose', 'offset', 'offset4', 'offset8', 'offset16'])
 def test_bshd_cancellation_layouts(block, layout):
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
@@ -168,7 +168,8 @@ def test_bshd_cancellation_layouts(block, layout):
     elif layout == 'head_transpose':
         x = torch.empty(2, 3, n, 128, device='cuda', dtype=torch.bfloat16).transpose(1, 2)
     else:
-        x = torch.empty(2 * n * 3 * 128 + 1, device='cuda', dtype=torch.bfloat16)[1:].view(2, n, 3, 128)
+        offset = int(layout.removeprefix('offset') or '1')
+        x = torch.empty(2 * n * 3 * 128 + offset, device='cuda', dtype=torch.bfloat16)[offset:].view(2, n, 3, 128)
     x.normal_().mul_(1e-4)
     x.view(2, 8, block, 3, 128)[:, :, 0] = 256
     x.view(2, 8, block, 3, 128)[:, :, 1] = -256
