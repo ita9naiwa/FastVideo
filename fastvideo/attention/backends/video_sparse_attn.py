@@ -191,12 +191,25 @@ def scatter_into_tile_buf(
     return buf
 
 
+def _tile_row_layout(x: torch.Tensor) -> bool:
+    if x.ndim != 4:
+        return False
+    batch, length, heads, dim = x.shape
+    width = heads * dim
+    return (batch > 0 and length > 0 and width > 0 and x.stride()[1:] == (width, dim, 1)
+            and x.stride(0) >= length * width and x.stride(0) % width == 0 and x.data_ptr() % 16 == 0
+            and width * x.element_size() % 16 == 0)
+
+
 def _gather_tile_rows(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    # Make aligned multi-batch gathers 2-D for PyTorch's vectorized row path.
-    if (x.shape[0] > 1 and x.is_contiguous() and x.data_ptr() % 16 == 0 and x.stride(1) * x.element_size() % 16 == 0):
+    if x.shape[0] > 1 and _tile_row_layout(x):
         batch, length, heads, dim = x.shape
-        rows = (index[None, :] + torch.arange(batch, device=x.device, dtype=index.dtype)[:, None] * length).flatten()
-        return x.view(batch * length, heads * dim).index_select(0, rows).view(batch, index.numel(), heads, dim)
+        batch_rows = x.stride(0) // (heads * dim)
+        rows = (index[None, :] +
+                torch.arange(batch, device=x.device, dtype=index.dtype)[:, None] * batch_rows).flatten()
+        # Last row ends at the original last logical element, never after its storage.
+        flat = x.as_strided(((batch - 1) * batch_rows + length, heads * dim), (heads * dim, 1))
+        return flat.index_select(0, rows).view(batch, index.numel(), heads, dim)
     return x.index_select(1, index)
 
 
@@ -299,8 +312,8 @@ class VideoSparseAttentionImpl(AttentionImpl):
     def tile(self, x: torch.Tensor, attn_metadata: VideoSparseAttentionMetadata) -> torch.Tensor:
         """Tile ``x`` into ``attn_metadata.tile_buf`` and return it.
 
-        The returned tensor aliases the per-metadata buffer and is only
-        valid until the next ``tile()`` / ``preprocess_qkv`` call on the
+        When caching is enabled, the returned tensor aliases the per-metadata
+        buffer and is only valid until the next ``tile()`` / ``preprocess_qkv`` call on the
         same ``attn_metadata``.  Callers must consume (or copy) the
         result before invoking another VSA layer with the same metadata.
         Training normally disables caching because attention can retain
@@ -316,8 +329,8 @@ class VideoSparseAttentionImpl(AttentionImpl):
         if not attn_metadata.cache_tile_buf:
             state = getattr(attn_metadata, "_tile_index_state", None)
             if (state is not None and torch.is_grad_enabled() and x.requires_grad and x.ndim == 4 and x.is_cuda
-                    and x.dtype == torch.bfloat16 and x.is_contiguous() and state[0].device == x.device
-                    and state[2].device == x.device and x.numel() >= 2**25
+                    and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
+                    and state[0].device == x.device and state[2].device == x.device and x.numel() >= 2**25
                     and x.shape[1] == attn_metadata.total_seq_length == state[0].numel() == state[2].numel()
                     and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index
                     and state[0]._version == state[1] and state[2]._version == state[3]):

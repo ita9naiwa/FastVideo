@@ -101,3 +101,39 @@ def test_tile_row_gather_preserves_alignment_and_stride_fallback(batch, offset, 
         expected = tensor.index_select(1, index)
         actual = m._gather_tile_rows(tensor, index)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('offset', [0, 1, 8])
+def test_outer_gap_tile_preserves_full_backing_gradient(offset):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    backing = torch.randn(offset + 2 * 35 * 3 * 16, device='cuda', requires_grad=True)
+    x = backing[offset:].view(2, 35, 3, 16)[:, :33]
+    assert m._tile_row_layout(x) == (offset != 1)
+    src = torch.randperm(33, device='cuda')
+    dst = torch.randperm(48, device='cuda')[:33]
+    reference = m.scatter_into_tile_buf(x, (2, 48, 3, 16), dst, None, src)
+    actual = m._TilePermutation.apply(x, src, dst, 48)
+    dy = torch.randn_like(actual)
+    gradients = [torch.autograd.grad(t, backing, dy)[0] for t in (reference, actual)]
+    torch.testing.assert_close(reference, actual, atol=0, rtol=0)
+    torch.testing.assert_close(*gradients, atol=0, rtol=0)
+
+
+def test_outer_gap_builder_admission_and_empty_fallback():
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    md = m.VideoSparseAttentionMetadataBuilder().build(
+        0, (32, 32, 32), (1, 1, 1), .9, torch.device('cuda'), cache_tile_buf=False)
+    base = torch.randn(2, 32770, 4, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    x = base[:, :32768]
+    impl = object.__new__(m.VideoSparseAttentionImpl)
+    actual = impl.tile(x, md)
+    assert type(actual.grad_fn).__name__ == '_TilePermutationBackward'
+    reference = m.scatter_into_tile_buf(x, tuple(actual.shape), md.non_pad_index, None, md.tile_partition_indices)
+    torch.testing.assert_close(reference, actual, atol=0, rtol=0)
+    for shape in ((2, 0, 3, 128), (2, 3, 0, 128), (2, 3, 2, 0)):
+        empty = torch.empty(shape, device='cuda')
+        assert not m._tile_row_layout(empty)
+    assert not m._tile_row_layout(base[:, ::2])
+    assert not m._tile_row_layout(base[..., ::2])
