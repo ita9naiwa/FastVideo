@@ -164,6 +164,10 @@ def _build_vbs_mask_mod(kv_block_size: int):
         valid = utils.scalar_to_ssa(kv_sizes[kv_blk[0]], cutlass.Int32)
         return (valid > zero_ssa) & (kv_off < valid)
 
+    # Exact contract for optional FA4 backward specialization: aux[0] is a
+    # 1D KV128 valid-prefix array, independent of Q, batch, and head.
+    if kv_block_size_const == 128:
+        _vbs_mask_mod.__vbs_kv_block_size__ = 128
     return _vbs_mask_mod
 
 
