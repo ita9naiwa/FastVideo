@@ -418,6 +418,7 @@ def _cute_attention(
         if (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "0") == "1"
                 and q_bshd.shape[-1] == k_bshd.shape[-1] == v_bshd.shape[-1]
                 and q_bshd.shape[2] == k_bshd.shape[2] == v_bshd.shape[2]
+                and block_map.shape[:2] == (q_bshd.shape[0], q_bshd.shape[2])
                 and all(t.is_contiguous() for t in (q_bshd, k_bshd, v_bshd))):
             from fastvideo_kernel.vsa_tail_backward import TailTraining
             return TailTraining.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)

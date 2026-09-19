@@ -63,3 +63,31 @@ def test_tail_backward_graph(monkeypatch, dim):
             _check('replayed gradient', ref, got, _GRAD_TOL)
             if not any(cases[iteration % len(cases)]):
                 assert torch.count_nonzero(got) == 0
+
+
+@pytest.mark.parametrize("map_shape", [(1, 3), (2, 1), (1, 1)])
+def test_tail_broadcast_routes_use_native_fallback(monkeypatch, map_shape):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
+    pytest.importorskip("flash_attn.cute.interface")
+    from fastvideo_kernel.vsa_tail_backward import TailTraining
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1")
+
+    def unexpected(*args):
+        raise AssertionError("broadcast routes entered the tail packing path")
+
+    monkeypatch.setattr(TailTraining, "apply", unexpected)
+    torch.manual_seed(512)
+    q, k, v = [torch.randn(2, 512, 3, 64, device="cuda", dtype=torch.bfloat16,
+                           requires_grad=True) for _ in range(3)]
+    routes = torch.ones(*map_shape, 2, 2, device="cuda", dtype=torch.bool)
+    routes[..., 0, 1] = False
+    sizes = torch.tensor([256, 131], device="cuda", dtype=torch.int32)
+    dout = torch.randn_like(q)
+    out = adapter._cute_attention(q, k, v, routes, sizes)[0]
+    ref = adapter._CuteAttentionQ256Training.apply(
+        q, k, v, routes.expand(2, 3, 2, 2).contiguous(), sizes)[0]
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    for expected, got in zip(torch.autograd.grad(ref, (q, k, v), dout),
+                             torch.autograd.grad(out, (q, k, v), dout)):
+        _check("broadcast gradient", expected, got, _GRAD_TOL)
