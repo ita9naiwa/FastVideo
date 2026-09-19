@@ -57,3 +57,35 @@ def test_vbs_prefix_mask_graph_gradients(block, dim, monkeypatch):
             assert actual.isfinite().all()
             assert error.mean() < 1e-3
             assert error.max() / (expected.float().abs().mean() + 1e-6) < 0.25
+
+
+@pytest.mark.parametrize("block", [128, 256])
+def test_vbs_prefix_strided_sizes(block, monkeypatch):
+    pytest.importorskip("flash_attn.cute.block_sparsity")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Requires SM100-family CUDA device")
+    torch.manual_seed(419)
+    qkv = [torch.randn(1, 4 * block, 2, 128, device="cuda", dtype=torch.bfloat16,
+                       requires_grad=True) for _ in range(3)]
+    sizes = torch.tensor([block, block - 3, 0, block // 2], device="cuda", dtype=torch.int32)
+    sizes = sizes.repeat_interleave(2)[::2]
+    assert sizes.stride() == (2,)
+    routes = torch.ones(1, 2, 4, 4, device="cuda", dtype=torch.bool)
+    dout = torch.randn_like(qkv[0])
+    function = adapter._CuteAttentionQ128 if block == 128 else adapter._CuteAttentionQ256Training
+    mask = adapter._build_vbs_mask_mod(128)
+
+    def run():
+        out, _ = function.apply(*qkv, routes, sizes)
+        return out, torch.autograd.grad(out, qkv, dout)
+
+    with monkeypatch.context() as context:
+        context.setattr(mask, "__vbs_kv_block_size__", 0)
+        expected_out, expected_grads = run()
+    actual_out, actual_grads = run()
+    assert torch.equal(expected_out, actual_out)
+    for expected, actual in zip(expected_grads, actual_grads):
+        error = (expected.float() - actual.float()).abs()
+        assert actual.isfinite().all()
+        assert error.mean() < 1e-3
+        assert error.max() / (expected.float().abs().mean() + 1e-6) < 0.25
