@@ -209,6 +209,12 @@ division followed by BF16 rounding before addition. Overlapping Q/K/V ranges
 retain the original accumulation graph; unused gradient branches and
 higher-order compression retain the existing helper behavior.
 
+For gated contiguous BF16/D128 training with at least `2**25` and at most
+`2**31 - 1` output elements, the default path uses native broadcast-weighting
+kernels. Fine addition stays in PyTorch autograd, and the coarse gradient retains
+the same BF16 product and native sum. Small inputs and unsupported layouts fall
+back; the explicit compiled option below takes priority.
+
 For repeated BF16, head-dimension-128 training calls, set
 `FASTVIDEO_VSA_COMPILE_COMBINE=1` to compile only the final coarse-output
 broadcast, gate multiplication and addition. This is optional and defaults off.

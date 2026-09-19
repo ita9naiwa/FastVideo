@@ -456,3 +456,86 @@ def _fork_block_mean_bshd(x, sizes, block):
             and sizes.dtype in (torch.int32, torch.int64) and block in (128, 256)):
         return _ForkBlockMeanBSHD.apply(x, sizes, block)
     return x, fused_block_mean_bshd(x, sizes, block)
+
+
+@triton.jit
+def _weighted_bshd_fwd(C, G, O, N: tl.constexpr, HD: tl.constexpr, BLOCK: tl.constexpr,
+                       TILE: tl.constexpr):
+    i = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = i < N
+    ci = (i // (BLOCK * HD)) * HD + i % HD
+    coarse = tl.load(C + ci, valid, 0).to(tl.float32)
+    gate = tl.load(G + i, valid, 0).to(tl.float32)
+    tl.store(O + i, coarse * gate, valid)
+
+
+@triton.jit
+def _weighted_bshd_bwd(D, C, G, DC, DG, N: tl.constexpr, HD: tl.constexpr, BLOCK: tl.constexpr,
+                       NEED_C: tl.constexpr, NEED_G: tl.constexpr, TILE: tl.constexpr):
+    i = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = i < N
+    value = tl.load(D + i, valid, 0).to(tl.float32)
+    if NEED_C:
+        gate = tl.load(G + i, valid, 0).to(tl.float32)
+        tl.store(DC + i, value * gate, valid)
+    if NEED_G:
+        ci = (i // (BLOCK * HD)) * HD + i % HD
+        coarse = tl.load(C + ci, valid, 0).to(tl.float32)
+        tl.store(DG + i, value * coarse, valid)
+
+
+class _WeightedBSHD(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, coarse, gate, block):
+        ctx.save_for_backward(coarse if ctx.needs_input_grad[1] else None,
+                              gate if ctx.needs_input_grad[0] else None)
+        ctx.block = block
+        out = torch.empty_like(gate)
+        _, _, heads, dim = gate.shape
+        _weighted_bshd_fwd[(triton.cdiv(gate.numel(), 1024),)](
+            coarse, gate, out, N=gate.numel(), HD=heads * dim, BLOCK=block, TILE=1024,
+            enable_fp_fusion=False)
+        return out
+
+    @staticmethod
+    def backward(ctx, dy):
+        coarse, gate = ctx.saved_tensors
+        batch, seq, heads, dim = dy.shape
+        shape = (batch, seq // ctx.block, ctx.block, heads, dim)
+        need_c, need_g, _ = ctx.needs_input_grad
+        dc = dg = None
+        if torch.is_grad_enabled() or not dy.is_contiguous():
+            if need_c:
+                dc = (dy * gate).view(shape).sum(2)
+            if need_g:
+                dg = (dy.view(shape) * coarse.unsqueeze(2)).reshape_as(dy)
+        else:
+            weighted = torch.empty_like(dy) if need_c else None
+            dg = torch.empty_like(dy) if need_g else None
+            _weighted_bshd_bwd[(triton.cdiv(dy.numel(), 1024),)](
+                dy, coarse, gate, weighted, dg, N=dy.numel(), HD=heads * dim,
+                BLOCK=ctx.block, NEED_C=need_c, NEED_G=need_g, TILE=1024)
+            if need_c:
+                # Preserve the BF16 product and the existing native reduction order.
+                dc = weighted.view(shape).sum(2)
+        return dc, dg, None
+
+
+def _combine_weighted_bshd(fine, coarse, gate, block, fallback):
+    tensors = (fine, coarse) if gate is None else (fine, coarse, gate)
+    eligible = (gate is not None and torch.is_grad_enabled()
+                and any(x.requires_grad for x in tensors) and block in (128, 256)
+                and fine.ndim == 4 and fine.shape[-1] == 128 and fine.shape[1] % block == 0
+                # Small inputs favor native launches; cap flattened int32 offsets.
+                and 2**25 <= fine.numel() <= 2**31 - 1
+                and coarse.shape == (fine.shape[0], fine.shape[1] // block, fine.shape[2], fine.shape[3])
+                and all(x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous()
+                        and x.device == fine.device for x in tensors)
+                and gate.shape == fine.shape)
+    if eligible:
+        ranges = [(x.data_ptr(), x.data_ptr() + x.numel() * x.element_size()) for x in tensors]
+        eligible = all(a[1] <= b[0] or b[1] <= a[0]
+                       for i, a in enumerate(ranges) for b in ranges[i + 1:])
+    # Keep addition in native autograd: requesting only fine must prune the
+    # weighted branch, including its saved-tensor version checks.
+    return fine + _WeightedBSHD.apply(coarse, gate, block) if eligible else fallback(fine, coarse, gate, block)

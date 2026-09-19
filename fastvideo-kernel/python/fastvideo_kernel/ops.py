@@ -10,7 +10,7 @@ from .block_sparse_attn_256 import (
     block_sparse_attn_256_bshd,
 )
 from .triton_kernels.st_attn_triton import sliding_tile_attention_triton
-from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask, _fork_block_mean_bshd
+from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask, _fork_block_mean_bshd, _combine_weighted_bshd
 
 # Try to load the C++ extension
 try:
@@ -234,4 +234,6 @@ def video_sparse_attn_bshd(
                      and compress_attn_weight.shape == out_s.shape
                      and compress_attn_weight.is_contiguous()))):
         combine = _compiled_bshd_combine()
+    if combine is _combine_bshd:
+        return _combine_weighted_bshd(out_s, out_c_blk, compress_attn_weight, block_elements, combine)
     return combine(out_s, out_c_blk, compress_attn_weight, block_elements)
