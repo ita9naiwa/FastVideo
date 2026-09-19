@@ -156,6 +156,8 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
     # can release the large tiled QKVG scratch tensor after each attention call.
     tile_buf: torch.Tensor | None = None
     cache_tile_buf: bool = True
+    # Only builder-created, unmodified permutation metadata admits inverse tiling.
+    _tile_index_state: tuple[torch.Tensor, int, torch.Tensor, int] | None = None
 
 
 def compute_topk(sparsity: float, num_blocks: int) -> int:
@@ -187,6 +189,34 @@ def scatter_into_tile_buf(
         buf = torch.zeros(target_shape, device=x.device, dtype=x.dtype)
     buf[:, dst_index] = x if src_index is None else x[:, src_index]
     return buf
+
+
+class _TilePermutation(torch.autograd.Function):
+    """Invert builder-bijective rows with distinct nonpad destinations.
+
+    Save original indices for version checks; rebuild the plan each call so
+    captured calls support changed valid permutations without a stale cache.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor,
+                padded_length: int) -> torch.Tensor:
+        source = partition.new_zeros(padded_length)
+        source.index_copy_(0, nonpad, partition)
+        padding = torch.ones(padded_length, device=x.device, dtype=torch.bool)
+        padding.index_fill_(0, nonpad, False)
+        inverse = partition.new_empty(partition.numel())
+        inverse.index_copy_(0, partition, nonpad)
+        # Retain original needed-index mutation/version checks.
+        ctx.save_for_backward(partition, nonpad, inverse)
+        out = x.index_select(1, source)
+        out.masked_fill_(padding[None, :, None, None], 0)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        _partition, _nonpad, inverse = ctx.saved_tensors
+        return grad.index_select(1, inverse), None, None, None
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -221,7 +251,7 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         non_pad_index = get_non_pad_index(variable_block_sizes, math.prod(VSA_TILE_SIZE))
         untile_combined_index = non_pad_index[reverse_tile_partition_indices]
 
-        return VideoSparseAttentionMetadata(
+        metadata = VideoSparseAttentionMetadata(
             current_timestep=current_timestep,
             dit_seq_shape=dit_seq_shape,  # type: ignore
             VSA_sparsity=VSA_sparsity,  # type: ignore
@@ -233,6 +263,12 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             non_pad_index=non_pad_index,
             untile_combined_index=untile_combined_index,
             cache_tile_buf=cache_tile_buf)
+        # Cached index tensors may have been modified through older metadata.
+        if (not tile_partition_indices.is_inference() and not non_pad_index.is_inference()
+                and tile_partition_indices._version == 0 and non_pad_index._version == 0):
+            metadata._tile_index_state = (tile_partition_indices, tile_partition_indices._version, non_pad_index,
+                                          non_pad_index._version)
+        return metadata
 
 
 class VideoSparseAttentionImpl(AttentionImpl):
@@ -269,6 +305,14 @@ class VideoSparseAttentionImpl(AttentionImpl):
         target_shape = (x.shape[0], t_padded_size * h_padded_size * w_padded_size, x.shape[-2], x.shape[-1])
 
         if not attn_metadata.cache_tile_buf:
+            state = getattr(attn_metadata, "_tile_index_state", None)
+            if (state is not None and torch.is_grad_enabled() and x.requires_grad and x.ndim == 4 and x.is_cuda
+                    and x.dtype == torch.bfloat16 and x.is_contiguous() and state[0].device == x.device
+                    and state[2].device == x.device and x.numel() >= 2**25
+                    and x.shape[1] == attn_metadata.total_seq_length == state[0].numel() == state[2].numel()
+                    and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index
+                    and state[0]._version == state[1] and state[2]._version == state[3]):
+                return _TilePermutation.apply(x, state[0], state[2], target_shape[1])
             return scatter_into_tile_buf(x, target_shape, attn_metadata.non_pad_index, None,
                                          attn_metadata.tile_partition_indices)
 
