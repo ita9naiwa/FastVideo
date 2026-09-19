@@ -225,6 +225,17 @@ Other layouts use the eager path. Each new shape can incur compilation cost;
 warm up the chosen shapes before CUDA Graph capture or steady-state timing.
 The attention backend and sparse routing are unchanged.
 
+Generic FastVideo cache-disabled training tiling has a separate opt-in:
+`FASTVIDEO_VSA_COMPILE_TILE=1` fuses the input gather and padding-zero copy with
+PyTorch Inductor. It defaults off; native inverse-gather backward is unchanged.
+The path retains builder-owned permutation checks and admits aligned BF16
+head dimensions 64/128, at least `2**25` input elements, and input spans/output
+sizes below `2**31` elements. Other inputs stay native. One compiled callable
+is shared across layers, with shape/layout specializations. First use can take several seconds even with a disk cache.
+Warm every actual shape/stride/device specialization, including backward,
+before CUDA Graph capture or steady-state timing. This does not enable
+`FASTVIDEO_VSA_COMPILE_COMBINE` or change attention routing.
+
 The native 256-token BSHD training path also accepts aligned BF16 views such as
 packed QKV, sequence strides and head transposes: the last stride must be one,
 the pointer 16-byte aligned, and outer strides positive multiples of eight

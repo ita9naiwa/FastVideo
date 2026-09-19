@@ -137,3 +137,52 @@ def test_outer_gap_builder_admission_and_empty_fallback():
         assert not m._tile_row_layout(empty)
     assert not m._tile_row_layout(base[:, ::2])
     assert not m._tile_row_layout(base[..., ::2])
+
+
+@pytest.mark.parametrize('dim', [64, 128])
+def test_compiled_tile_exact_contract_and_shared_callable(monkeypatch, dim):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    m._compiled_tile_copy.cache_clear()
+    base = torch.randn(8 + 2 * 35 * 3 * dim, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    x = base[8:].view(2, 35, 3, dim)[:, :33]
+    src = torch.randperm(33, device='cuda')
+    dst = torch.randperm(48, device='cuda')[:33]
+    monkeypatch.delenv('FASTVIDEO_VSA_COMPILE_TILE', raising=False)
+    reference = m._TilePermutation.apply(x, src, dst, 48)
+    assert m._compiled_tile_copy.cache_info().misses == 0
+    monkeypatch.setenv('FASTVIDEO_VSA_COMPILE_TILE', '1')
+    actual = m._TilePermutation.apply(x, src, dst, 48)
+    torch.testing.assert_close(reference, actual, atol=0, rtol=0)
+    gradients = [torch.autograd.grad(t.square().sum(), base, create_graph=True)[0] for t in (reference, actual)]
+    torch.testing.assert_close(*gradients, atol=0, rtol=0)
+    second = [torch.autograd.grad(t.sum(), base)[0] for t in gradients]
+    torch.testing.assert_close(*second, atol=0, rtol=0)
+    actual = m._TilePermutation.apply(x, src, dst, 48)
+    src.add_(0)
+    with pytest.raises(RuntimeError, match='modified by an inplace operation'):
+        torch.autograd.grad(actual.sum(), base)
+    assert m._compiled_tile_copy.cache_info().misses == 1
+    with torch.no_grad():
+        base[8:].view(2, 35, 3, dim)[:, 0].fill_(float('nan'))
+    monkeypatch.delenv('FASTVIDEO_VSA_COMPILE_TILE')
+    reference = m._TilePermutation.apply(x, src, dst, 48)
+    monkeypatch.setenv('FASTVIDEO_VSA_COMPILE_TILE', '1')
+    actual = m._TilePermutation.apply(x, src, dst, 48)
+    # Padding reads row zero internally but must still become exact zero, not NaN.
+    assert torch.equal(reference.view(torch.int16), actual.view(torch.int16))
+
+
+def test_compiled_tile_unsupported_inputs_keep_native(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    def forbidden():
+        raise AssertionError('unsupported input invoked compiler')
+    monkeypatch.setenv('FASTVIDEO_VSA_COMPILE_TILE', '1')
+    monkeypatch.setattr(m, '_compiled_tile_copy', forbidden)
+    misaligned = torch.randn(1 + 2 * 33 * 3 * 128, device='cuda', dtype=torch.bfloat16)[1:].view(2, 33, 3, 128)
+    for x in (torch.randn(2, 33, 3, 128), torch.randn(2, 33, 3, 128, device='cuda'), misaligned):
+        src = torch.randperm(33, device=x.device)
+        dst = torch.randperm(48, device=x.device)[:33]
+        expected = m.scatter_into_tile_buf(x, (2, 48, 3, 128), dst, None, src)
+        torch.testing.assert_close(m._TilePermutation.apply(x, src, dst, 48), expected, atol=0, rtol=0)
