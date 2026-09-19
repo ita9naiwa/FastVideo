@@ -7,8 +7,8 @@ edge ("route A"), and requires no optional dependencies.
 The FA4 CuTe block-sparse fastpath (intended for Blackwell sm_100+) is
 *opt-in* via ``FASTVIDEO_VSA_CUTEDSL=1``. It routes to
 :mod:`fastvideo_kernel.block_sparse_attn_cute_fwd`, which natively operates
-on 128-token Q/KV blocks (the 256 wrapper expands its logical KV map and
-sizes into that physical representation). The CuTe kernel
+on native 256-token blocks for supported BSHD training inputs, with 128-token
+expansion retained for other paths. The CuTe kernel
 (``flash_attn.cute`` with block-sparsity) is an optional dependency,
 imported lazily only when this fastpath is selected.
 
@@ -233,6 +233,21 @@ def block_sparse_attn_256_bshd(
         )
         return out_bhsd.transpose(1, 2).contiguous(), aux
 
-    mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
+    if (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+            and q.is_cuda and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.ndim == k.ndim == v.ndim == 4
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] and q.shape[-1] in (64, 128)
+            and q.shape[0] == k.shape[0] == v.shape[0]
+            and q.shape[2] == k.shape[2] == v.shape[2]
+            and k.shape[1] == v.shape[1]
+            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+            and q.shape[1] == logical_block_map_256.shape[2] * 256
+            and k.shape[1] == logical_block_map_256.shape[3] * 256
+            and logical_block_map_256.shape[:2] == (q.shape[0], q.shape[2])
+            and torch.cuda.get_device_capability(q.device)[0] == 10):
+        out, lse = block_sparse_attn_cute_fwd_bshd(
+            q, k, v, logical_block_map_256, logical_variable_block_sizes_256)
+        return out, lse.detach()
+    mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)

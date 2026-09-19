@@ -173,8 +173,8 @@ def test_vsa256_cute_backward_cross_q_kv(layout: str) -> None:
 
 @pytest.mark.cuda
 def test_vsa256_cute_inference_matches_training_forward() -> None:
-    """The KV-owned backward metadata is only built when something requires
-    grad. Skipping it must not perturb the forward result."""
+    """Training may use native256 while inference retains expanded128.
+    Both implement the same operator, with the existing output tolerance."""
     kv_var = torch.tensor([256, 173, 79, 256], dtype=torch.int32, device="cuda")
     q_var = torch.full((3, ), _BLOCK, dtype=torch.int32, device="cuda")
     q, k, v, _ = _make_inputs(3, 4, kv_var, q_var, seed=5)
@@ -192,7 +192,7 @@ def test_vsa256_cute_inference_matches_training_forward() -> None:
         )
 
     out_train, _ = _run_bshd(q, k, v, kv_var, q_var, 2)
-    torch.testing.assert_close(out_infer, out_train.transpose(1, 2).detach(), rtol=0, atol=0)
+    _check("inference-training", out_infer, out_train.transpose(1, 2).detach(), _OUT_TOL)
 
 
 @pytest.mark.cuda
