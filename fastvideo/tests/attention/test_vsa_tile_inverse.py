@@ -88,3 +88,16 @@ def test_inverse_tile_builder_rejects_mutated_cached_indices():
     again = builder.build(*args, cache_tile_buf=False)
     assert again.tile_partition_indices is first.tile_partition_indices
     assert again._tile_index_state is None
+
+
+@pytest.mark.parametrize('batch,offset,dim', [(1, 0, 16), (2, 8, 16), (2, 1, 16), (2, 0, 3)])
+def test_tile_row_gather_preserves_alignment_and_stride_fallback(batch, offset, dim):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    storage = torch.randn(batch * 33 * 3 * dim + offset, device='cuda', dtype=torch.bfloat16)
+    x = storage[offset:].view(batch, 33, 3, dim)
+    index = torch.randperm(33, device='cuda')
+    for tensor in (x, x[..., ::2]):
+        expected = tensor.index_select(1, index)
+        actual = m._gather_tile_rows(tensor, index)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

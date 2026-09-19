@@ -191,6 +191,15 @@ def scatter_into_tile_buf(
     return buf
 
 
+def _gather_tile_rows(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    # Make aligned multi-batch gathers 2-D for PyTorch's vectorized row path.
+    if (x.shape[0] > 1 and x.is_contiguous() and x.data_ptr() % 16 == 0 and x.stride(1) * x.element_size() % 16 == 0):
+        batch, length, heads, dim = x.shape
+        rows = (index[None, :] + torch.arange(batch, device=x.device, dtype=index.dtype)[:, None] * length).flatten()
+        return x.view(batch * length, heads * dim).index_select(0, rows).view(batch, index.numel(), heads, dim)
+    return x.index_select(1, index)
+
+
 class _TilePermutation(torch.autograd.Function):
     """Invert builder-bijective rows with distinct nonpad destinations.
 
@@ -209,14 +218,14 @@ class _TilePermutation(torch.autograd.Function):
         inverse.index_copy_(0, partition, nonpad)
         # Retain original needed-index mutation/version checks.
         ctx.save_for_backward(partition, nonpad, inverse)
-        out = x.index_select(1, source)
+        out = _gather_tile_rows(x, source)
         out.masked_fill_(padding[None, :, None, None], 0)
         return out
 
     @staticmethod
     def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
         _partition, _nonpad, inverse = ctx.saved_tensors
-        return grad.index_select(1, inverse), None, None, None
+        return _gather_tile_rows(grad, inverse), None, None, None
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
