@@ -2,7 +2,7 @@
 
 This module adapts VSA's ``(block_map, variable_block_sizes)`` inputs into
 FA4's forward and backward ``BlockSparseTensorsTorch`` representations.
-FA4's public ``flash_attn_func`` owns the forward/backward autograd bridge.
+FA4 supplies the forward/backward kernels; this adapter bridges autograd.
 
 Both [B, H, S, D] (BHSD) and [B, S, H, D] (BSHD) entrypoints are provided.
 The BSHD variant is preferred from VSA-128/256 callers to avoid layout
@@ -13,11 +13,20 @@ The FA4 CuTe block-sparse kernel (``flash_attn.cute`` with
 only exercised when the VSA-128/256 CuTe fastpath is explicitly selected
 (``FASTVIDEO_VSA_CUTEDSL=1``). The default path is Triton and does not require
 it. Also needs ``nvidia-cutlass-dsl`` and ``quack-kernels``.
+
+``FASTVIDEO_VSA_PACK_TAILS=1`` additionally enables VSA-256 training tail packing
+for contiguous BF16 inputs on SM10x (head dimensions 64/128). It requires FA4
+backward workspace support and is opt-in: short KV tails benefit, while full
+blocks and overflowing tail plans pay preparation overhead. A device-side
+capacity check preserves the original sparse calculation on overflow.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib
+import os
+from pathlib import Path
 from typing import Tuple
 
 import torch
@@ -157,7 +166,43 @@ def _build_vbs_mask_mod(kv_block_size: int):
         valid = utils.scalar_to_ssa(kv_sizes[kv_blk[0]], cutlass.Int32)
         return (valid > zero_ssa) & (kv_off < valid)
 
+    # Exact contract for optional FA4 backward specialization: aux[0] is a
+    # 1D KV128 valid-prefix array, independent of Q, batch, and head.
+    if kv_block_size_const == 128:
+        _vbs_mask_mod.__vbs_kv_block_size__ = 128
     return _vbs_mask_mod
+
+
+@functools.lru_cache(maxsize=2)
+def _build_vbs_vector_mask_mod(kv_block_size: int):
+    """Pack one aligned SM100 KV128 fragment's validity into four masks."""
+    import cutlass
+    import cutlass.cute as cute
+    try:
+        from flash_attn.cute.mask import AttentionMask, r2p_bitmask_below
+    except ImportError:
+        return _build_vbs_mask_mod(kv_block_size)
+    if not hasattr(AttentionMask, "apply_mask_mod_sm100_vector"):
+        return _build_vbs_mask_mod(kv_block_size)
+
+    @cute.jit
+    def _vbs_vector_mask_mod(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        base = n_idx[0]
+        limit = aux_tensors[0][base // kv_block_size] - base % kv_block_size
+        packed = cute.make_rmem_tensor(4, cutlass.Uint32)
+        for word in cutlass.range_constexpr(4):
+            packed[word] = r2p_bitmask_below(limit, word)
+        return packed.load()
+
+    _vbs_vector_mask_mod.__vec_size__ = 128
+    return _vbs_vector_mask_mod
+
+
+def _build_vbs_fwd_mask_mod(q, kv_block_size: int, *, need_backward: bool = False):
+    if (not need_backward and kv_block_size in (128, 256) and q.shape[-1] in (64, 128)
+            and torch.cuda.get_device_capability(q.device)[0] in (10, 11)):
+        return _build_vbs_vector_mask_mod(kv_block_size)
+    return _build_vbs_mask_mod(kv_block_size)
 
 
 def _build_sparse_tensors(
@@ -168,15 +213,15 @@ def _build_sparse_tensors(
     q_block_size: int,
     kv_block_size: int,
     need_backward: bool,
+    need_forward: bool = True,
     force_q_sparse_block_size: int | None = None,
-) -> Tuple[object, object | None]:
+) -> Tuple[object | None, object | None]:
     """Build the Q-owned forward and KV-owned backward sparse metadata.
 
     ``need_backward`` is False on inference-only calls: the backward metadata
-    is a pair of dense ``[B, H, kv_blocks, q_blocks]`` int32 index tensors that
-    FA4 keeps alive on its autograd ctx until backward runs, so building it
-    when nothing requires grad is pure overhead (~80 MiB per call at Wan-14B
-    720p shape).
+    retains a dense ``[B, H, kv_blocks, q_blocks]`` int32 index tensor shared
+    by the full and partial lists until backward runs. Building it when
+    nothing requires grad is pure overhead.
     """
     BlockSparseTensorsTorch, _, _, _ = _load_fa4_cute()
     if force_q_sparse_block_size is None:
@@ -211,7 +256,7 @@ def _build_sparse_tensors(
     forward_sparse_tensors = from_maps(
         sparse_map & kv_full,
         sparse_map & kv_partial,
-    )
+    ) if need_forward else None
 
     if not need_backward:
         return forward_sparse_tensors, None
@@ -219,9 +264,14 @@ def _build_sparse_tensors(
     # FA4 backward is KV-owned: for each physical KV tile, list the sparse
     # query tiles that selected it. Full and partial KV tiles stay separate
     # so the token-level validity mask only runs for padded tiles.
-    backward_sparse_tensors = from_maps(
-        (sparse_map & kv_full).transpose(2, 3),
-        (sparse_map & kv_partial).transpose(2, 3),
+    # Validity is constant across each KV-owned row: only one list is active.
+    shared_idx, shared_count = _map_to_index(sparse_map.transpose(2, 3).contiguous())
+    backward_sparse_tensors = BlockSparseTensorsTorch(
+        full_block_cnt=shared_count * kv_full.reshape(1, 1, -1),
+        full_block_idx=shared_idx,
+        mask_block_cnt=shared_count * kv_partial.reshape(1, 1, -1),
+        mask_block_idx=shared_idx,
+        block_size=(q_sparse_block_size, kv_block_size),
     )
     return forward_sparse_tensors, backward_sparse_tensors
 
@@ -246,13 +296,17 @@ def _cute_attention_q128_forward(
         need_backward=need_backward,
         force_q_sparse_block_size=_FA4_Q_BLOCK_SIZE,
     )
+    mask_mod = _build_vbs_mask_mod(_FA4_Q_BLOCK_SIZE)
+    if (need_backward and q_bshd.dtype == torch.bfloat16 and q_bshd.shape[-1] in (64, 128)
+            and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
+        mask_mod = _build_vbs_vector_mask_mod(_FA4_Q_BLOCK_SIZE)
     out, lse = flash_attn_fwd(
         q_bshd,
         k_bshd,
         v_bshd,
         tile_mn=(_FA4_Q_BLOCK_SIZE, _FA4_Q_BLOCK_SIZE),
         max_seqlen_q=_SingleQStageLength(q_bshd.shape[1]),
-        mask_mod=_build_vbs_mask_mod(_FA4_Q_BLOCK_SIZE),
+        mask_mod=mask_mod,
         block_sparse_tensors=forward_sparse_tensors,
         aux_tensors=[variable_block_sizes],
         causal=False,
@@ -322,6 +376,47 @@ def _cute_attention_q128(
     return out, lse
 
 
+class _CuteAttentionQ256Training(torch.autograd.Function):
+    """Vectorize the forward mask and classify backward KV tiles at 128 tokens."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, block_map, sizes):
+        _, _, flash_attn_fwd, _ = _load_fa4_cute()
+        forward_sparse, _ = _build_sparse_tensors(
+            block_map, sizes, q_len=q.shape[1], q_block_size=256,
+            kv_block_size=256, need_backward=False,
+        )
+        # A partially filled logical block can contain a full physical KV tile.
+        # Classifying its children avoids masking that full tile in backward.
+        child_sizes = torch.stack((sizes.clamp(0, 128), (sizes - 128).clamp(0, 128)), -1).flatten()
+        _, backward_sparse = _build_sparse_tensors(
+            block_map.repeat_interleave(2, -1), child_sizes,
+            q_len=q.shape[1], q_block_size=256, kv_block_size=128,
+            need_backward=True, need_forward=False, force_q_sparse_block_size=256,
+        )
+        out, lse = flash_attn_fwd(
+            q, k, v, mask_mod=_build_vbs_vector_mask_mod(256),
+            aux_tensors=[sizes], block_sparse_tensors=forward_sparse, return_lse=True,
+        )[:2]
+        ctx.save_for_backward(q, k, v, out, lse, child_sizes)
+        ctx.backward_sparse_tensors = backward_sparse
+        ctx.set_materialize_grads(False)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, dlse):
+        q, k, v, out, lse, sizes = ctx.saved_tensors
+        if dout is None:
+            dout = torch.zeros_like(out)
+        _, _, _, flash_attn_bwd = _load_fa4_cute()
+        dq, dk, dv = flash_attn_bwd(
+            q, k, v, out, dout.contiguous(), lse,
+            mask_mod=_build_vbs_mask_mod(128), aux_tensors=[sizes],
+            block_sparse_tensors=ctx.backward_sparse_tensors, dlse=dlse,
+        )
+        return dq, dk, dv, None, None
+
+
 def _cute_attention(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
@@ -330,12 +425,26 @@ def _cute_attention(
     variable_block_sizes: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FA4's autograd-enabled block-sparse attention with BSHD inputs."""
+    if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
+        return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     _, flash_attn_func, _, _ = _load_fa4_cute()
     q_block_size = q_bshd.shape[1] // block_map.shape[2]
     kv_block_size = k_bshd.shape[1] // block_map.shape[3]
     if q_block_size == kv_block_size == _FA4_Q_BLOCK_SIZE:
         return _cute_attention_q128(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     need_backward = torch.is_grad_enabled() and any(t.requires_grad for t in (q_bshd, k_bshd, v_bshd))
+    if (need_backward and q_bshd.shape[1] == block_map.shape[2] * 256
+            and k_bshd.shape[1] == block_map.shape[3] * 256
+            and q_bshd.dtype == torch.bfloat16 and q_bshd.shape[-1] in (64, 128)
+            and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
+        if (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "0") == "1"
+                and q_bshd.shape[-1] == k_bshd.shape[-1] == v_bshd.shape[-1]
+                and q_bshd.shape[2] == k_bshd.shape[2] == v_bshd.shape[2]
+                and block_map.shape[:2] == (q_bshd.shape[0], q_bshd.shape[2])
+                and all(t.is_contiguous() for t in (q_bshd, k_bshd, v_bshd))):
+            from fastvideo_kernel.vsa_tail_backward import TailTraining
+            return TailTraining.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     forward_sparse_tensors, backward_sparse_tensors = _build_sparse_tensors(
         block_map,
         variable_block_sizes,
@@ -354,6 +463,167 @@ def _cute_attention(
         block_sparse_tensors_bwd=backward_sparse_tensors,
         return_lse=True,
     )
+
+
+@functools.lru_cache(maxsize=8)
+def _load_vc_module(name: str, root: str | None):
+    module = importlib.import_module(f"flash_attn.cute.{name}")
+    if not root or Path(module.__file__).resolve().parent != Path(root).resolve() / "flash_attn" / "cute":
+        raise RuntimeError("Set FASTVIDEO_VSA_VC_ROOT to the imported VC-enabled FA4 checkout")
+    return module
+
+
+def prepare_vsa_vc_fwd_bshd(q, k, v, source_map, sizes, block_size, query_map, query_tokens, query_offset):
+    return _load_vc_module("vc_vsa_preprocess", os.environ.get("FASTVIDEO_VSA_VC_ROOT")).prepare_vsa(
+        q, k, v, source_map, sizes, block_size,
+        padded_to_query=query_map, query_tokens=query_tokens, query_offset=query_offset,
+    )
+
+
+def _validate_vc_prepared(p, block_map, variable_block_sizes):
+    q, k, v = (p[name] for name in ("q", "k", "v"))
+    if torch.is_grad_enabled() and any(t.requires_grad for t in p.values()):
+        raise ValueError("VSA VC attention is inference-only")
+    if block_map.ndim == 3:
+        block_map = block_map.unsqueeze(0)
+    if (q.ndim != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]
+            or q.shape[2:] != k.shape[2:] or block_map.ndim != 4
+            or any(t.device != q.device or t.dtype != q.dtype for t in (k, v))
+            or min(block_map.shape) <= 0 or block_map.shape[:2] != (q.shape[0], q.shape[2])):
+        raise ValueError("prepared Q/K/V and block_map batch/head dimensions must agree")
+    if q.shape[1] % block_map.shape[2] or k.shape[1] % block_map.shape[3]:
+        raise ValueError("prepared Q/K lengths must be exact multiples of their block counts")
+    if (block_map.device != q.device or block_map.dtype != torch.bool
+            or variable_block_sizes.device != q.device or variable_block_sizes.dtype != torch.int32
+            or variable_block_sizes.shape != (block_map.shape[3],)):
+        raise ValueError("block_map must be bool and KV sizes must be an int32 vector on the Q device")
+    q_block_size = q.shape[1] // block_map.shape[2]
+    kv_block_size = k.shape[1] // block_map.shape[3]
+    if q_block_size not in (128, 256) or kv_block_size not in (128, 256):
+        raise ValueError("VSA VC attention requires 128- or 256-token logical blocks")
+    return block_map, q_block_size, kv_block_size
+
+
+def _vc_physical_sizes(sizes, block_size):
+    """Split logical 256-token parents into adjacent physical 128-token children."""
+    if block_size == 128:
+        return sizes
+    return torch.stack((sizes.clamp(0, 128), (sizes - 128).clamp(0, 128)), dim=-1).flatten()
+
+
+def _vc_sparse_tensors(block_map, sizes, q_len, q_block_size, kv_block_size):
+    if kv_block_size == 128:
+        sparse, _ = _build_sparse_tensors(
+            block_map, sizes, q_len=q_len, q_block_size=q_block_size,
+            kv_block_size=128, need_backward=False, force_q_sparse_block_size=q_block_size,
+        )
+        return sparse, sizes, 128
+    sparse_type, _, _, _ = _load_fa4_cute()
+    # Preserve the original full/masked traversal, including zero-valid children;
+    # reclassifying children changes ExpCast rounding as the running max evolves.
+    full = (block_map & (sizes == 256).view(1, 1, 1, -1)).repeat_interleave(2, -1)
+    masked = (block_map & ((sizes > 0) & (sizes < 256)).view(1, 1, 1, -1)).repeat_interleave(2, -1)
+    full_idx, full_cnt = _map_to_index(full.contiguous())
+    mask_idx, mask_cnt = _map_to_index(masked.contiguous())
+    sparse = sparse_type(full_block_idx=full_idx, full_block_cnt=full_cnt,
+                         mask_block_idx=mask_idx, mask_block_cnt=mask_cnt,
+                         block_size=(q_block_size, 128))
+    physical_sizes = _vc_physical_sizes(sizes, kv_block_size)
+    return sparse, physical_sizes, 128
+
+
+@functools.lru_cache(maxsize=4)
+def _supports_vc_vbs128(forward):
+    import inspect
+    try:
+        return "vc_vbs128" in inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes, *, return_lse=True):
+    # LSE is centered/quantized auxiliary output, not a BF16 partition-merge weight.
+    block_map, q_block_size, kv_block_size = _validate_vc_prepared(p, block_map, variable_block_sizes)
+    sparse, variable_block_sizes, kv_block_size = _vc_sparse_tensors(
+        block_map, variable_block_sizes, p["q"].shape[1], q_block_size, kv_block_size,
+    )
+    return _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse)
+
+
+def _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse):
+    interface = _load_vc_module("interface", os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
+    q, k, v = (p[name] for name in ("q", "k", "v"))
+    compact = (q_block_size == 128 and kv_block_size == 128 and q.shape[-1] == v.shape[-1] == 128
+               and q.shape[-2] == k.shape[-2] == v.shape[-2]
+               and torch.cuda.get_device_capability(q.device) == (10, 3)
+               and _supports_vc_vbs128(interface._flash_attn_fwd))
+    mask_options = ({"vc_vbs128": True} if compact else {"mask_mod": _build_vbs_fwd_mask_mod(q, kv_block_size)})
+    return interface._flash_attn_fwd(
+        q, k, v, q_descale=p["qs"], k_descale=p["ks"], vc_vscale=p["vs"], vc_expcast=True,
+        tile_mn=(_FA4_Q_BLOCK_SIZE, _FA4_Q_BLOCK_SIZE),
+        max_seqlen_q=_SingleQStageLength(q.shape[1]) if q_block_size == 128 else q.shape[1],
+        block_sparse_tensors=sparse, aux_tensors=[variable_block_sizes], return_lse=return_lse,
+        **mask_options,
+    )[:2]
+
+
+
+def block_sparse_attn_vc_routes_fwd_bshd(
+    p, selected, variable_block_sizes, block_size, prefix, document_start=0, *, return_lse=True,
+):
+    """Consume unique top-k parent IDs directly, without a dense block map.
+
+    selected is int64 [B,H,Q_blocks,K], using document-global block IDs.
+    Each row must contain unique IDs from this document's non-prefix blocks;
+    callers own value validation. Prefix blocks are included automatically.
+    Parent classification and ascending full/partial traversal match the map API.
+    LSE is quantized auxiliary state, not a BF16 partition-merge weight.
+    """
+    q, k, v = (p[name] for name in ("q", "k", "v"))
+    if torch.is_grad_enabled() and any(t.requires_grad for t in p.values()):
+        raise ValueError("VSA VC attention is inference-only")
+    if (q.ndim != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]
+            or q.shape[2:] != k.shape[2:] or selected.ndim != 4
+            or selected.shape[:2] != (q.shape[0], q.shape[2])
+            or q.shape[1] != selected.shape[2] * block_size
+            or k.shape[1] != variable_block_sizes.numel() * block_size
+            or selected.device != q.device
+            or any(t.device != q.device or t.dtype != q.dtype for t in (k, v))):
+        raise ValueError("prepared Q/K/V lengths, devices and route dimensions must agree")
+    native = _load_vc_module("vc_vsa_preprocess", os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
+    full_idx, full_cnt, mask_idx, mask_cnt = native.prepare_vsa_routes(
+        selected, variable_block_sizes, block_size, prefix, document_start,
+    )
+    sparse_type, _, _, _ = _load_fa4_cute()
+    sparse = sparse_type(full_block_idx=full_idx, full_block_cnt=full_cnt,
+                        mask_block_idx=mask_idx, mask_block_cnt=mask_cnt,
+                        block_size=(block_size, 128))
+    physical_sizes = _vc_physical_sizes(variable_block_sizes, block_size)
+    return _vc_prepared_sparse(p, sparse, physical_sizes, block_size, 128, return_lse)
+
+
+def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes):
+    """Opt-in FP8/ExpCast self-attention; retain VSA routing and padded-KV masks.
+
+    No V-Smooth or token regrouping: those would require sparse mean-restoration
+    support. Coarse attention and top-k selection remain in their original dtype.
+    FASTVIDEO_VSA_VC_ROOT must identify the already imported VC-enabled FA4 checkout.
+    Returned LSE describes centered, quantized K and ExpCast normalization; it is
+    auxiliary only and must not be used to merge dense BF16 attention partitions.
+    """
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
+        raise ValueError("VSA VC attention is inference-only")
+    if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:] or q.shape[1] > k.shape[1]:
+        raise ValueError("VSA VC attention requires matching batch/heads/dim, k/v shapes, and Q length <= KV length")
+    vc_preprocess = _load_vc_module("vc_preprocess", os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
+    # Native preparation shares a Q/K token count. Zero Q padding leaves its
+    # maximum and all K/V statistics unchanged; only real queries reach attention.
+    q_padded = q if q.shape[1] == k.shape[1] else torch.nn.functional.pad(
+        q, (0, 0, 0, 0, 0, k.shape[1] - q.shape[1]))
+    p = vc_preprocess.prepare(q_padded.contiguous(), k.contiguous(), v.contiguous(), smooth=False, bshd=True)
+    p["q"] = p["q"][:, :q.shape[1]]
+    out, lse = block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes)
+    return out.to(q.dtype), lse
 
 
 def block_sparse_attn_cute_fwd(
@@ -403,4 +673,18 @@ def block_sparse_attn_cute_fwd_bshd(
         variable_block_sizes,
     )
     # lse is [B, H, S] regardless of the q/k/v layout; see above.
+    return out, lse.detach()
+
+
+def block_sparse_attn_vc_fwd_bshd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_map: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Explicit inference-only VC entrypoint, independent of backend environment flags."""
+    if block_map.dim() == 3:
+        block_map = block_map.unsqueeze(0)
+    out, lse = _vc_sparse_attention(q, k, v, block_map, variable_block_sizes)
     return out, lse.detach()

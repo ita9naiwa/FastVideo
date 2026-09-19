@@ -193,6 +193,55 @@ This package also includes kernels from [TurboDiffusion](https://github.com/thu-
   - `CUDACXX` must be set (for example, `$CUDA_HOME/bin/nvcc`)
   - C++20 compatible compiler (GCC 10+, Clang 11+)
 
+## BSHD VSA compression and optional output fusion
+
+`video_sparse_attn_bshd` uses native FP32 accumulation and fused broadcast
+gradients for 128/256-token blocks. Contiguous BF16 inputs with an 8-byte-aligned
+actual pointer avoid full FP32 Q/K/V copies, including nonzero-offset views.
+Other dtypes retain the zero-offset, 16-byte-alignment guard; other layouts
+retain the original forward expression. Cancellation tests cover pooled values and top-k routing. Padding must remain zero,
+just as in the original expression; gradients are broadcast to every padded
+slot. Unsupported layouts retain the PyTorch expression.
+
+For contiguous BF16/D128 training inputs, one autograd node exposes each fine
+input and its pooled value, allowing backward to join both gradients in the
+broadcast kernel. The join allocates its own output and preserves the FP32
+division followed by BF16 rounding before addition. Overlapping Q/K/V ranges
+retain the original accumulation graph; unused gradient branches and
+higher-order compression retain the existing helper behavior.
+
+For gated contiguous BF16/D128 training with at least `2**25` and at most
+`2**31 - 1` output elements, the default path uses native broadcast-weighting
+kernels. Fine addition stays in PyTorch autograd, and the coarse gradient retains
+the same BF16 product and native sum. Small inputs and unsupported layouts fall
+back; the explicit compiled option below takes priority.
+
+For repeated BF16, head-dimension-128 training calls, set
+`FASTVIDEO_VSA_COMPILE_COMBINE=1` to compile only the final coarse-output
+broadcast, gate multiplication and addition. This is optional and defaults off.
+It requires contiguous tensors and PyTorch Inductor's `emulate_precision_casts`
+option, which preserves the BF16 rounding between multiplication and addition.
+Other layouts use the eager path. Each new shape can incur compilation cost;
+warm up the chosen shapes before CUDA Graph capture or steady-state timing.
+The attention backend and sparse routing are unchanged.
+
+Generic FastVideo cache-disabled training tiling has a separate opt-in:
+`FASTVIDEO_VSA_COMPILE_TILE=1` fuses the input gather and padding-zero copy with
+PyTorch Inductor. It defaults off; native inverse-gather backward is unchanged.
+The path retains builder-owned permutation checks and admits aligned BF16
+head dimensions 64/128, at least `2**25` input elements, and input spans/output
+sizes below `2**31` elements. Other inputs stay native. One compiled callable
+is shared across layers, with shape/layout specializations. First use can take several seconds even with a disk cache.
+Warm every actual shape/stride/device specialization, including backward,
+before CUDA Graph capture or steady-state timing. This does not enable
+`FASTVIDEO_VSA_COMPILE_COMBINE` or change attention routing.
+
+The native 256-token BSHD training path also accepts aligned BF16 views such as
+packed QKV, sequence strides and head transposes: the last stride must be one,
+the pointer 16-byte aligned, and outer strides positive multiples of eight
+elements. Existing contiguous admission is preserved. Inference and unsupported
+layouts retain their previous dispatch; the public auxiliary LSE stays detached.
+
 ## Acknowledgement
 
 This package structure and build system are based on [sgl-kernel](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) from the SGLang project.

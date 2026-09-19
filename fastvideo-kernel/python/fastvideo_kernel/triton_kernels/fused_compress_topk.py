@@ -24,7 +24,9 @@ def _fused_block_mean_kernel(
     X_ptr,
     Out_ptr,
     VBS_ptr,
-    stride_x_bh,
+    stride_x_b,
+    stride_x_h,
+    num_heads: tl.constexpr,
     stride_x_seq,
     stride_o_bh,
     stride_o_blk,
@@ -32,28 +34,31 @@ def _fused_block_mean_kernel(
     BLOCK_ELEMENTS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
+    EXACT_DIV: tl.constexpr = False,
 ):
     """Fused block mean: one program computes mean of one block for one (b,h).
 
-    X is viewed as [B*H, num_blocks*BLOCK_ELEMENTS, HEAD_DIM] contiguous.
+    X uses separate batch/head strides, supporting both BHSD and BSHD.
     Out is [B*H, num_blocks, HEAD_DIM] contiguous.
     2D load + parallel tl.sum reduction, accumulates in fp32.
     """
-    block_idx = tl.program_id(0)
-    bh_idx = tl.program_id(1)
+    # Widen before stride products: supported tensors can exceed 2**31 elements.
+    block_idx = tl.program_id(0).to(tl.int64)
+    bh_idx = tl.program_id(1).to(tl.int64)
 
     if block_idx >= num_blocks:
         return
 
     vbs = tl.load(VBS_ptr + block_idx).to(tl.float32)
 
-    x_base = X_ptr + bh_idx * stride_x_bh + block_idx * BLOCK_ELEMENTS * stride_x_seq
+    x_base = X_ptr + (bh_idx // num_heads) * stride_x_b + (bh_idx % num_heads) * stride_x_h + block_idx * BLOCK_ELEMENTS * stride_x_seq
 
     row_offsets = tl.arange(0, BLOCK_ELEMENTS)
     dim_offsets = tl.arange(0, HEAD_DIM)
     offsets = row_offsets[:, None] * stride_x_seq + dim_offsets[None, :]
     block_data = tl.load(x_base + offsets).to(tl.float32)
-    acc = tl.sum(block_data, axis=0) / vbs
+    total = tl.sum(block_data, axis=0)
+    acc = tl.div_rn(total, vbs) if EXACT_DIV else total / vbs
 
     out_base = Out_ptr + bh_idx * stride_o_bh + block_idx * stride_o_blk + dim_offsets
     tl.store(out_base, acc.to(OUTPUT_DTYPE))
@@ -66,12 +71,16 @@ def _fused_block_mean_bwd_kernel(
     VBS_ptr,
     stride_go_bh,
     stride_go_blk,
-    stride_gx_bh,
+    stride_gx_b,
+    stride_gx_h,
+    num_heads: tl.constexpr,
     stride_gx_seq,
     num_blocks,
     BLOCK_ELEMENTS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
+    EXACT_DIV: tl.constexpr = False,
+    FineGrad_ptr=None,
 ):
     """Backward of block mean: broadcast grad_out / vbs to each token in the block.
 
@@ -80,8 +89,8 @@ def _fused_block_mean_bwd_kernel(
     GradX  is [B*H, num_blocks*BLOCK_ELEMENTS, HEAD_DIM].
     2D store writes all BLOCK_ELEMENTS rows in parallel.
     """
-    block_idx = tl.program_id(0)
-    bh_idx = tl.program_id(1)
+    block_idx = tl.program_id(0).to(tl.int64)
+    bh_idx = tl.program_id(1).to(tl.int64)
 
     if block_idx >= num_blocks:
         return
@@ -90,12 +99,17 @@ def _fused_block_mean_bwd_kernel(
 
     dim_offsets = tl.arange(0, HEAD_DIM)
     go_base = GradOut_ptr + bh_idx * stride_go_bh + block_idx * stride_go_blk
-    grad_val = tl.load(go_base + dim_offsets).to(tl.float32) / vbs
+    grad = tl.load(go_base + dim_offsets).to(tl.float32)
+    grad_val = tl.div_rn(grad, vbs) if EXACT_DIV else grad / vbs
 
     row_offsets = tl.arange(0, BLOCK_ELEMENTS)
-    gx_base = GradX_ptr + bh_idx * stride_gx_bh + block_idx * BLOCK_ELEMENTS * stride_gx_seq
+    base = (bh_idx // num_heads) * stride_gx_b + (bh_idx % num_heads) * stride_gx_h + block_idx * BLOCK_ELEMENTS * stride_gx_seq
+    gx_base = GradX_ptr + base
     offsets = row_offsets[:, None] * stride_gx_seq + dim_offsets[None, :]
     grad_2d = tl.broadcast_to(grad_val[None, :], [BLOCK_ELEMENTS, HEAD_DIM])
+    if FineGrad_ptr is not None:
+        # Compression rounds before the ordinary fine/coarse gradient addition.
+        grad_2d = grad_2d.to(OUTPUT_DTYPE).to(tl.float32) + tl.load(FineGrad_ptr + base + offsets).to(tl.float32)
     tl.store(gx_base + offsets, grad_2d.to(OUTPUT_DTYPE))
 
 
@@ -127,8 +141,10 @@ def _fused_block_mean_bwd(
         variable_block_sizes,
         go_flat.stride(0),
         go_flat.stride(1),
-        gx_flat.stride(0),
-        gx_flat.stride(1),
+        grad_x.stride(0),
+        grad_x.stride(1),
+        H,
+        grad_x.stride(2),
         num_blocks,
         BLOCK_ELEMENTS=block_elements,
         HEAD_DIM=D,
@@ -147,20 +163,23 @@ def _fused_block_mean_fwd(
     num_blocks = seq_len // block_elements
     assert seq_len % block_elements == 0
 
-    x = x.contiguous()
+    if not (block_elements == 128 and x.dtype == torch.bfloat16 and D in (64, 128) and x.stride(-1) == 1
+            and x.data_ptr() % 16 == 0 and all(s > 0 and s % 8 == 0 for s in x.stride()[:-1])):
+        x = x.contiguous()
     out = torch.empty(B, H, num_blocks, D, dtype=x.dtype, device=x.device)
 
-    x_flat = x.view(B * H, seq_len, D)
     out_flat = out.view(B * H, num_blocks, D)
 
     grid = (num_blocks, B * H)
 
     _fused_block_mean_kernel[grid](
-        x_flat,
+        x,
         out_flat,
         variable_block_sizes,
-        x_flat.stride(0),
-        x_flat.stride(1),
+        x.stride(0),
+        x.stride(1),
+        H,
+        x.stride(2),
         out_flat.stride(0),
         out_flat.stride(1),
         num_blocks,
@@ -185,6 +204,49 @@ class _FusedBlockMeanAutograd(torch.autograd.Function):
         variable_block_sizes, = ctx.saved_tensors
         block_elements = ctx.block_elements
         return _fused_block_mean_bwd(grad_output, variable_block_sizes, block_elements), None, None
+
+
+class _ForkBlockMeanBHSD(_FusedBlockMeanAutograd):
+    """Join fine and pooled gradients without changing the BHSD mean operator."""
+
+    @staticmethod
+    def forward(ctx, x, sizes, block):
+        ctx.set_materialize_grads(False)
+        pooled = _FusedBlockMeanAutograd.forward(ctx, x, sizes, block)
+        return x.view_as(x), pooled
+
+    @staticmethod
+    def backward(ctx, fine, coarse):
+        if coarse is None:
+            return fine, None, None
+        if (fine is None or torch.is_grad_enabled()
+                or not (fine.is_contiguous() or fine.transpose(1, 2).is_contiguous())):
+            expanded, _, _ = _FusedBlockMeanAutograd.backward(ctx, coarse)
+            return expanded if fine is None else fine + expanded, None, None
+        sizes, = ctx.saved_tensors
+        coarse = coarse.contiguous()
+        b, h, nb, d = coarse.shape
+        out = torch.empty_like(fine)
+        _fused_block_mean_bwd_kernel[(nb, b * h)](
+            coarse, out, sizes, coarse.stride(1), coarse.stride(2),
+            out.stride(0), out.stride(1), h, out.stride(2), nb,
+            BLOCK_ELEMENTS=ctx.block_elements, HEAD_DIM=d,
+            OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[coarse.dtype], EXACT_DIV=False,
+            FineGrad_ptr=fine,
+        )
+        return out, None, None
+
+
+def _fork_bhsd_admitted(tensors, sizes, qsizes, block):
+    if not (torch.is_grad_enabled() and any(x.requires_grad for x in tensors)
+            and block == 128 and all(x.is_cuda and x.device == tensors[0].device and x.dtype == torch.bfloat16
+                and x.shape[-1] == 128 and (x.is_contiguous() or x.transpose(1, 2).is_contiguous())
+                for x in tensors)
+            and all(s.is_contiguous() and s.device == tensors[0].device
+                and s.dtype in (torch.int32, torch.int64) for s in (sizes, qsizes))):
+        return False
+    spans = [(x.data_ptr(), x.data_ptr() + x.numel() * x.element_size()) for x in tensors]
+    return all(a1 <= b0 or b1 <= a0 for i, (a0, a1) in enumerate(spans) for b0, b1 in spans[i + 1:])
 
 
 def fused_block_mean(
@@ -346,3 +408,183 @@ def fused_topk_mask(
     )
 
     return mask
+
+
+class _FusedBlockMeanBSHD(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, sizes, block):
+        b, seq, h, d = x.shape
+        assert x.stride(-1) == 1 and d in (64, 128) and seq % block == 0
+        ctx.save_for_backward(sizes)
+        ctx.block = block
+        # Preserve ATen's reduction order: cancellation can otherwise change
+        # discrete top-k routes. Accumulate in FP32 without a full FP32 copy.
+        blocks = x.view(b, seq // block, block, h, d)
+        # ATen output vec4 requires 8-byte BF16 pointer alignment, including
+        # contiguous views with nonzero storage offsets. Other layouts keep
+        # the original float() conversion and its reduction order.
+        direct_sum = x.is_contiguous() and (
+            (x.dtype == torch.bfloat16 and x.data_ptr() % 8 == 0)
+            or (x.storage_offset() == 0 and x.data_ptr() % 16 == 0))
+        pooled = blocks.sum(dim=2, dtype=torch.float32) if direct_sum else blocks.float().sum(dim=2)
+        pooled = (pooled / sizes.view(1, -1, 1, 1)).to(x.dtype)
+        return pooled.permute(0, 2, 1, 3).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad):
+        sizes, = ctx.saved_tensors
+        b, h, nb, d = grad.shape
+        if torch.is_grad_enabled():
+            # Preserve the original expression for higher-order autograd.
+            per_block = (grad.float() / sizes.view(1, 1, nb, 1)).to(grad.dtype)
+            expanded = per_block.permute(0, 2, 1, 3).unsqueeze(2)
+            return expanded.expand(b, nb, ctx.block, h, d).reshape(b, nb * ctx.block, h, d), None, None
+        grad = grad.contiguous()
+        out = torch.empty(b, nb * ctx.block, h, d, device=grad.device, dtype=grad.dtype)
+        _fused_block_mean_bwd_kernel[(nb, b * h)](
+            grad, out, sizes, grad.stride(1), grad.stride(2),
+            out.stride(0), out.stride(2), h, out.stride(1), nb,
+            BLOCK_ELEMENTS=ctx.block, HEAD_DIM=d,
+            OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[grad.dtype], EXACT_DIV=True,
+        )
+        return out, None, None
+
+
+def fused_block_mean_bshd(x: torch.Tensor, sizes: torch.Tensor, block: int) -> torch.Tensor:
+    """Compress BSHD blocks to BHND; aligned contiguous inputs avoid an FP32 copy.
+
+    As in the original compression expression, padding participates in the sum
+    and backward broadcasts to every padded slot. The caller supplies zero
+    padding and valid divisors. Unsupported layouts use that original expression.
+    """
+    b, seq, h, d = x.shape
+    if (x.is_cuda and x.dtype in _TORCH_TO_TRITON_DTYPE and d in (64, 128)
+            and x.stride(-1) == 1 and sizes.device == x.device
+            and sizes.dtype in (torch.int32, torch.int64) and block in (128, 256)):
+        return _FusedBlockMeanBSHD.apply(x, sizes.reshape(-1).contiguous(), block)
+    pooled = x.view(b, seq // block, block, h, d).float().sum(dim=2)
+    pooled = (pooled / sizes.view(1, -1, 1, 1)).to(x.dtype)
+    return pooled.permute(0, 2, 1, 3).contiguous()
+
+
+class _ForkBlockMeanBSHD(_FusedBlockMeanBSHD):
+    """Native autograd gathers fine and pooled gradients at one node."""
+
+    @staticmethod
+    def forward(ctx, x, sizes, block):
+        ctx.set_materialize_grads(False)
+        pooled = _FusedBlockMeanBSHD.forward(ctx, x, sizes, block)
+        return x.view_as(x), pooled
+
+    @staticmethod
+    def backward(ctx, fine, coarse):
+        if coarse is None:
+            return fine, None, None
+        if fine is None or torch.is_grad_enabled() or not fine.is_contiguous():
+            expanded, _, _ = _FusedBlockMeanBSHD.backward(ctx, coarse)
+            return expanded if fine is None else fine + expanded, None, None
+        sizes, = ctx.saved_tensors
+        coarse = coarse.contiguous()
+        b, h, nb, d = coarse.shape
+        out = torch.empty_like(fine)
+        _fused_block_mean_bwd_kernel[(nb, b * h)](
+            coarse, out, sizes, coarse.stride(1), coarse.stride(2),
+            out.stride(0), out.stride(2), h, out.stride(1), nb,
+            BLOCK_ELEMENTS=ctx.block, HEAD_DIM=d,
+            OUTPUT_DTYPE=_TORCH_TO_TRITON_DTYPE[coarse.dtype], EXACT_DIV=True,
+            FineGrad_ptr=fine,
+        )
+        return out, None, None
+
+
+def _fork_block_mean_bshd(x, sizes, block):
+    # Keep inference, other dtypes/dimensions and unsupported layouts unchanged.
+    if (torch.is_grad_enabled() and x.requires_grad and x.is_cuda
+            and x.dtype == torch.bfloat16 and x.shape[-1] == 128 and x.is_contiguous()
+            and sizes.device == x.device and sizes.is_contiguous()
+            and sizes.dtype in (torch.int32, torch.int64) and block in (128, 256)):
+        return _ForkBlockMeanBSHD.apply(x, sizes, block)
+    return x, fused_block_mean_bshd(x, sizes, block)
+
+
+@triton.jit
+def _weighted_bshd_fwd(C, G, O, N: tl.constexpr, HD: tl.constexpr, BLOCK: tl.constexpr,
+                       TILE: tl.constexpr):
+    i = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = i < N
+    ci = (i // (BLOCK * HD)) * HD + i % HD
+    coarse = tl.load(C + ci, valid, 0).to(tl.float32)
+    gate = tl.load(G + i, valid, 0).to(tl.float32)
+    tl.store(O + i, coarse * gate, valid)
+
+
+@triton.jit
+def _weighted_bshd_bwd(D, C, G, DC, DG, N: tl.constexpr, HD: tl.constexpr, BLOCK: tl.constexpr,
+                       NEED_C: tl.constexpr, NEED_G: tl.constexpr, TILE: tl.constexpr):
+    i = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = i < N
+    value = tl.load(D + i, valid, 0).to(tl.float32)
+    if NEED_C:
+        gate = tl.load(G + i, valid, 0).to(tl.float32)
+        tl.store(DC + i, value * gate, valid)
+    if NEED_G:
+        ci = (i // (BLOCK * HD)) * HD + i % HD
+        coarse = tl.load(C + ci, valid, 0).to(tl.float32)
+        tl.store(DG + i, value * coarse, valid)
+
+
+class _WeightedBSHD(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, coarse, gate, block):
+        ctx.save_for_backward(coarse if ctx.needs_input_grad[1] else None,
+                              gate if ctx.needs_input_grad[0] else None)
+        ctx.block = block
+        out = torch.empty_like(gate)
+        _, _, heads, dim = gate.shape
+        _weighted_bshd_fwd[(triton.cdiv(gate.numel(), 1024),)](
+            coarse, gate, out, N=gate.numel(), HD=heads * dim, BLOCK=block, TILE=1024,
+            enable_fp_fusion=False)
+        return out
+
+    @staticmethod
+    def backward(ctx, dy):
+        coarse, gate = ctx.saved_tensors
+        batch, seq, heads, dim = dy.shape
+        shape = (batch, seq // ctx.block, ctx.block, heads, dim)
+        need_c, need_g, _ = ctx.needs_input_grad
+        dc = dg = None
+        if torch.is_grad_enabled() or not dy.is_contiguous():
+            if need_c:
+                dc = (dy * gate).view(shape).sum(2)
+            if need_g:
+                dg = (dy.view(shape) * coarse.unsqueeze(2)).reshape_as(dy)
+        else:
+            weighted = torch.empty_like(dy) if need_c else None
+            dg = torch.empty_like(dy) if need_g else None
+            _weighted_bshd_bwd[(triton.cdiv(dy.numel(), 1024),)](
+                dy, coarse, gate, weighted, dg, N=dy.numel(), HD=heads * dim,
+                BLOCK=ctx.block, NEED_C=need_c, NEED_G=need_g, TILE=1024)
+            if need_c:
+                # Preserve the BF16 product and the existing native reduction order.
+                dc = weighted.view(shape).sum(2)
+        return dc, dg, None
+
+
+def _combine_weighted_bshd(fine, coarse, gate, block, fallback):
+    tensors = (fine, coarse) if gate is None else (fine, coarse, gate)
+    eligible = (gate is not None and torch.is_grad_enabled()
+                and any(x.requires_grad for x in tensors) and block in (128, 256)
+                and fine.ndim == 4 and fine.shape[-1] == 128 and fine.shape[1] % block == 0
+                # Small inputs favor native launches; cap flattened int32 offsets.
+                and 2**25 <= fine.numel() <= 2**31 - 1
+                and coarse.shape == (fine.shape[0], fine.shape[1] // block, fine.shape[2], fine.shape[3])
+                and all(x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous()
+                        and x.device == fine.device for x in tensors)
+                and gate.shape == fine.shape)
+    if eligible:
+        ranges = [(x.data_ptr(), x.data_ptr() + x.numel() * x.element_size()) for x in tensors]
+        eligible = all(a[1] <= b[0] or b[1] <= a[0]
+                       for i, a in enumerate(ranges) for b in ranges[i + 1:])
+    # Keep addition in native autograd: requesting only fine must prune the
+    # weighted branch, including its saved-tensor version checks.
+    return fine + _WeightedBSHD.apply(coarse, gate, block) if eligible else fallback(fine, coarse, gate, block)
