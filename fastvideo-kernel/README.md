@@ -202,6 +202,13 @@ expression. Cancellation tests cover pooled values and top-k routing. Padding mu
 just as in the original expression; gradients are broadcast to every padded
 slot. Unsupported layouts retain the PyTorch expression.
 
+For contiguous BF16/D128 training inputs, one autograd node exposes each fine
+input and its pooled value, allowing backward to join both gradients in the
+broadcast kernel. The join allocates its own output and preserves the FP32
+division followed by BF16 rounding before addition. Overlapping Q/K/V ranges
+retain the original accumulation graph; unused gradient branches and
+higher-order compression retain the existing helper behavior.
+
 For repeated BF16, head-dimension-128 training calls, set
 `FASTVIDEO_VSA_COMPILE_COMBINE=1` to compile only the final coarse-output
 broadcast, gate multiplication and addition. This is optional and defaults off.

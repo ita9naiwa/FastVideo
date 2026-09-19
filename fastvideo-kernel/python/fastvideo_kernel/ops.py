@@ -10,7 +10,7 @@ from .block_sparse_attn_256 import (
     block_sparse_attn_256_bshd,
 )
 from .triton_kernels.st_attn_triton import sliding_tile_attention_triton
-from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask
+from .triton_kernels.fused_compress_topk import fused_block_mean, fused_block_mean_bshd, fused_topk_mask, _fork_block_mean_bshd
 
 # Try to load the C++ extension
 try:
@@ -195,9 +195,23 @@ def video_sparse_attn_bshd(
     # Compression branch (BSHD-native: match fused_block_mean's semantics).
     # Padding values are expected to be zero; gradients are broadcast across
     # the full padded block, just like the BHSD fused common path.
-    q_ch = fused_block_mean_bshd(q, q_variable_block_sizes, block_elements)
-    k_ch = fused_block_mean_bshd(k, variable_block_sizes, block_elements)
-    v_ch = fused_block_mean_bshd(v, variable_block_sizes, block_elements)
+    # Preserve the original BF16 accumulation graph when Q/K/V overlap.
+    tensors = (q, k, v)
+    independent = (torch.is_grad_enabled() and any(x.requires_grad for x in tensors)
+                   and all(x.is_cuda and x.dtype == torch.bfloat16 and x.shape[-1] == 128
+                           and x.is_contiguous() for x in tensors))
+    if independent:
+        ranges = [(x.data_ptr(), x.data_ptr() + x.numel() * x.element_size()) for x in tensors]
+        independent = all(ranges[i][1] <= ranges[j][0] or ranges[j][1] <= ranges[i][0]
+                          for i, j in ((0, 1), (0, 2), (1, 2)))
+    if independent:
+        q, q_ch = _fork_block_mean_bshd(q, q_variable_block_sizes, block_elements)
+        k, k_ch = _fork_block_mean_bshd(k, variable_block_sizes, block_elements)
+        v, v_ch = _fork_block_mean_bshd(v, variable_block_sizes, block_elements)
+    else:
+        q_ch = fused_block_mean_bshd(q, q_variable_block_sizes, block_elements)
+        k_ch = fused_block_mean_bshd(k, variable_block_sizes, block_elements)
+        v_ch = fused_block_mean_bshd(v, variable_block_sizes, block_elements)
 
     scores = torch.matmul(q_ch, k_ch.transpose(-2, -1)) / (dim**0.5)
     attn = torch.softmax(scores, dim=-1)

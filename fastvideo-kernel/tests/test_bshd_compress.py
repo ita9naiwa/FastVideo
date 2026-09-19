@@ -72,6 +72,7 @@ def test_bshd_wrapper_changed_graph(block, compiled, monkeypatch):
                 x.fill_(float('nan'))
         with monkeypatch.context() as patch:
             patch.setattr(ops, 'fused_block_mean_bshd', _reference)
+            patch.setattr(ops, '_fork_block_mean_bshd', lambda x, sizes, block: (x, _reference(x, sizes, block)))
             patch.setenv('FASTVIDEO_VSA_COMPILE_COMBINE', '0')
             ref = call()
         graph.replay()
@@ -148,18 +149,21 @@ def test_bshd_cancellation_preserves_routes_and_compression_gradient(block, monk
         got = ops.video_sparse_attn_bshd(*qkv, sizes, sizes, 30, (4, 8, block // 32), gate)
         with monkeypatch.context() as patch:
             patch.setattr(ops, 'fused_block_mean_bshd', _reference)
+            patch.setattr(ops, '_fork_block_mean_bshd', lambda x, sizes, block: (x, _reference(x, sizes, block)))
             ref = ops.video_sparse_attn_bshd(*qkv, sizes, sizes, 30, (4, 8, block // 32), gate)
     torch.testing.assert_close(got, ref, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize('block', [128, 256])
-@pytest.mark.parametrize('layout', ['sequence_stride', 'head_transpose', 'offset'])
+@pytest.mark.parametrize('layout', ['aligned', 'sequence_stride', 'head_transpose', 'offset'])
 def test_bshd_cancellation_layouts(block, layout):
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     torch.manual_seed(216)
     n = 8 * block
-    if layout == 'sequence_stride':
+    if layout == 'aligned':
+        x = torch.empty(2, n, 3, 128, device='cuda', dtype=torch.bfloat16)
+    elif layout == 'sequence_stride':
         x = torch.empty(2, 2 * n, 3, 128, device='cuda', dtype=torch.bfloat16)[:, ::2]
     elif layout == 'head_transpose':
         x = torch.empty(2, 3, n, 128, device='cuda', dtype=torch.bfloat16).transpose(1, 2)
@@ -175,3 +179,64 @@ def test_bshd_cancellation_layouts(block, layout):
     dy = torch.randn_like(ref)
     torch.testing.assert_close(torch.autograd.grad(got, x, dy)[0],
                                torch.autograd.grad(ref, x, dy)[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('block', [128, 256])
+@pytest.mark.parametrize('branch', ['fine', 'coarse', 'both'])
+def test_bshd_fork_gradient_branches(block, branch):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    from fastvideo_kernel.triton_kernels.fused_compress_topk import _fork_block_mean_bshd
+    torch.manual_seed(481)
+    x = torch.randn(2, block * 2, 3, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    sizes = torch.tensor([block, 67], device='cuda', dtype=torch.int32)
+    fine, coarse = _fork_block_mean_bshd(x, sizes, block)
+    expected_coarse = _reference(x, sizes, block)
+    gf, gc = torch.randn_like(x), torch.randn_like(coarse)
+    outputs, refs, grads = ((fine, coarse), (x, expected_coarse), (gf, gc))
+    if branch == 'fine':
+        outputs, refs, grads = outputs[:1], refs[:1], grads[:1]
+    elif branch == 'coarse':
+        outputs, refs, grads = outputs[1:], refs[1:], grads[1:]
+    for _ in range(2):
+        actual = torch.autograd.grad(outputs, x, grads, retain_graph=True)[0]
+        expected = torch.autograd.grad(refs, x, grads, retain_graph=True)[0]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_bshd_fork_higher_order_gradient():
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    from fastvideo_kernel.triton_kernels.fused_compress_topk import _fork_block_mean_bshd
+    x = torch.randn(1, 256, 2, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    sizes = torch.tensor([128, 67], device='cuda', dtype=torch.int32)
+    fine, coarse = _fork_block_mean_bshd(x, sizes, 128)
+    gf, gc = torch.randn_like(x, requires_grad=True), torch.randn_like(coarse, requires_grad=True)
+    actual = torch.autograd.grad((fine, coarse), x, (gf, gc), create_graph=True)[0]
+    # Preserve the existing helper's higher-order BF16 rounding, which need
+    # not be bitexact to differentiation through the original raw expression.
+    expected = torch.autograd.grad((x, fused_block_mean_bshd(x, sizes, 128)), x, (gf, gc), create_graph=True)[0]
+    dx = torch.randn_like(x)
+    for a, b in zip(torch.autograd.grad(actual, (gf, gc), dx), torch.autograd.grad(expected, (gf, gc), dx)):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+def test_bshd_overlapping_qkv_keeps_original_gradient_grouping(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip('SM10x required')
+    monkeypatch.setenv('FASTVIDEO_VSA_PACK_TAILS', '0')
+    monkeypatch.setenv('FASTVIDEO_VSA_COMPILE_COMBINE', '0')
+    torch.manual_seed(519)
+    x = torch.randn(1, 512, 2, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    sizes = torch.tensor([128, 67, 17, 128], device='cuda', dtype=torch.int32)
+    got = ops.video_sparse_attn_bshd(x, x, x, sizes, sizes, 2, (4, 8, 4))
+    actual = torch.autograd.grad(got, x, torch.ones_like(got))[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(ops, 'fused_block_mean_bshd', _reference)
+        patch.setattr(ops, '_fork_block_mean_bshd', lambda x, sizes, block: (x, _reference(x, sizes, block)))
+        ref = ops.video_sparse_attn_bshd(x, x, x, sizes, sizes, 2, (4, 8, 4))
+        expected = torch.autograd.grad(ref, x, torch.ones_like(ref))[0]
+    for a, b in ((ref, got), (expected, actual)):
+        error = (a.float() - b.float()).abs()
+        assert error.mean() < 1e-3
+        assert error.max() / (a.float().abs().mean() + 1e-6) < .25
