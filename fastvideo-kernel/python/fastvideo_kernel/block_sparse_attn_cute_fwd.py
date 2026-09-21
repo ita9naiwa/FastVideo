@@ -265,7 +265,7 @@ def _build_sparse_tensors(
     # query tiles that selected it. Full and partial KV tiles stay separate
     # so the token-level validity mask only runs for padded tiles.
     # Validity is constant across each KV-owned row: only one list is active.
-    shared_idx, shared_count = _map_to_index(sparse_map.transpose(2, 3).contiguous())
+    shared_idx, shared_count = _map_to_index(sparse_map.transpose(2, 3))
     backward_sparse_tensors = BlockSparseTensorsTorch(
         full_block_cnt=shared_count * kv_full.reshape(1, 1, -1),
         full_block_idx=shared_idx,
