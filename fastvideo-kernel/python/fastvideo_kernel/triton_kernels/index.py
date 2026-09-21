@@ -278,3 +278,44 @@ def invert_indices(
     )
 
     return k2q_idx, k2q_num
+
+
+@triton.jit
+def _classified_map_to_index_kernel(
+    map_ptr, size_ptr, full_ptr, full_count_ptr, mask_ptr, mask_count_ptr,
+    stride_b: tl.constexpr, stride_h: tl.constexpr,
+    stride_q: tl.constexpr, stride_k: tl.constexpr, stride_size: tl.constexpr,
+    H: tl.constexpr, Q: tl.constexpr, N: tl.constexpr,
+    KV_BLOCK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    b, h, q = row // (H * Q), row // Q % H, row % Q
+    col = tl.arange(0, BLOCK)
+    chosen = tl.load(map_ptr + b * stride_b + h * stride_h + q * stride_q + col * stride_k,
+                     col < N, other=False)
+    size = tl.load(size_ptr + col * stride_size, col < N, other=0)
+    for kind in tl.static_range(2):
+        selected = chosen & ((size == KV_BLOCK) if kind == 0 else ((size > 0) & (size < KV_BLOCK)))
+        rank = tl.cumsum(selected.to(tl.int32), 0) - 1
+        count = tl.sum(selected.to(tl.int32), 0)
+        index_ptr = full_ptr if kind == 0 else mask_ptr
+        count_ptr = full_count_ptr if kind == 0 else mask_count_ptr
+        tl.store(index_ptr + row * N + col, -1, (col < N) & (col >= count))
+        tl.store(index_ptr + row * N + rank, col, selected)
+        tl.store(count_ptr + row, count)
+
+
+def map_to_classified_indices(block_map, sizes, kv_block_size):
+    """Fuse full/partial classification for a validated bool map and int32 size vector."""
+    b, h, q, n = block_map.shape
+    full = torch.empty(block_map.shape, dtype=torch.int32, device=block_map.device)
+    masked = torch.empty_like(full)
+    full_count = torch.empty((b, h, q), dtype=torch.int32, device=block_map.device)
+    mask_count = torch.empty_like(full_count)
+    if b * h * q:
+        _classified_map_to_index_kernel[(b * h * q,)](
+            block_map, sizes, full, full_count, masked, mask_count,
+            *block_map.stride(), sizes.stride(0), h, q, n, kv_block_size,
+            triton.next_power_of_2(max(1, n)),
+        )
+    return full, full_count, masked, mask_count

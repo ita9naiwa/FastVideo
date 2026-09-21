@@ -239,8 +239,6 @@ def _build_sparse_tensors(
         q_sparse_block_size=q_sparse_block_size,
         q_block_size=q_block_size,
     )
-    kv_full = (variable_block_sizes == kv_block_size).view(1, 1, 1, -1)
-    kv_partial = ((variable_block_sizes > 0) & (variable_block_sizes < kv_block_size)).view(1, 1, 1, -1)
 
     def from_maps(full_map: torch.Tensor, mask_map: torch.Tensor) -> object:
         full_block_idx, full_block_cnt = _map_to_index(full_map.contiguous())
@@ -253,10 +251,29 @@ def _build_sparse_tensors(
             block_size=(q_sparse_block_size, kv_block_size),
         )
 
-    forward_sparse_tensors = from_maps(
-        sparse_map & kv_full,
-        sparse_map & kv_partial,
-    ) if need_forward else None
+    fuse_forward = (need_forward and 0 < sparse_map.shape[-1] <= 4096
+            and variable_block_sizes.ndim == 1
+            and variable_block_sizes.numel() == sparse_map.shape[-1]
+            and variable_block_sizes.dtype == torch.int32
+            and variable_block_sizes.device == sparse_map.device)
+    if need_backward or not fuse_forward:
+        kv_full = (variable_block_sizes == kv_block_size).view(1, 1, 1, -1)
+        kv_partial = ((variable_block_sizes > 0) & (variable_block_sizes < kv_block_size)).view(1, 1, 1, -1)
+    if fuse_forward:
+        from fastvideo_kernel.triton_kernels.index import map_to_classified_indices
+        full_idx, full_count, mask_idx, mask_count = map_to_classified_indices(
+            sparse_map, variable_block_sizes, kv_block_size,
+        )
+        forward_sparse_tensors = BlockSparseTensorsTorch(
+            full_block_idx=full_idx, full_block_cnt=full_count,
+            mask_block_idx=mask_idx, mask_block_cnt=mask_count,
+            block_size=(q_sparse_block_size, kv_block_size),
+        )
+    else:
+        forward_sparse_tensors = from_maps(
+            sparse_map & kv_full,
+            sparse_map & kv_partial,
+        ) if need_forward else None
 
     if not need_backward:
         return forward_sparse_tensors, None
