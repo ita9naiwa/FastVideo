@@ -345,7 +345,7 @@ class _CuteAttentionQ128(torch.autograd.Function):
             k_bshd,
             v_bshd,
             out,
-            grad_out.contiguous(),
+            grad_out,
             lse,
             softmax_scale=q_bshd.shape[-1]**-0.5,
             mask_mod=_build_vbs_mask_mod(_FA4_Q_BLOCK_SIZE),
@@ -410,7 +410,7 @@ class _CuteAttentionQ256Training(torch.autograd.Function):
             dout = torch.zeros_like(out)
         _, _, _, flash_attn_bwd = _load_fa4_cute()
         dq, dk, dv = flash_attn_bwd(
-            q, k, v, out, dout.contiguous(), lse,
+            q, k, v, out, dout, lse,
             mask_mod=_build_vbs_mask_mod(128), aux_tensors=[sizes],
             block_sparse_tensors=ctx.backward_sparse_tensors, dlse=dlse,
         )
