@@ -118,7 +118,7 @@ def test_cold_capture_raises(h3, monkeypatch):
 
 
 @torch.no_grad()
-def test_cuda_graph_warm_key(h3, monkeypatch):
+def test_vc_ops_cuda_graph(h3, monkeypatch):
     """CUDA-graph capture: an attention geometry never run eagerly raises before any launch; a warmed one captures,
     its producer launches land in the graph, and replays with new inputs equal eager bitwise."""
     h3, adapter, impl, calls, _ = h3
