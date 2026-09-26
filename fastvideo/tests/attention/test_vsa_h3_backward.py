@@ -195,3 +195,27 @@ def test_h3_query_pad_untile_swapped_before_postprocess_uses_forward_map(monkeyp
             torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
         else:
             torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+
+def test_h3_empty_query_child_rows_get_exact_zero_dq(monkeypatch) -> None:
+    """Query rows of a wholly padded Q128 child receive exactly zero dQ and every gradient stays finite.
+
+    Tree-agnostic (no candidate-only API): holds for the full backward and for the pruned one, where
+    those rows are never visited and keep the zero-initialized dQ accumulator. No gate: its pooled-query
+    branch legitimately sends gradient to every row of a tile, padded rows included.
+    """
+    _cute_tail_or_skip(monkeypatch)
+    device = torch.device("cuda")
+    impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
+    meta = _build_meta(device)
+    tiles = torch.nonzero(meta.variable_block_sizes <= 128)
+    assert tiles.numel() > 0, "geometry must contain a wholly padded query child"
+    empty = (torch.arange(128, 256, device=device)[None, :] + meta.tile_elems * tiles).flatten()
+    _, tiled, _ = _tiled_inputs(impl, meta, False, device)
+    tiled = [t.detach().requires_grad_(True) for t in tiled]
+    out = impl.postprocess_output(impl.forward(*tiled, None, meta), meta)
+    # Large random dO on every live row; padded rows get zero dO only through the untile gather.
+    torch.autograd.backward(out, torch.randn_like(out) * 8)
+    for t in tiled:
+        assert torch.isfinite(t.grad).all()
+    assert torch.count_nonzero(tiled[0].grad[:, empty]) == 0
