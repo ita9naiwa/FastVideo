@@ -90,7 +90,7 @@ def test_fused_route_shuffled_untile_and_dense_layer(monkeypatch):
     generic, fused, *_ = _routes(h3, meta, impl, q, k, v)
     rel = ((fused.float() - generic.float()).norm() / generic.float().norm()).item()
     assert rel < 1e-3, rel
-    # A different geometry with the same padded length must rebuild the cached inverse map.
+    # A different geometry with the same padded length must use its own inverse map.
     meta2 = h3.MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=(9, 40, 52), patch_size=(1, 2, 2),
                                                    VSA_sparsity=0.75, prefix_segments=(301, 4, 130),
                                                    device=torch.device("cuda"))
@@ -98,6 +98,12 @@ def test_fused_route_shuffled_untile_and_dense_layer(monkeypatch):
     generic2, fused2, *_ = _routes(h3, meta2, impl, q, k, v)
     rel2 = ((fused2.float() - generic2.float()).norm() / generic2.float().norm()).item()
     assert rel2 < 1e-3, rel2
+    # The same untile tensor mutated in place (two packed rows swap slots) must be honoured, not a map cached by identity.
+    untile = meta2.untile_combined_index
+    untile[[0, -1]] = untile[[-1, 0]].clone()
+    generic3, fused3, *_ = _routes(h3, meta2, impl, q, k, v)
+    rel3 = ((fused3.float() - generic3.float()).norm() / generic3.float().norm()).item()
+    assert rel3 < 1e-3, rel3
 
 
 def test_fused_route_fallbacks(monkeypatch):

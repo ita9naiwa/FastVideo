@@ -308,8 +308,6 @@ class _MiniMaxH3VSATileBufferHolder:
     def __init__(self) -> None:
         self.buffer: torch.Tensor | None = None
         self.untile_geometry: torch.Tensor | None = None
-        # Fused VC route: (untile index it was built from, padded slot -> packed row map, padded query map)
-        self.vc_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -645,15 +643,11 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             if tensor.shape[1] != attn_metadata.total_seq_length:
                 raise ValueError(f"VSA-H3 fused VC {name} has length {tensor.shape[1]}, expected the packed length "
                                  f"{attn_metadata.total_seq_length}.")
-        holder = attn_metadata.tile_buf_holder
-        if holder is None:
-            raise RuntimeError("VSA-H3 metadata has no builder-owned tile buffer holder")
+        # Rebuilt per call from the authoritative untile index (small next to the attention; never cached by identity).
         untile = attn_metadata.untile_combined_index
-        if holder.vc_maps is None or holder.vc_maps[0] is not untile:
-            padded_to_original = torch.full((padded, ), -1, dtype=torch.int64, device=query.device)
-            padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=query.device)
-            holder.vc_maps = (untile, padded_to_original, torch.arange(padded, dtype=torch.int64, device=query.device))
-        _, padded_to_original, padded_to_query = holder.vc_maps
+        padded_to_original = torch.full((padded, ), -1, dtype=torch.int64, device=query.device)
+        padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=query.device)
+        padded_to_query = torch.arange(padded, dtype=torch.int64, device=query.device)
 
         p, pools = prepare_vsa_vc_fwd_bshd(query.contiguous(), key.contiguous(), value.contiguous(), padded_to_original,
                                            sizes, 256, padded_to_query, padded, 0)
