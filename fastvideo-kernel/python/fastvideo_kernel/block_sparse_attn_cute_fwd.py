@@ -301,6 +301,7 @@ def _cute_attention_q128_forward(
     variable_block_sizes: torch.Tensor,
     *,
     need_backward: bool,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, object | None]:
     """Run FA4 with one physical Q stage per logical VSA-128 block."""
     _, _, flash_attn_fwd, _ = _load_fa4_cute()
@@ -328,6 +329,7 @@ def _cute_attention_q128_forward(
         aux_tensors=[variable_block_sizes],
         causal=False,
         return_lse=True,
+        **_alias_guard_kwargs(flash_attn_fwd, alias_guard),
     )[:2]
     return out, lse, backward_sparse_tensors
 
@@ -335,7 +337,7 @@ def _cute_attention_q128_forward(
 class _CuteAttentionQ128(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes):
+    def forward(ctx, q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, alias_guard=None):
         out, lse, backward_sparse_tensors = _cute_attention_q128_forward(
             q_bshd,
             k_bshd,
@@ -343,6 +345,7 @@ class _CuteAttentionQ128(torch.autograd.Function):
             block_map,
             variable_block_sizes,
             need_backward=True,
+            alias_guard=alias_guard,
         )
         ctx.save_for_backward(q_bshd, k_bshd, v_bshd, out, lse, variable_block_sizes)
         ctx.backward_sparse_tensors = backward_sparse_tensors
@@ -369,7 +372,7 @@ class _CuteAttentionQ128(torch.autograd.Function):
             aux_tensors=[variable_block_sizes],
             block_sparse_tensors=ctx.backward_sparse_tensors,
         )
-        return dq, dk, dv, None, None
+        return dq, dk, dv, None, None, None
 
 
 def _cute_attention_q128(
@@ -378,10 +381,11 @@ def _cute_attention_q128(
     v_bshd: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     need_backward = torch.is_grad_enabled() and any(t.requires_grad for t in (q_bshd, k_bshd, v_bshd))
     if need_backward:
-        return _CuteAttentionQ128.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        return _CuteAttentionQ128.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, alias_guard)
     out, lse, _ = _cute_attention_q128_forward(
         q_bshd,
         k_bshd,
@@ -389,6 +393,7 @@ def _cute_attention_q128(
         block_map,
         variable_block_sizes,
         need_backward=False,
+        alias_guard=alias_guard,
     )
     return out, lse
 
@@ -397,7 +402,7 @@ class _CuteAttentionQ256Training(torch.autograd.Function):
     """Vectorize the forward mask and classify backward KV tiles at 128 tokens."""
 
     @staticmethod
-    def forward(ctx, q, k, v, block_map, sizes):
+    def forward(ctx, q, k, v, block_map, sizes, alias_guard=None):
         _, _, flash_attn_fwd, _ = _load_fa4_cute()
         forward_sparse, _ = _build_sparse_tensors(
             block_map, sizes, q_len=q.shape[1], q_block_size=256,
@@ -414,6 +419,7 @@ class _CuteAttentionQ256Training(torch.autograd.Function):
         out, lse = flash_attn_fwd(
             q, k, v, mask_mod=_build_vbs_vector_mask_mod(256),
             aux_tensors=[sizes], block_sparse_tensors=forward_sparse, return_lse=True,
+            **_alias_guard_kwargs(flash_attn_fwd, alias_guard),
         )[:2]
         ctx.save_for_backward(q, k, v, out, lse, child_sizes)
         ctx.backward_sparse_tensors = backward_sparse
@@ -431,7 +437,7 @@ class _CuteAttentionQ256Training(torch.autograd.Function):
             mask_mod=_build_vbs_mask_mod(128), aux_tensors=[sizes],
             block_sparse_tensors=ctx.backward_sparse_tensors, dlse=dlse,
         )
-        return dq, dk, dv, None, None
+        return dq, dk, dv, None, None, None
 
 
 def _cute_attention(
@@ -443,6 +449,7 @@ def _cute_attention(
     *,
     pack_tails: bool | None = None,
     qkv: torch.Tensor | None = None,
+    alias_guard: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FA4's autograd-enabled block-sparse attention with BSHD inputs.
 
@@ -451,14 +458,15 @@ def _cute_attention(
     Keyword-only training options: ``pack_tails`` None follows FASTVIDEO_VSA_PACK_TAILS (default on); a bool forces it.
     ``qkv``: optional contiguous ``[3B, S, H, D]`` tensor whose dim-0 chunks are q/k/v; it then becomes the single
     autograd input (one fused gradient allocation).
+    ``alias_guard`` (None = FA4 default) reaches every forward launch below (training, no-grad and VC).
     """
     if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
-        return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, alias_guard)
     _, flash_attn_func, _, _ = _load_fa4_cute()
     q_block_size = q_bshd.shape[1] // block_map.shape[2]
     kv_block_size = k_bshd.shape[1] // block_map.shape[3]
     if q_block_size == kv_block_size == _FA4_Q_BLOCK_SIZE:
-        return _cute_attention_q128(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        return _cute_attention_q128(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, alias_guard)
     need_backward = torch.is_grad_enabled() and any(t.requires_grad for t in (q_bshd, k_bshd, v_bshd))
     if (need_backward and q_bshd.shape[1] == block_map.shape[2] * 256
             and k_bshd.shape[1] == block_map.shape[3] * 256
@@ -467,9 +475,9 @@ def _cute_attention(
         from fastvideo_kernel import vsa256_ops
         if vsa256_ops.training_eligible(q_bshd, k_bshd, v_bshd, block_map):
             return vsa256_ops.training_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes,
-                                                 pack_tails=pack_tails, qkv=qkv)
+                                                 pack_tails=pack_tails, qkv=qkv, alias_guard=alias_guard)
         # Outside the op's validated domain (same predicate as the public wrapper): plain Q256 training autograd.
-        return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, alias_guard)
     forward_sparse_tensors, backward_sparse_tensors = _build_sparse_tensors(
         block_map,
         variable_block_sizes,
@@ -487,6 +495,7 @@ def _cute_attention(
         block_sparse_tensors=forward_sparse_tensors,
         block_sparse_tensors_bwd=backward_sparse_tensors,
         return_lse=True,
+        **_alias_guard_kwargs(flash_attn_func, alias_guard),
     )
 
 
@@ -556,16 +565,36 @@ def _supports_vc_vbs128(forward):
         return False
 
 
-def block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes, *, return_lse=True):
+@functools.lru_cache(maxsize=8)
+def _supports_alias_guard(forward):
+    import inspect
+    try:
+        return "alias_guard" in inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _alias_guard_kwargs(forward, alias_guard):
+    """FA4 persistent-grid alias-guard hint: None (FA4 default), a bool, or a 0-d CPU bool tensor.
+
+    The tensor form is a compiled-graph input, so the hint never specializes a graph. Omitted when unset or when the
+    provider predates the hint.
+    """
+    if alias_guard is None or not _supports_alias_guard(forward):
+        return {}
+    return {"alias_guard": bool(alias_guard)}
+
+
+def block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes, *, return_lse=True, alias_guard=None):
     # LSE is centered/quantized auxiliary output, not a BF16 partition-merge weight.
     block_map, q_block_size, kv_block_size = _validate_vc_prepared(p, block_map, variable_block_sizes)
     sparse, variable_block_sizes, kv_block_size = _vc_sparse_tensors(
         block_map, variable_block_sizes, p["q"].shape[1], q_block_size, kv_block_size,
     )
-    return _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse)
+    return _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse, alias_guard)
 
 
-def _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse):
+def _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_size, return_lse, alias_guard=None):
     interface = _load_vc_module("interface", os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
     q, k, v = (p[name] for name in ("q", "k", "v"))
     compact = (q_block_size == 128 and kv_block_size == 128 and q.shape[-1] == v.shape[-1] == 128
@@ -578,7 +607,7 @@ def _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_
         tile_mn=(_FA4_Q_BLOCK_SIZE, _FA4_Q_BLOCK_SIZE),
         max_seqlen_q=_SingleQStageLength(q.shape[1]) if q_block_size == 128 else q.shape[1],
         block_sparse_tensors=sparse, aux_tensors=[variable_block_sizes], return_lse=return_lse,
-        **mask_options,
+        **mask_options, **_alias_guard_kwargs(interface._flash_attn_fwd, alias_guard),
     )[:2]
 
 
@@ -636,7 +665,7 @@ def block_sparse_attn_vc_routes_fwd_bshd(
     return _vc_prepared_sparse(p, sparse, physical_sizes, block_size, 128, return_lse)
 
 
-def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes):
+def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes, alias_guard=None):
     """Opt-in FP8/ExpCast self-attention; retain VSA routing and padded-KV masks.
 
     No V-Smooth or token regrouping: those would require sparse mean-restoration
@@ -656,7 +685,7 @@ def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes):
         q, (0, 0, 0, 0, 0, k.shape[1] - q.shape[1]))
     p = vc_preprocess.prepare(q_padded.contiguous(), k.contiguous(), v.contiguous(), smooth=False, bshd=True)
     p["q"] = p["q"][:, :q.shape[1]]
-    out, lse = block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes)
+    out, lse = block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes, alias_guard=alias_guard)
     return out.to(q.dtype), lse
 
 
@@ -697,6 +726,7 @@ def block_sparse_attn_cute_fwd_bshd(
     *,
     pack_tails: bool | None = None,
     qkv: torch.Tensor | None = None,
+    alias_guard: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
     if block_map.dim() == 3:
@@ -710,6 +740,7 @@ def block_sparse_attn_cute_fwd_bshd(
         variable_block_sizes,
         pack_tails=pack_tails,
         qkv=qkv,
+        alias_guard=alias_guard,
     )
     # lse is [B, H, S] regardless of the q/k/v layout; see above.
     return out, lse.detach()

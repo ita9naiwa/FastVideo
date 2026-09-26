@@ -108,7 +108,7 @@ def scatter(dk, dv, tk, tv, index, valid):
 
 class TailTraining(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, routes, sizes, query_sizes=None):
+    def forward(ctx, q, k, v, routes, sizes, query_sizes=None, alias_guard=None):
         _, _, forward, backward = adapter._load_fa4_cute()
         _check_workspace_support(backward)
         sparse, _ = adapter._build_sparse_tensors(
@@ -118,6 +118,7 @@ class TailTraining(torch.autograd.Function):
         out, lse = forward(
             q, k, v, mask_mod=adapter._build_vbs_vector_mask_mod(256),
             aux_tensors=[sizes], block_sparse_tensors=sparse, return_lse=True,
+            **adapter._alias_guard_kwargs(forward, alias_guard),
         )[:2]
         ctx.save_for_backward(q, k, v, out, lse, routes, sizes, query_sizes)
         ctx.set_materialize_grads(False)
@@ -127,7 +128,7 @@ class TailTraining(torch.autograd.Function):
     def backward(ctx, dout, dlse):
         q, k, v, out, lse, routes, sizes, query_sizes = ctx.saved_tensors
         dout = torch.zeros_like(out) if dout is None else dout
-        return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes), None, None, None)
+        return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes), None, None, None, None)
 
 
 def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes=None, grad_views=(None, None, None)):

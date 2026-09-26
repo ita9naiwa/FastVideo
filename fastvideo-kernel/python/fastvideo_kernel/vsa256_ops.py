@@ -4,7 +4,8 @@
 (plain 128-child backward, or the shared packed-tail backward when ``pack_tails``). Metadata enters as tensors (block
 map, valid sizes, optional query-padding proof); the pack policy is a static bool chosen by the caller. The same ops run
 in eager and compiled mode, so an activation-checkpoint policy sees identical op keys; the FA4 loader caches, CuTe
-compilation and backward planning stay inside the opaque bodies.
+compilation and backward planning stay inside the opaque bodies. The optional FA4 alias-guard hint is a 0-d CPU bool
+tensor (forward only), so it is a graph input and never specializes a compiled graph.
 
 Query-padding proof: ``query_sizes`` asks the packed-tail backward to skip wholly padded Q128 children. It is honored
 only with the caller's trusted ``query_untile`` map and the builder-recorded versions of that map and of
@@ -37,7 +38,8 @@ def _chunks(q, k, v):
 @torch.library.custom_op("fastvideo_kernel::vsa256_fwd", mutates_args=(), device_types="cuda")
 def vsa256_fwd(q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None, block_map: torch.Tensor, sizes: torch.Tensor,
                query_sizes: torch.Tensor | None, query_untile: torch.Tensor | None, query_untile_version: int,
-               query_sizes_version: int, pack_tails: bool) -> tuple[torch.Tensor, torch.Tensor]:
+               query_sizes_version: int, pack_tails: bool,
+               alias_guard: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     _, _, flash_attn_fwd, flash_attn_bwd = adapter._load_fa4_cute()
     if pack_tails:
         from fastvideo_kernel.vsa_tail_backward import _check_workspace_support
@@ -46,13 +48,14 @@ def vsa256_fwd(q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None, 
     forward_sparse, _ = adapter._build_sparse_tensors(block_map, sizes, q_len=q.shape[1], q_block_size=256,
                                                       kv_block_size=256, need_backward=False)
     out, lse = flash_attn_fwd(q, k, v, mask_mod=adapter._build_vbs_vector_mask_mod(256), aux_tensors=[sizes],
-                              block_sparse_tensors=forward_sparse, return_lse=True)[:2]
+                              block_sparse_tensors=forward_sparse, return_lse=True,
+                              **adapter._alias_guard_kwargs(flash_attn_fwd, alias_guard))[:2]
     return out, lse
 
 
 @torch.library.register_fake("fastvideo_kernel::vsa256_fwd")
 def _vsa256_fwd_fake(q, k, v, block_map, sizes, query_sizes, query_untile, query_untile_version, query_sizes_version,
-                     pack_tails):
+                     pack_tails, alias_guard=None):
     if k is None:  # stacked [3B, S, H, D]: the output covers one B-sized chunk
         batch = q.shape[0] // 3
         return (q.new_empty((batch, *q.shape[1:])),
@@ -109,7 +112,7 @@ def _vsa256_bwd_fake(dout, q, k, v, out, lse, block_map, sizes, query_sizes, que
 
 
 def _setup_context(ctx, inputs, output):
-    q, k, v, block_map, sizes, query_sizes, query_untile, untile_version, sizes_version, pack_tails = inputs
+    q, k, v, block_map, sizes, query_sizes, query_untile, untile_version, sizes_version, pack_tails, _alias_guard = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse, block_map, sizes, query_sizes, query_untile)
     ctx.query_versions = (untile_version, sizes_version)
@@ -123,7 +126,7 @@ def _backward(ctx, dout, dlse):
         dout = torch.zeros_like(out)
     grads = vsa256_bwd(dout, q, k, v, out, lse, block_map, sizes, query_sizes, query_untile, *ctx.query_versions,
                        ctx.pack_tails, dlse)
-    metadata_grads = (None, ) * 7  # block_map, sizes, query_sizes, query_untile, two versions, pack_tails
+    metadata_grads = (None, ) * 8  # block_map, sizes, query_sizes, query_untile, two versions, pack_tails, alias_guard
     if k is None:
         return grads[0], None, None, *metadata_grads
     return grads[0], grads[1], grads[2], *metadata_grads
@@ -155,7 +158,7 @@ def training_eligible(q, k, v, block_map):
 
 
 def training_attention(q, k, v, block_map, sizes, *, pack_tails=None, query_sizes=None, query_untile=None,
-                       query_versions=(0, 0), qkv=None):
+                       query_versions=(0, 0), qkv=None, alias_guard=None):
     """Single dispatch into the op pair for native BF16 Q256 training (public wrapper and _cute_attention); callers
     check ``training_eligible`` first.
 
@@ -165,7 +168,12 @@ def training_attention(q, k, v, block_map, sizes, *, pack_tails=None, query_size
     ``query_sizes``), is dropped: full backward. ``qkv``: the contiguous ``[3B, S, H, D]`` tensor whose dim-0 chunks are
     q/k/v (caller contract, e.g. H3 ``forward_qkv``); when usable it replaces q/k/v as the op input, so the fused gradient
     is written into one allocation. Otherwise (gated calls, non-contiguous stacks, unequal shapes) the ordinary route.
+    ``alias_guard``: FA4 alias-guard hint (None, bool or 0-d CPU bool tensor) for the forward launch of either route; it
+    enters the op as a CPU tensor (graph input) and only when set, so hint-less calls keep the previous op arguments.
     """
+    hint = ()
+    if alias_guard is not None:
+        hint = (alias_guard if isinstance(alias_guard, torch.Tensor) else torch.tensor(bool(alias_guard), device="cpu"), )
     if pack_tails is None:
         pack_tails = os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
     pack_tails = bool(pack_tails and q.shape[-1] == k.shape[-1] == v.shape[-1]
@@ -176,5 +184,6 @@ def training_attention(q, k, v, block_map, sizes, *, pack_tails=None, query_size
         query_sizes = query_untile = None
     if (qkv is not None and qkv.is_contiguous() and q.shape == k.shape == v.shape
             and qkv.shape == (3 * q.shape[0], *q.shape[1:])):
-        return vsa256_fwd(qkv, None, None, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails)
-    return vsa256_fwd(q, k, v, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails)
+        return vsa256_fwd(qkv, None, None, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails,
+                          *hint)
+    return vsa256_fwd(q, k, v, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails, *hint)

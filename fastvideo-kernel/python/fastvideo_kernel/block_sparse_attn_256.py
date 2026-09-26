@@ -220,8 +220,12 @@ def block_sparse_attn_256_bshd(
     query_versions: tuple[int, int] = (0, 0),
     pack_tails: bool | None = None,
     qkv: torch.Tensor | None = None,
+    alias_guard: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, S, H, D] inputs.
+
+    ``alias_guard`` is FA4's persistent-grid alias-guard hint: None (FA4 default), a bool, or a 0-d CPU bool tensor
+    (preferred under torch.compile: a graph input, not a specialized constant). The Triton fallback ignores it.
 
     Default CuTe path consumes BSHD directly; Triton fallback transposes
     to BHSD as the legacy path expects. ``query_sizes``: optional caller
@@ -254,7 +258,8 @@ def block_sparse_attn_256_bshd(
         out, lse = vsa256_ops.training_attention(q, k, v, logical_block_map_256, logical_variable_block_sizes_256,
                                                  query_sizes=query_sizes, query_untile=query_untile,
                                                  query_versions=query_versions, pack_tails=pack_tails,
-                                                 qkv=qkv)
+                                                 qkv=qkv, alias_guard=alias_guard)
         return out, lse.detach()
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
-    return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)
+    hint = {} if alias_guard is None else {"alias_guard": alias_guard}  # hint-less calls stay byte-identical
+    return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128, **hint)

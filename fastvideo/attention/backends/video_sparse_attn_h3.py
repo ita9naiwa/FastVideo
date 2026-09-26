@@ -317,6 +317,16 @@ def _pack_tails_policy(variable_block_sizes: torch.Tensor, tile_elems: int, min_
     return residual_rows <= capacity and partial >= min_partial
 
 
+@functools.cache
+def _alias_guard_hint(value: bool) -> torch.Tensor:
+    """One shared 0-d CPU bool hint tensor per value. Marked a static, unguarded input: compiled graphs take it as an
+    input (no guard, so no recompile between True and False), and CUDA-graph trees use it in place instead of copying
+    a CPU tensor into the CUDA pool (a non-static CPU input fails their pool check)."""
+    hint = torch.tensor(bool(value), device="cpu")
+    torch._dynamo.mark_static_address(hint, guard=False)
+    return hint
+
+
 class _MiniMaxH3VSATileBufferHolder:
     """Builder-owned no-grad tile scratch and its active geometry."""
 
@@ -367,6 +377,9 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     fused_qkv_grad: bool = True
     # Training backward tail packing for tile-256 (static per step; see _pack_tails_policy).
     pack_tails: bool = True
+    # FA4 persistent-grid alias-guard hint: 0-d CPU bool tensor, True iff the document has dense prefix tiles (its
+    # prefix query rows are what pile onto a few CTAs on an aliased grid). A tensor so compiled graphs take it as input.
+    alias_guard_hint: torch.Tensor | None = None
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -447,6 +460,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             query_pad_pruning=bool(query_pad_pruning),
             fused_qkv_grad=bool(fused_qkv_grad),
             pack_tails=self._pack_tails(pack_tails, variable_block_sizes, int(tile_size), pack_tails_min_partial),
+            alias_guard_hint=_alias_guard_hint(num_prefix_tiles > 0),
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
@@ -865,7 +879,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                                      _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
                                      if layer_sparsity > 0.0 else None)
         mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(mask, sizes)
-        out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128)[0].to(query.dtype)
+        out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128,
+                                                     alias_guard=attn_metadata.alias_guard_hint)[0].to(query.dtype)
         if gate_compress is not None:
             out_c = torch.matmul(torch.softmax(scores, dim=-1), pools[2]).permute(0, 2, 1, 3).to(out.dtype)
             batch, _, heads, dim = out.shape
@@ -1098,6 +1113,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                     and state[2] is attn_metadata.variable_block_sizes
                     and (compiling or (state[0]._version == state[1] and state[2]._version == state[3]))):
                 query_sizes, query_untile, query_versions = state[2], state[0], (state[1], state[3])
+            # Dense prefix rows make the aliased persistent grid pile work onto a few CTAs; uniform (prefix-0) documents
+            # would only lose a wave to the shrink. The host-known prefix count decides the FA4 hint.
             out, _ = block_sparse_attn_256_bshd(
                 logical_query,
                 logical_key,
@@ -1109,6 +1126,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 query_versions=query_versions,
                 pack_tails=attn_metadata.pack_tails,
                 qkv=qkv if gate_compress is None and query.shape[1] == logical_seq_len else None,
+                alias_guard=attn_metadata.alias_guard_hint,
             )
 
         if logical_gate is not None:
