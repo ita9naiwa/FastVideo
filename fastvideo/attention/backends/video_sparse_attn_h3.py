@@ -723,7 +723,16 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
-        return output[:, attn_metadata.untile_combined_index]
+        # A forward that let the backward skip padded query rows pins the untile map it trusted;
+        # untile with exactly that map so padded rows keep zero dO.
+        pinned = getattr(output, "_vsa_h3_query_pad_untile", None)
+        if pinned is None:
+            return output[:, attn_metadata.untile_combined_index]
+        untile, version = pinned
+        if untile._version != version:
+            raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
+                               "postprocess_output; its backward assumed the original padded-row geometry.")
+        return output[:, untile]
 
     def forward(  # type: ignore[override]
         self,
@@ -817,6 +826,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             # preserves the eager dense-layer contract without a Python branch.
             mask = mask | force_dense
 
+        query_sizes = None
         if tile_elems == 64:
             # Native 64-token path: the block map is already at the kernels'
             # granularity. Both 64-token entries take BHSD ([B, H, S_pad, D]);
@@ -919,10 +929,10 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             out = out_bhsd.transpose(1, 2).contiguous()
         else:
             # Padded query rows get zero dO through postprocess_output's untile gather, which lets
-            # the CuTe backward skip wholly padded Q128 children (the LSE output is discarded).
+            # the CuTe backward skip wholly padded Q128 children (the LSE output is discarded; the
+            # gate branch adds out of place, so it leaves the attention output's padded dO zero).
             state = getattr(attn_metadata, "_query_pad_state", None)
-            query_sizes = None
-            if (logical_gate is None and state is not None and state[0] is attn_metadata.untile_combined_index
+            if (state is not None and state[0] is attn_metadata.untile_combined_index
                     and state[2] is attn_metadata.variable_block_sizes and state[0]._version == state[1]
                     and state[2]._version == state[3]):
                 query_sizes = attn_metadata.variable_block_sizes
@@ -951,4 +961,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             out_tiled = out.view(batch, n_tiles, tile_elems, heads, dim)
             gate_tiled = logical_gate.view(batch, n_tiles, tile_elems, heads, dim)
             out = (out_tiled + out_c.unsqueeze(2) * gate_tiled).view(batch, seq_len, heads, dim)
+        if query_sizes is not None:
+            untile = attn_metadata.untile_combined_index
+            out._vsa_h3_query_pad_untile = (untile, untile._version)  # type: ignore[attr-defined]
         return out

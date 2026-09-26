@@ -108,3 +108,90 @@ def test_h3_vsa_backward_cute_matches_triton(monkeypatch, gate_compress: bool) -
         print(f"[h3-vsa gate={gate_compress}] {name}: avg_abs={avg_abs:.6e}, max_rel={max_rel:.6e}")
         assert avg_abs < 1e-2, f"{name}: avg_abs {avg_abs:.3e}"
         assert max_rel < 0.5, f"{name}: max_rel {max_rel:.3e}"
+
+
+def _cute_tail_or_skip(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
+    _select_backend(monkeypatch, "cute")
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1")
+
+
+def _padded_slot(meta):
+    tile = int(torch.nonzero(meta.variable_block_sizes <= 128)[0])
+    return tile * meta.tile_elems + meta.tile_elems - 1
+
+
+def _tiled_inputs(impl, meta, gate_compress, device):
+    torch.manual_seed(0)
+    leaves = [torch.randn(1, meta.total_seq_length, _HEADS, _DIM, device=device, dtype=torch.bfloat16,
+                          requires_grad=True) for _ in range(3)]
+    tiled = [impl.tile(t, meta).clone() for t in leaves]
+    gate = torch.randn_like(tiled[0]) * 0.1 if gate_compress else None
+    return leaves, tiled, gate
+
+
+@pytest.mark.parametrize("gate_compress", [False, True])
+def test_h3_query_pad_pruning_matches_full_backward(monkeypatch, gate_compress: bool) -> None:
+    """Trusted cube metadata prunes padded query children; outputs and dK/dV stay bitwise equal."""
+    _cute_tail_or_skip(monkeypatch)
+    from fastvideo_kernel import vsa_tail_backward as tail
+    conveyed = []
+    apply = tail.TailTraining.apply
+    monkeypatch.setattr(tail.TailTraining, "apply", lambda *a: conveyed.append(a[5] is not None) or apply(*a))
+    device = torch.device("cuda")
+    impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
+    results = []
+    for trusted in (True, False):
+        meta = _build_meta(device)
+        if not trusted:
+            meta._query_pad_state = None
+        leaves, tiled, gate = _tiled_inputs(impl, meta, gate_compress, device)
+        out = impl.postprocess_output(impl.forward(*tiled, gate, meta), meta)
+        out.float().pow(2).sum().backward()
+        results.append([out.detach()] + [leaf.grad for leaf in leaves])
+    assert conveyed == [True, False]
+    (out, dq, dk, dv), (ref_out, ref_dq, ref_dk, ref_dv) = results
+    for got, ref in ((out, ref_out), (dk, ref_dk), (dv, ref_dv)):
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    # dQ accumulates through fp32 atomics; keep it at bf16 noise, not bitwise.
+    torch.testing.assert_close(dq, ref_dq, rtol=2e-2, atol=2e-3)
+
+
+def test_h3_query_pad_untile_mutated_before_postprocess_raises(monkeypatch) -> None:
+    _cute_tail_or_skip(monkeypatch)
+    device = torch.device("cuda")
+    impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
+    meta = _build_meta(device)
+    _, tiled, _ = _tiled_inputs(impl, meta, False, device)
+    out = impl.forward(*tiled, None, meta)
+    from fastvideo.attention.backends.video_sparse_attn_h3 import _h3_tile_geometry
+    try:
+        meta.untile_combined_index[0] = _padded_slot(meta)  # tensor-valid, now selects a padded query row
+        with pytest.raises(RuntimeError, match="modified in place"):
+            impl.postprocess_output(out, meta)
+    finally:
+        _h3_tile_geometry.cache_clear()  # the cached geometry tensor was mutated
+
+
+def test_h3_query_pad_untile_swapped_before_postprocess_uses_forward_map(monkeypatch) -> None:
+    _cute_tail_or_skip(monkeypatch)
+    device = torch.device("cuda")
+    impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
+    results = []
+    for swap in (False, True):
+        meta = _build_meta(device)
+        leaves, tiled, _ = _tiled_inputs(impl, meta, False, device)
+        out = impl.forward(*tiled, None, meta)
+        if swap:
+            swapped = meta.untile_combined_index.clone()
+            swapped[0] = _padded_slot(meta)
+            meta.untile_combined_index = swapped
+        out = impl.postprocess_output(out, meta)
+        out.float().pow(2).sum().backward()
+        results.append([out.detach()] + [leaf.grad for leaf in leaves])
+    for name, got, ref in zip(("out", "dq", "dk", "dv"), results[1], results[0], strict=True):
+        if name == "dq":
+            torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
+        else:
+            torch.testing.assert_close(got, ref, rtol=0, atol=0)
