@@ -32,9 +32,14 @@ def test_vsa256_bshd_training_only_dispatch(monkeypatch, requires_grad, grad_ena
             expected_blocks = 4
     routes = torch.ones(1, 2, 2, 2, device='cuda', dtype=torch.bool)
     sizes = torch.tensor([131, 0], device='cuda', dtype=torch.int32)
-    with torch.set_grad_enabled(grad_enabled):
+    native = expected_blocks == 2
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof, \
+            torch.set_grad_enabled(grad_enabled):
         _, lse = wrapper.block_sparse_attn_256_bshd(*qkv, routes, sizes)
-    assert seen == [expected_blocks]
+    # Native Q256 training (256-token map) takes the fullgraph custom op fastvideo_kernel::vsa256_fwd; every other case
+    # keeps the 128-token-map adapter path (4 blocks here).
+    assert seen == ([] if native else [expected_blocks])
+    assert ("fastvideo_kernel::vsa256_fwd" in {e.key for e in prof.key_averages()}) == native
     # The public auxiliary remains informational even when native training
     # internally retains a differentiable normalization state.
     if expected_blocks == 2:
