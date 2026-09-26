@@ -50,7 +50,30 @@ def reach(monkeypatch):
     """Records what the op bodies actually did: the forward sparse plan (and, opt-in, the full block map it received)
     and the packed-tail plan (pruned or not)."""
     from fastvideo_kernel import vsa_tail_backward as tail
-    rec = dict(fwd=[], prepare=[], prepare_sizes=[], tail=[], maps=None)
+    from fastvideo_kernel import vsa256_ops
+    rec = dict(fwd=[], prepare=[], prepare_sizes=[], tail=[], maps=None, stacked=[], bwd=[])
+    chunks = vsa256_ops._chunks
+
+    def spy_chunks(q, k, v):  # op bodies: k = v = None is the stacked [3B, S, H, D] input
+        rec["stacked"].append(k is None)
+        return chunks(q, k, v)
+
+    load = adapter._load_fa4_cute
+
+    def spy_load():
+        a, b, c, bwd = load()
+
+        @functools.wraps(bwd)  # keeps the signature: _check_workspace_support inspects it
+        def spy_bwd(*args, **kwargs):
+            grads = bwd(*args, **kwargs)
+            bufs = [kwargs.get(n) for n in ("dq", "dk", "dv")]
+            rec["bwd"].append(dict(fused=all(b_ is not None for b_ in bufs)
+                                   and len({b_.untyped_storage().data_ptr() for b_ in bufs}) == 1
+                                   and all(g is b_ for g, b_ in zip(grads[:3], bufs, strict=True)),
+                                   storages=len({g.untyped_storage().data_ptr() for g in grads[:3] if g is not None})))
+            return grads
+
+        return a, b, c, spy_bwd
     bst = adapter._build_sparse_tensors
 
     def spy_bst(block_map, *args, **kwargs):
@@ -74,6 +97,8 @@ def reach(monkeypatch):
         return tail_backward(*args, **kwargs)
 
     monkeypatch.setattr(adapter, "_build_sparse_tensors", spy_bst)
+    monkeypatch.setattr(vsa256_ops, "_chunks", spy_chunks)
+    monkeypatch.setattr(adapter, "_load_fa4_cute", spy_load)
     monkeypatch.setattr(tail, "_prepare", spy_prepare)
     monkeypatch.setattr(tail, "tail_backward", spy_tail)
     return rec
@@ -122,11 +147,11 @@ def _meta(spec=_BIG, layout="cube", merge=False, **opts):
 
 
 def _layer_block(impl, meta):
-    """DistributedAttention_VSA's single-rank data path: stack, tile, chunk, gate-free forward, untile."""
+    """DistributedAttention_VSA's single-rank data path: stack, tile, gate-free forward_qkv, untile."""
 
     def block(q, k, v):
         x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
-        return impl.postprocess_output(impl.forward(*x.chunk(3, dim=0), None, meta), meta)
+        return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
 
     return block
 
@@ -850,7 +875,7 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
 
     def block(q, k, v, meta):
         x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
-        return impl.postprocess_output(impl.forward(*x.chunk(3, dim=0), None, meta), meta)
+        return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
 
     def checkpointed(q, k, v, meta):
         return checkpoint(block, q, k, v, meta, use_reentrant=False,
@@ -912,6 +937,7 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
             _clear(reach)
             _run(lambda q, k, v: compiled(q, k, v, meta), leaves, dout)  # reach of a clean compiled call
             assert len(reach["fwd"]) == 1 and reach["tail"] == ([True] if meta.pack_tails else []), label
+            assert reach["stacked"][:1] == [True] and reach["bwd"][0]["fused"], label  # one fused dqkv
             assert reach["prepare"] == ([layout == "cube"] if meta.pack_tails else []), label  # compiled pruning
     graphs = counters["stats"]["unique_graphs"]
     breaks = sum(counters["graph_break"].values())
@@ -1104,3 +1130,130 @@ def test_f1_h3mh_fullgraph_rejects_noncontiguous_inputs(reach):
         with pytest.raises(torch._dynamo.exc.Unsupported, match=r"unsupported operand type\(s\) for %"):
             compiled(leaf)
     assert reach["fwd"] == [], "a vsa256 op body ran"
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Fused-QKV gradient (conditional input 2dba19be): stacked op route with ONE dqkv allocation
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _stack_grads(qkv, block_map, sizes, dout, stacked, compiled=False, **kw):
+    """Public entry on the stacked (qkv=) or ordinary route; returns (O, dQ, dK, dV)."""
+    leaf = qkv.detach().clone().requires_grad_(True)
+    b = qkv.shape[0] // 3
+
+    def call(x):
+        q, k, v = x.chunk(3, dim=0)
+        return _public(q, k, v, block_map, sizes, qkv=x if stacked else None, **kw)[0]
+
+    fn = torch.compile(call, fullgraph=True, dynamic=True) if compiled else call
+    out = fn(leaf)
+    (g, ) = torch.autograd.grad(out, leaf, dout)
+    return (out.detach(), g[:b], g[b:2 * b], g[2 * b:])
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "fullgraph"])
+@pytest.mark.parametrize("fused", [True, False], ids=["fused_on", "fused_off"])
+def test_fq_flag_reach_and_allocation(reach, fused, compiled):
+    """fused_qkv_grad ON: the op receives the stacked input and its backward writes one dqkv allocation (no
+    SplitBackward concat); OFF restores the baseline: three gradient buffers and autograd's chunk concat. Both equal."""
+    impl = _impl(8)
+    meta = _meta(fused_qkv_grad=fused, **_ALL_ON)
+    leaves, dout = _leaves(meta, 8, seed=31)
+    ref = _run(_layer_block(impl, _meta(fused_qkv_grad=False, **_ALL_ON)), leaves, dout)
+    _clear(reach)
+    block = _layer_block(impl, meta)
+    fn = torch.compile(block, fullgraph=True, dynamic=True) if compiled else block
+    out = fn(*leaves)
+    concat = _reaches(out.grad_fn, "SplitBackward0") if not compiled else None
+    got = (out.detach(), *torch.autograd.grad(out, leaves, dout))
+    diag = dict(fused_qkv_grad=fused, compiled=compiled, stacked_input=reach["stacked"][0],
+                grad_storages=reach["bwd"][0]["storages"], fused_views=reach["bwd"][0]["fused"],
+                split_backward_concat=concat)
+    print("ablation-diagnostic", json.dumps(diag))
+    assert reach["stacked"][0] is fused and reach["bwd"][0]["fused"] is fused
+    assert reach["bwd"][0]["storages"] == (1 if fused else 3)
+    if not compiled:
+        assert concat is (not fused)
+    _same(f"fused={fused} compiled={compiled}", got, ref)
+
+
+@pytest.mark.parametrize("proof", [False, True], ids=["no_proof", "proof"])
+@pytest.mark.parametrize("pack_tails", [True, False], ids=["pack1", "pack0"])
+def test_fq_op_schema_stacked(proof, pack_tails):
+    """opcheck of the stacked forward; backward fake arity 1 ([dqkv]) vs 3."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    qkv, block_map, sizes, _, _ = _op_inputs()
+    qkv.requires_grad_(True)
+    p = _proof(sizes)
+    extra = (p["query_sizes"], p["query_untile"], *p["query_versions"]) if proof else (None, None, 0, 0)
+    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa256_fwd.default, (qkv, None, None, block_map, sizes, *extra,
+                                                                          pack_tails),
+                          test_utils=("test_schema", "test_faketensor", "test_autograd_registration"))
+    out, lse = torch.ops.fastvideo_kernel.vsa256_fwd(qkv, None, None, block_map, sizes, *extra, pack_tails)
+    assert out.shape == (qkv.shape[0] // 3, *qkv.shape[1:])
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        grads = torch.ops.fastvideo_kernel.vsa256_bwd(torch.empty_like(out), qkv, None, None, out, lse, block_map, sizes,
+                                                      *extra, pack_tails, None)
+    assert len(grads) == 1 and grads[0].shape == qkv.shape
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "fullgraph"])
+@pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+def test_fq_stacked_route_invalid_slot_poison(reach, poison, compiled):
+    """Stacked packed route: a non-finite K/V row reachable only through invalid packed slots stays out of dQ/dK/dV
+    on the target rows; stacked == ordinary bitwise (O, dK, dV)."""
+    sizes, routes, bad, target = _poison_case("pad_row0")
+    sizes = torch.tensor(sizes, device="cuda", dtype=torch.int32)
+    g = torch.Generator(device="cuda").manual_seed(615)
+    qkv = torch.randn(3, 1536, 2, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+    qkv[1:, bad] = poison
+    dout = torch.randn(1, 1536, 2, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+    ordinary = _stack_grads(qkv, routes, sizes, dout, stacked=False, pack_tails=True, compiled=compiled)
+    _clear(reach)
+    stacked = _stack_grads(qkv, routes, sizes, dout, stacked=True, pack_tails=True, compiled=compiled)
+    assert reach["tail"] == [True] and reach["bwd"][0]["fused"]
+    for name, s_, o_ in zip(("O", "dQ", "dK", "dV"), stacked, ordinary, strict=True):
+        s_, o_ = s_[:, target], o_[:, target]
+        assert torch.isfinite(s_).all(), f"{name} non-finite on target rows"
+        if name == "dQ":
+            _check("poison dQ", o_, s_, _GRAD_TOL)
+        else:
+            assert torch.equal(s_, o_), name
+
+
+@pytest.mark.parametrize("pack_tails", [True, False], ids=["pack1", "pack0"])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_fq_batch_dim_routes(reach, batch, dim, pack_tails):
+    """Stacked == ordinary (O, dK, dV bitwise) and compiled == eager, B1/2 x D64/128 x both pack settings, with the
+    query proof; the stacked backward writes one allocation."""
+    qkv, block_map, sizes, dout, _ = _op_inputs(b=batch, dim=dim, seed=14)
+    ordinary = _stack_grads(qkv, block_map, sizes, dout, stacked=False, pack_tails=pack_tails, **_proof(sizes))
+    _clear(reach)
+    stacked = _stack_grads(qkv, block_map, sizes, dout, stacked=True, pack_tails=pack_tails, **_proof(sizes))
+    assert reach["stacked"][0] and reach["bwd"][0]["fused"]
+    _same("stacked vs ordinary", stacked, ordinary)
+    compiled = _stack_grads(qkv, block_map, sizes, dout, stacked=True, pack_tails=pack_tails, compiled=True,
+                            **_proof(sizes))
+    _same("compiled vs eager", compiled, stacked)
+
+
+def test_fq_noncontiguous_stack_takes_gated_fallback(reach):
+    """A non-contiguous [3B, S, H, D] stack cannot be the fused input: the ordinary three-input route runs (no fused
+    gradient claimed) with the same result."""
+    qkv, block_map, sizes, dout, _ = _op_inputs(seed=15)
+    wide = torch.zeros(3, qkv.shape[1], 4, 128, device="cuda", dtype=torch.bfloat16)
+    wide[:, :, :2] = qkv
+    leaf = wide.requires_grad_(True)
+    strided = leaf[:, :, :2]
+    assert not strided.is_contiguous()
+    q, k, v = strided.chunk(3, dim=0)
+    out = _public(q, k, v, block_map, sizes, pack_tails=True, qkv=strided)[0]
+    (g, ) = torch.autograd.grad(out, leaf, dout)
+    assert reach["stacked"][0] is False and reach["bwd"][0]["fused"] is False
+    ref = _stack_grads(qkv, block_map, sizes, dout, stacked=False, pack_tails=False)
+    assert torch.equal(out, ref[0])
+    _check("strided dQ", ref[1], g[:1, :, :2], _GRAD_TOL)
+    assert torch.equal(g[1:, :, :2], torch.cat(ref[2:]))
