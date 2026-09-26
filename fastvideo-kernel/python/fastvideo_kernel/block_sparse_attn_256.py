@@ -247,9 +247,15 @@ def block_sparse_attn_256_bshd(
             and q.shape[1] == logical_block_map_256.shape[2] * 256
             and k.shape[1] == logical_block_map_256.shape[3] * 256
             and logical_block_map_256.shape[:2] == (q.shape[0], q.shape[2])
-            and torch.cuda.get_device_capability(q.device)[0] == 10):
-        out, lse = block_sparse_attn_cute_fwd_bshd(
-            q, k, v, logical_block_map_256, logical_variable_block_sizes_256)
+            and torch.cuda.get_device_capability(q.device)[0] == 10
+            and os.environ.get("FASTVIDEO_VSA_VC", "0") != "1"):
+        # BF16 Q256 training: opaque custom-op pair (same op in eager and compiled mode, fullgraph-safe). The pack
+        # policy is static per call: packed-tail backward when enabled (default) and the inputs are contiguous.
+        from . import vsa256_ops  # noqa: F401  (registers torch.ops.fastvideo_kernel.vsa256_fwd/bwd)
+        pack_tails = (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
+                      and all(t.is_contiguous() for t in (q, k, v)))
+        out, lse = torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, logical_block_map_256,
+                                                          logical_variable_block_sizes_256, pack_tails)
         return out, lse.detach()
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)

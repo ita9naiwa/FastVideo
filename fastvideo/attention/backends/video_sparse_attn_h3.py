@@ -561,6 +561,12 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                              "routed to the VSA-H3 backend; exclude it from the supported backends.")
         n_tiles = attn_metadata.variable_block_sizes.numel()
         grad_mode = torch.is_grad_enabled() and x.requires_grad
+        if grad_mode and block_sparse_attn_256_bshd is not None:
+            # Training: an invocation-owned padded buffer through the opaque permutation op pair (same op eager and
+            # compiled; never the shared no-grad scratch below, whose reuse would couple autograd graphs).
+            from fastvideo_kernel import vsa256_ops  # noqa: F401  (registers the fastvideo_kernel ops)
+            return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, attn_metadata.untile_combined_index,
+                                                                    n_tiles * attn_metadata.tile_elems)
         compiling = torch.compiler.is_compiling()
         regional_compiling = compiling and self._regional_compile_sm100a_enabled is True
         if regional_compiling:
