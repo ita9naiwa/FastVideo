@@ -661,10 +661,12 @@ def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> 
     # them. Anything else indexes the effective map (IndexBackward0).
     tile_state = getattr(attn_metadata, "_tile_index_state", None)
     state = getattr(attn_metadata, "_untile_grad_state", None)
-    if (state is not None and tile_state is not None and torch.is_grad_enabled() and output.requires_grad
-            and state[0] is untile and tile_state[0] is attn_metadata.tile_partition_indices
-            and tile_state[2] is attn_metadata.non_pad_index and state[2].device == output.device
-            and output.shape[1] == state[2].numel()
+    # Compiled no-grad calls take the same op for its forward alone: its aten gather beats Inductor's generated one.
+    trains = torch.is_grad_enabled() and output.requires_grad
+    if (state is not None and tile_state is not None
+            and (trains or (torch.compiler.is_compiling() and not torch.is_grad_enabled())) and state[0] is untile
+            and tile_state[0] is attn_metadata.tile_partition_indices and tile_state[2] is attn_metadata.non_pad_index
+            and state[2].device == output.device and output.shape[1] == state[2].numel()
             and (torch.compiler.is_compiling() or (_versions_match(tile_state) and _versions_match(state)))):
         return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(
             output, untile, state[2], state[4], tile_state[0], tile_state[2],
@@ -715,13 +717,16 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         # request-time env/probe/fallback behavior; only Dynamo capture reads
         # the prepared, static route.
         self._regional_compile_sm100a_enabled: bool | None = None
+        # Compiled tile-256 inference route resolved by prepare_for_regional_compile: "bf16" (the opaque CuTe no-grad
+        # op, vsa256_ops.vsa256_nograd_fwd) or None (unavailable; such runs stay eager).
+        self._regional_compile_nograd_route: str | None = None
 
     def prepare_for_compile(self, device: torch.device) -> None:
         """Tensorize per-layer state shared by every torch.compile route."""
         self._compile_layer_idx = torch.tensor(self.layer_idx, device=device, dtype=torch.int64)
 
     def prepare_for_regional_compile(self, device: torch.device) -> str | None:
-        """Resolve the inference-only sm_100a route before fullgraph capture.
+        """Resolve the inference-only compiled routes before fullgraph capture: tile-64 sm_100a and tile-256 CuTe.
 
         The ordinary eager route probes the environment, extension, device,
         and tensor contract at every call so it can warn and fall back.  Those
@@ -758,6 +763,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 enabled = reason is None
 
         self._regional_compile_sm100a_enabled = enabled
+        self._regional_compile_nograd_route = self._resolve_cute256_route(device)
+        if not enabled and self._regional_compile_nograd_route is not None:
+            reason = None  # tile-256 CuTe runs compile; the loader pairs FASTVIDEO_VSA_SM100A=1 with tile 64
         if enabled:
             route = ("native fastvideo-kernel mask entry" if callable(
                 getattr(_sm100a, "block_sparse_attn_sm100a_from_mask", None)) else
@@ -766,6 +774,23 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if requested and reason is not None:
             logger.warning_once(f"VSA-H3 regional compile is unavailable and will stay eager: {reason}")
         return reason
+
+    @staticmethod
+    def _resolve_cute256_route(device: torch.device) -> str | None:
+        """"bf16" when tile-256 no-grad calls reach the opaque CuTe op: CuTe backend, SM10x, VC off (the VC route is
+        eager-only)."""
+        if (block_sparse_attn_256_bshd is None or device.type != "cuda"
+                or os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"):
+            return None
+        from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
+        if _resolve_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
+            return None
+        try:
+            from fastvideo_kernel.block_sparse_attn_cute_fwd import _load_fa4_cute
+            _load_fa4_cute()
+        except (ImportError, RuntimeError):
+            return None
+        return "bf16"
 
     def tile(self, x: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Scatter rows into the padded tile buffer (pad positions stay zero).
@@ -808,6 +833,17 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, state[0], state[2],
                                                                     attn_metadata.untile_combined_index,
                                                                     target_shape[1], state[1], state[3])
+
+        if compiling and not grad_mode and attn_metadata.tile_elems == 256:
+            # Compiled tile-256 inference: a fresh tensor the graph owns (the holder's identity/version bookkeeping
+            # below is eager-only Python state). With builder-certified indices, the opaque permutation op (row gather,
+            # pad rows zeroed by index) beats Inductor's generated gather; otherwise a fresh zero-padded scatter.
+            if (state is not None and state[0] is attn_metadata.tile_partition_indices
+                    and state[2] is attn_metadata.non_pad_index and x.shape[1] == state[0].numel()):
+                return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, state[0], state[2],
+                                                                       attn_metadata.untile_combined_index,
+                                                                       target_shape[1], state[1], state[3])
+            return scatter_into_tile_buf(x, target_shape, attn_metadata.untile_combined_index, None)
 
         # ``untile_combined_index`` maps each packed row to a logical tile
         # slot. Different geometries can share one transport shape; clear a
@@ -952,9 +988,6 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         regional_compiling = compiling and self._regional_compile_sm100a_enabled is True
 
         tile_elems = attn_metadata.tile_elems
-        if regional_compiling and tile_elems != 64:
-            raise RuntimeError("VSA-H3 regional fullgraph compile requires 64-token tiles; disable "
-                               "inference_torch_compile for tile-256/CuTe runs.")
         if tile_elems == 64:
             if block_sparse_attn_64_bhsd is None:
                 raise NotImplementedError("fastvideo_kernel.block_sparse_attn is not installed")

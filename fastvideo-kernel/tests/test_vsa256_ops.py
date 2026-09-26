@@ -307,3 +307,96 @@ def test_h3_block_h3mh_compile_config(monkeypatch, sparsity):
     assert sum(counters["graph_break"].values()) == breaks0
     assert counters["stats"]["unique_graphs"] - graphs0 == 1
     torch._dynamo.reset()
+
+
+def test_vsa256_nograd_op_opcheck_and_previous_route():
+    """Inference op: schema/fake check, and eager output (out, LSE) bitwise equal to the previous no-grad route
+    (256 map expanded to 128-token KV children, then the CuTe forward)."""
+    from fastvideo_kernel import vsa256_ops
+    from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
+    from fastvideo_kernel.block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
+    q, k, v, block_map, sizes = _inputs(requires_grad=False)
+    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa256_nograd_fwd.default, (q, k, v, block_map, sizes),
+                          test_utils=("test_schema", "test_faketensor"))
+    out, lse = vsa256_ops.vsa256_nograd_fwd(q, k, v, block_map, sizes)
+    with torch.no_grad():
+        ref_out, ref_lse = block_sparse_attn_cute_fwd_bshd(q, k, v, *_expand_mask_and_sizes_256_to_128(block_map, sizes))
+    assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
+
+
+def test_vsa256_nograd_op_cuda_graph():
+    """CUDA-graph capture: an unwarmed geometry raises (its CuTe JIT would run inside the capture); a warmed one
+    captures and replays equal to eager, also after the inputs and the block map change in place."""
+    q, k, v, block_map, sizes = _inputs(n_tiles=10, requires_grad=False)
+    op = torch.ops.fastvideo_kernel.vsa256_nograd_fwd
+    with pytest.raises(RuntimeError, match="unwarmed geometry"), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        op(q, k, v, block_map, sizes)
+    op(q, k, v, block_map, sizes)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = op(q, k, v, block_map, sizes)
+    for step in range(2):
+        q.copy_(torch.randn_like(q))
+        block_map.copy_(torch.rand(block_map.shape, device="cuda") < 0.3 + 0.2 * step)
+        ref_out, ref_lse = op(q, k, v, block_map, sizes)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse), step
+
+
+def test_h3_nograd_block_fullgraph(monkeypatch):
+    """Compiled tile-256 H3 inference: torch.compile(fullgraph=True, dynamic=True) of the no-grad block (tile -> block map
+    -> attention -> untile) at s=0.85 capped at 32 over cube and chunk256 geometries with different top-k: one graph per
+    layout, 0 recompiles, output bitwise equal to eager, and the CuTe forward runs inside the no-grad op in both modes."""
+    import types
+    import torch.fx.experimental._config as fx_config
+    from fastvideo_kernel import vsa256_ops
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.delenv("FASTVIDEO_VSA_VC", raising=False)
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
+    calls = []
+    real = vsa256_ops.adapter
+    proxy = types.SimpleNamespace(**{n: getattr(real, n) for n in dir(real) if not n.startswith("__")})
+    proxy.block_sparse_attn_cute_fwd_bshd = lambda *a, **kw: calls.append(1) or real.block_sparse_attn_cute_fwd_bshd(*a, **kw)
+    monkeypatch.setattr(vsa256_ops, "adapter", proxy)
+    impl = MiniMaxH3VSAImpl(num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5)
+    impl.layer_idx = 0
+    assert impl.prepare_for_regional_compile(torch.device("cuda")) is None
+    assert impl._regional_compile_nograd_route == "bf16"
+
+    def block(q, k, v, meta):
+        x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
+        q2, k2, v2 = x.chunk(3, dim=0)
+        return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
+
+    geometries = [((42, 14, 24), (175, 1, 170, 402)), ((37, 16, 56), (250, 1, 0, 300)), ((102, 14, 24), (120, 1, 0, 402)),
+                  ((62, 26, 24), (175, 1, 170, 0))]
+    counters = torch._dynamo.utils.counters
+    for layout in ("chunk256", "cube"):
+        torch._dynamo.reset()
+        compiled = torch.compile(block, backend="inductor", dynamic=True, fullgraph=True)
+        graphs0, breaks0 = counters["stats"]["unique_graphs"], sum(counters["graph_break"].values())
+        ks = set()
+        for i, (raw, prefix) in enumerate(geometries):
+            meta = MiniMaxH3VSAMetadataBuilder().build(
+                current_timestep=0, raw_latent_shape=raw, patch_size=(1, 2, 2), VSA_sparsity=0.85, prefix_segments=prefix,
+                device=torch.device("cuda"), topk_cap=32,
+                **({"tile_layout": "chunk256", "merge_prefix": True} if layout == "chunk256" else {}))
+            ks.add(meta.video_topk)
+            torch.manual_seed(i)
+            q, k, v = (torch.randn(1, meta.total_seq_length, 4, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+            with torch.no_grad():
+                calls.clear()
+                eager = block(q, k, v, meta)
+                assert len(calls) == 1, (layout, i, "eager")
+                before = counters["stats"]["unique_graphs"]
+                out = compiled(q, k, v, meta)
+                assert len(calls) == 2, (layout, i, "compiled")
+            assert i == 0 or counters["stats"]["unique_graphs"] == before, f"recompiled at {layout} geometry {i} {raw}"
+            assert torch.equal(out, eager), (layout, i, raw)
+        assert len(ks) > 1, ks  # the geometries exercise different top-k values
+        assert sum(counters["graph_break"].values()) == breaks0
+        assert counters["stats"]["unique_graphs"] - graphs0 == 1, layout
+    torch._dynamo.reset()

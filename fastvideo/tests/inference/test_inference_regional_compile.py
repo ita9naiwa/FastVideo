@@ -78,6 +78,7 @@ def test_h3_vsa_sm100a_tile64_allows_compile(monkeypatch) -> None:
 def test_h3_vsa_unsupported_compile_route_degrades_to_eager(sm100a, tile_size, monkeypatch) -> None:
     monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
     monkeypatch.delenv("FASTVIDEO_H3_VSA_PROBE", raising=False)
+    monkeypatch.delenv("FASTVIDEO_VSA_CUTEDSL", raising=False)  # tile 256 without the CuTe backend stays eager
     if sm100a:
         monkeypatch.setenv("FASTVIDEO_VSA_SM100A", "1")
     else:
@@ -90,6 +91,24 @@ def test_h3_vsa_unsupported_compile_route_degrades_to_eager(sm100a, tile_size, m
 
     assert reason is not None
     assert "eager" in reason
+
+
+@pytest.mark.parametrize(("vc", "allowed"), [(False, True), (True, False)])
+def test_h3_vsa_cute_tile256_compile_route(vc, allowed, monkeypatch) -> None:
+    monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
+    monkeypatch.delenv("FASTVIDEO_H3_VSA_PROBE", raising=False)
+    monkeypatch.delenv("FASTVIDEO_VSA_SM100A", raising=False)
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.setenv("FASTVIDEO_VSA_VC", "1" if vc else "0")
+
+    reason = _regional_compile_unsupported_reason(
+        _init_params_for("VIDEO_SPARSE_ATTN_H3"),
+        vsa_tile_size=256,
+    )
+
+    assert (reason is None) == allowed
+    if not allowed:
+        assert "eager" in reason
 
 
 def test_h3_vsa_probe_degrades_regional_compile_to_eager(monkeypatch) -> None:

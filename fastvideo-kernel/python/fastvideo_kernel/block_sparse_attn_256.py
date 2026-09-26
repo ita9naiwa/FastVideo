@@ -274,5 +274,8 @@ def block_sparse_attn_256_bshd(
                                                  query_versions=query_versions, pack_tails=pack_tails,
                                                  qkv=qkv, alias_guard=alias_guard)
         return out, lse.detach()
+    if vsa256_ops.nograd_eligible(q, k, v, logical_block_map_256):
+        # BF16 Q256 inference: the same forward behind one opaque op (eager and compiled), fullgraph-safe.
+        return vsa256_ops.vsa256_nograd_fwd(q, k, v, logical_block_map_256, logical_variable_block_sizes_256)
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128, **_hint_kwargs(alias_guard))
