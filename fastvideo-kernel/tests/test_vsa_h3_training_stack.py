@@ -11,7 +11,9 @@ and compiled mode alike; op identity reach via the profiler. Numerics: O, LSE, d
 atomics (order may differ), so it is held to the suite-wide _GRAD_TOL.
 """
 import functools
+import inspect
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -42,6 +44,7 @@ def _cute(monkeypatch):
                  "FASTVIDEO_VSA_PACK_TAILS"):
         monkeypatch.delenv(name, raising=False)
     yield
+    os.environ.pop("FASTVIDEO_VSA_PACK_TAILS", None)  # _public may set it on trees without the policy input
     torch._dynamo.reset()
 
 
@@ -137,10 +140,33 @@ def _impl(heads):
     return impl
 
 
-def _meta(spec=_BIG, layout="cube", merge=False, **opts):
-    """Test metadata; pack_tails defaults to True (always pack) so pruning is reachable, "auto" = the policy."""
+def _features():
+    """Which conditional inputs this tree carries (one module serves the stack and its single-input branches)."""
     from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAMetadataBuilder
+    params = inspect.signature(MiniMaxH3VSAMetadataBuilder.build).parameters
+    return dict(policy="pack_tails" in params, fused="fused_qkv_grad" in params)
+
+
+def _need(feature):
+    if not _features()[feature]:
+        pytest.skip(f"this tree does not carry the {feature} input")
+
+
+def _pack(meta):
+    """Effective pack policy: the metadata bool (policy input) or the seam's env default (on)."""
+    return getattr(meta, "pack_tails", os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1")
+
+
+def _meta(spec=_BIG, layout="cube", merge=False, **opts):
+    """Test metadata; pack_tails defaults to True (always pack) so pruning is reachable, "auto" = the policy (policy
+    trees only; without the policy input the seam's env default applies)."""
+    from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAMetadataBuilder
+    feats = _features()
     opts.setdefault("pack_tails", True)
+    if not feats["policy"]:
+        assert opts.pop("pack_tails") is True, "pack policy requested on a tree without the policy input"
+    if not feats["fused"]:
+        opts.pop("fused_qkv_grad", None)
     return MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, VSA_sparsity=opts.pop("VSA_sparsity", 0.75),
                                                device=torch.device("cuda"),
                                                tile_layout=layout, merge_prefix=merge, **spec, **opts)
@@ -151,7 +177,9 @@ def _layer_block(impl, meta):
 
     def block(q, k, v):
         x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
-        return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
+        if hasattr(impl, "forward_qkv"):
+            return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
+        return impl.postprocess_output(impl.forward(*x.chunk(3, dim=0), None, meta), meta)
 
     return block
 
@@ -193,6 +221,9 @@ def _op_inputs(b=1, n=12, heads=2, dim=128, seed=0, sizes=None):
 
 def _public(q, k, v, block_map, sizes, **kw):
     from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    if "pack_tails" in kw and "pack_tails" not in inspect.signature(block_sparse_attn_256_bshd).parameters:
+        # tree without the policy input: the seam reads FASTVIDEO_VSA_PACK_TAILS per call
+        os.environ["FASTVIDEO_VSA_PACK_TAILS"] = "1" if kw.pop("pack_tails") else "0"
     return block_sparse_attn_256_bshd(q, k, v, block_map, sizes, **kw)
 
 
@@ -230,14 +261,16 @@ def test_f1_public_dispatch_reach(reach, pack, compiled):
     """Real H3 layer block, cube: the vsa256 op pair runs (eager and fullgraph dynamic), the metadata pack policy
     (builder pack_tails True / False / "auto") reaches the backward as the op's static bool, query pruning reaches the
     packed backward; each arm equals the pruning-off eager arm with the same policy."""
+    if pack is not True:
+        _need("policy")
     impl = _impl(8)
     meta = _meta(pack_tails=pack, **_ALL_ON)
     if pack == "auto":
         pack = meta.pack_tails
-    assert meta.pack_tails is pack
+    assert _pack(meta) is pack
     assert bool((meta.variable_block_sizes <= 128).any())
     leaves, dout = _leaves(meta, 8)
-    ref = _run(_layer_block(impl, _meta(pack_tails=meta.pack_tails, **_ALL_OFF)), leaves, dout)
+    ref = _run(_layer_block(impl, _meta(pack_tails=_pack(meta), **_ALL_OFF)), leaves, dout)
     _clear(reach)
     block = _layer_block(impl, meta)
     got, ops = _op_calls(_run, torch.compile(block, fullgraph=True, dynamic=True) if compiled else block, leaves, dout)
@@ -249,6 +282,7 @@ def test_f1_public_dispatch_reach(reach, pack, compiled):
 
 def test_f1_policy_decided_once_in_builder(monkeypatch, reach):
     """pack_tails="auto": the builder reads the environment once; later environment changes do not reach the op."""
+    _need("policy")
     meta = _meta(pack_tails="auto", **_ALL_ON)
     policy = meta.pack_tails
     monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "0" if policy else "1")
@@ -261,6 +295,7 @@ def test_f1_policy_decided_once_in_builder(monkeypatch, reach):
 def test_f1_pack_policy_flag_reach(reach, pack):
     """Same-head ablation of the pack policy: pack_tails=True (policy OFF = the pre-policy default, always pack)
     vs "auto" (policy ON): the op's static bool follows the metadata; results equal the matching reference."""
+    _need("policy")
     impl = _impl(8)
     meta = _meta(pack_tails=pack, **_ALL_ON)
     leaves, dout = _leaves(meta, 8, seed=4)
@@ -911,7 +946,7 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
                                  device=torch.device("cuda"), tile_layout=layout, merge_prefix=merge,
                                  topk_cap=cap, **_ALL_ON)
             assert meta.total_seq_length == doc["rows"], label
-            policies.add(meta.pack_tails)
+            policies.add(_pack(meta))
             if cap is not None:  # s085k32 v4: builder k == the spec's exact rule, per document
                 n = meta.num_video_tiles
                 assert meta.video_topk == max(1, min((3 * n + 19) // 20, int(cap), n)), (label, n, meta.video_topk)
@@ -936,16 +971,18 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
             reach["maps"] = None
             _clear(reach)
             _run(lambda q, k, v: compiled(q, k, v, meta), leaves, dout)  # reach of a clean compiled call
-            assert len(reach["fwd"]) == 1 and reach["tail"] == ([True] if meta.pack_tails else []), label
-            assert reach["stacked"][:1] == [True] and reach["bwd"][0]["fused"], label  # one fused dqkv
-            assert reach["prepare"] == ([layout == "cube"] if meta.pack_tails else []), label  # compiled pruning
+            assert len(reach["fwd"]) == 1 and reach["tail"] == ([True] if _pack(meta) else []), label
+            if _features()["fused"]:
+                assert reach["stacked"][:1] == [True] and reach["bwd"][0]["fused"], label  # one fused dqkv
+            assert reach["prepare"] == ([layout == "cube"] if _pack(meta) else []), label  # compiled pruning
     graphs = counters["stats"]["unique_graphs"]
     breaks = sum(counters["graph_break"].values())
     print(f"h3mh-compile {layout} {spec}: docs={[d[0] for d in docs]} unique_graphs={graphs} graph_breaks={breaks} "
           f"flip_docs={[r['doc'] for r in parity if r['flipped_blocks']]}")
     for r in parity:
         print("h3mh-parity", json.dumps(r))
-    assert policies == ({True} if spec == "pack1_witness" else {False}), policies  # one static policy per corpus
+    # one static policy per corpus: the auto policy packs only the witnesses; without the policy input every doc packs
+    assert policies == ({True} if spec == "pack1_witness" or not _features()["policy"] else {False}), policies
     if spec == "pack1_witness":
         assert reach["tail"] and reach["prepare"] == [True], "PACK1 witness must run the pruned packed backward"
     assert breaks == 0 and graphs == 1, (graphs, dict(counters["graph_break"]), dict(counters["frames"]))
@@ -1158,6 +1195,7 @@ def _stack_grads(qkv, block_map, sizes, dout, stacked, compiled=False, **kw):
 def test_fq_flag_reach_and_allocation(reach, fused, compiled):
     """fused_qkv_grad ON: the op receives the stacked input and its backward writes one dqkv allocation (no
     SplitBackward concat); OFF restores the baseline: three gradient buffers and autograd's chunk concat. Both equal."""
+    _need("fused")
     impl = _impl(8)
     meta = _meta(fused_qkv_grad=fused, **_ALL_ON)
     leaves, dout = _leaves(meta, 8, seed=31)
@@ -1183,6 +1221,7 @@ def test_fq_flag_reach_and_allocation(reach, fused, compiled):
 @pytest.mark.parametrize("pack_tails", [True, False], ids=["pack1", "pack0"])
 def test_fq_op_schema_stacked(proof, pack_tails):
     """opcheck of the stacked forward; backward fake arity 1 ([dqkv]) vs 3."""
+    _need("fused")
     from torch._subclasses.fake_tensor import FakeTensorMode
     qkv, block_map, sizes, _, _ = _op_inputs()
     qkv.requires_grad_(True)
@@ -1204,6 +1243,7 @@ def test_fq_op_schema_stacked(proof, pack_tails):
 def test_fq_stacked_route_invalid_slot_poison(reach, poison, compiled):
     """Stacked packed route: a non-finite K/V row reachable only through invalid packed slots stays out of dQ/dK/dV
     on the target rows; stacked == ordinary bitwise (O, dK, dV)."""
+    _need("fused")
     sizes, routes, bad, target = _poison_case("pad_row0")
     sizes = torch.tensor(sizes, device="cuda", dtype=torch.int32)
     g = torch.Generator(device="cuda").manual_seed(615)
@@ -1229,6 +1269,7 @@ def test_fq_stacked_route_invalid_slot_poison(reach, poison, compiled):
 def test_fq_batch_dim_routes(reach, batch, dim, pack_tails):
     """Stacked == ordinary (O, dK, dV bitwise) and compiled == eager, B1/2 x D64/128 x both pack settings, with the
     query proof; the stacked backward writes one allocation."""
+    _need("fused")
     qkv, block_map, sizes, dout, _ = _op_inputs(b=batch, dim=dim, seed=14)
     ordinary = _stack_grads(qkv, block_map, sizes, dout, stacked=False, pack_tails=pack_tails, **_proof(sizes))
     _clear(reach)
@@ -1246,6 +1287,7 @@ def test_fq_batch_dim_routes(reach, batch, dim, pack_tails):
 def test_fq_noncontiguous_stack_takes_gated_fallback(reach):
     """A non-contiguous [3B, S, H, D] stack cannot be the fused input: the ordinary three-input route runs (no fused
     gradient claimed) with the same result."""
+    _need("fused")
     qkv, block_map, sizes, dout, _ = _op_inputs(seed=15)
     wide = torch.zeros(3, qkv.shape[1], 4, 128, device="cuda", dtype=torch.bfloat16)
     wide[:, :, :2] = qkv
@@ -1269,6 +1311,7 @@ def test_fq_tile_path_eligibility(reach, heads):
     eligibility guard, 3 * numel >= 2**25; at h3mh's H56 every real document passes it, 46/46). Below the guard (H2,
     eager) H3 tiles into the builder-owned holder buffer; above it (H8) through the invocation-owned permutation op.
     Both give the stacked single-allocation backward with results equal to fused_qkv_grad OFF."""
+    _need("fused")
     impl = _impl(heads)
     meta = _meta(**_ALL_ON)
     leaves, dout = _leaves(meta, heads, seed=33)
