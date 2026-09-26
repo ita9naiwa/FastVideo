@@ -144,6 +144,20 @@ class DistributedAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
+        if world_size == 1 and replicated_q is None and hasattr(self.attn_impl, "preprocess_q_k_v"):
+            # No all-to-all to feed: the backend tiles q, k, v from their own tensors (no stacked copy of Q/K/V).
+            original_seq_len = original_seq_len or q.shape[1]
+            pad_seq_len = q.shape[1] - original_seq_len
+            q, k, v = (x[:, :original_seq_len] for x in (q, k, v))
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata).chunk(3, dim=0)
+            output = self.attn_impl.postprocess_output(self.attn_impl.forward(q, k, v, ctx_attn_metadata),
+                                                       ctx_attn_metadata)
+            return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None
+
         # Stack QKV
         qkv = torch.cat([q, k, v], dim=0)  # [3*batch, seq_len, num_heads, head_dim]
 
@@ -238,6 +252,19 @@ class DistributedAttention_VSA(DistributedAttention):
         batch_size, seq_len, num_heads, head_dim = q.shape
         # Stack QKV (a caller with a structurally-zero gate passes None and
         # skips the gate's share of the all-to-all/tile traffic)
+        if gate_compress is None and get_sp_world_size() == 1 and hasattr(self.attn_impl, "preprocess_q_k_v"):
+            # No all-to-all to feed: the backend tiles q, k, v from their own tensors (no stacked copy of Q/K/V).
+            pad_seq_len = seq_len - original_seq_len
+            q, k, v = (x[:, :original_seq_len] for x in (q, k, v))
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata).chunk(3, dim=0)
+            output = self.attn_impl.forward(q, k, v, None, ctx_attn_metadata)  # type: ignore[call-arg]
+            output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
+            return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None
+
         stack = [q, k, v] if gate_compress is None else [q, k, v, gate_compress]
         qkvg = torch.cat(stack, dim=0)  # [3or4*batch, seq_len, num_heads, head_dim]
 

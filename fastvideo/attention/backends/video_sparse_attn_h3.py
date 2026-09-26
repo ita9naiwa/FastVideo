@@ -804,6 +804,29 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             return qkv
         return self.tile(qkv, attn_metadata)
 
+    def preprocess_q_k_v(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
+        """preprocess_qkv for callers holding separate q, k, v: equals preprocess_qkv(torch.cat([q, k, v])).
+
+        Training calls on trusted cube/chunk metadata gather each operand straight into the stacked tiled layout
+        (vsa_tile_permute_qkv_fwd), so the concatenated [3B, S, H, D] tensor is never materialized; every other
+        call concatenates and takes preprocess_qkv unchanged.
+        """
+        state = getattr(attn_metadata, "_tile_index_state", None)
+        n = attn_metadata.total_seq_length
+        grad_mode = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
+        if (state is not None and grad_mode and q.ndim == 4 and q.is_cuda and q.dtype == torch.bfloat16
+                and all(x.shape == q.shape and x.dtype == q.dtype and x.device == q.device and
+                        (x.is_contiguous() or _tile_row_layout(x)) for x in (q, k, v))
+                and q.shape[1] == n == state[0].numel() == state[2].numel() and state[0].device == q.device
+                and state[2].device == q.device and (torch.compiler.is_compiling() or 3 * q.numel() >= 2**25)
+                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
+            padded = attn_metadata.variable_block_sizes.numel() * attn_metadata.tile_elems
+            return torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd(q, k, v, state[0], state[2],
+                                                                       attn_metadata.untile_combined_index, padded,
+                                                                       state[1], state[3])
+        return self.preprocess_qkv(torch.cat([q, k, v], dim=0), attn_metadata)
+
     def _vc_fused_forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                           gate_compress: torch.Tensor | None, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Fused VC route: one producer pass from packed rows to padded FP8 Q/K/V plus FP32 tile pools.
