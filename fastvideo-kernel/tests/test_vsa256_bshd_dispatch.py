@@ -16,7 +16,7 @@ def test_vsa256_bshd_training_only_dispatch(monkeypatch, requires_grad, grad_ena
     monkeypatch.setattr(wrapper, '_resolve_backend', lambda: 'cute')
     seen = []
 
-    def record(q, k, v, routes, sizes):
+    def record(q, k, v, routes, sizes, **_):
         seen.append(routes.shape[-1])
         return torch.empty_like(q), torch.empty(1, 2, 512, device='cuda', requires_grad=True)
 

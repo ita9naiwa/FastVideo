@@ -362,6 +362,9 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # skip wholly padded Q128 children. Further integrated options (pack_tails policy, prefix_split, fused_qkv_grad) are
     # added next to it when their inputs are accepted.
     query_pad_pruning: bool = True
+    # forward_qkv keeps [3B, S, H, D] as one autograd input (one fused gradient allocation); OFF = the ordinary
+    # three-input route with three gradient buffers and autograd's chunk-backward concat (the pre-component path).
+    fused_qkv_grad: bool = True
     # Training backward tail packing for tile-256 (static per step; see _pack_tails_policy).
     pack_tails: bool = True
 
@@ -397,6 +400,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         merge_prefix: bool = False,
         topk_cap: int | None = None,
         query_pad_pruning: bool = True,
+        fused_qkv_grad: bool = True,
         pack_tails: bool | str = "auto",
         pack_tails_min_partial: float = 0.15,
         **kwargs: dict[str, Any],
@@ -441,6 +445,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             video_topk=_video_topk(VSA_sparsity, num_video_tiles, topk_cap),
             video_topk_cap=topk_cap,
             query_pad_pruning=bool(query_pad_pruning),
+            fused_qkv_grad=bool(fused_qkv_grad),
             pack_tails=self._pack_tails(pack_tails, variable_block_sizes, int(tile_size), pack_tails_min_partial),
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
@@ -770,6 +775,16 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                                "postprocess_output; its backward assumed the original padded-row geometry.")
         return output[:, untile]
 
+    def forward_qkv(self, qkv: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
+        """Gate-free entry on the batch-stacked tiled ``[3B, S, H, D]`` tensor.
+
+        Same result as ``forward(*qkv.chunk(3), None, ...)``; native tile-256
+        CuTe training keeps ``qkv`` as one autograd input so backward writes a
+        single fused gradient instead of a ChunkBackward concat.
+        """
+        return self.forward(*qkv.chunk(3, dim=0), None, attn_metadata,
+                            qkv=qkv if attn_metadata.fused_qkv_grad else None)
+
     def forward(  # type: ignore[override]
         self,
         query: torch.Tensor,
@@ -777,6 +792,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         value: torch.Tensor,
         gate_compress: torch.Tensor | None,
         attn_metadata: MiniMaxH3VSAMetadata,
+        qkv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._vc_fused_route(query, attn_metadata) and query.shape[1] == attn_metadata.total_seq_length:
             return self._vc_fused_forward(query, key, value, gate_compress, attn_metadata)
@@ -987,6 +1003,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 query_untile=query_untile,
                 query_versions=query_versions,
                 pack_tails=attn_metadata.pack_tails,
+                qkv=qkv if gate_compress is None and query.shape[1] == logical_seq_len else None,
             )
 
         if logical_gate is not None:

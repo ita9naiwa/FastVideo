@@ -256,11 +256,15 @@ class DistributedAttention_VSA(DistributedAttention):
 
         qkvg = self.attn_impl.preprocess_qkv(qkvg, ctx_attn_metadata)
 
-        if gate_compress is None:
-            q, k, v = qkvg.chunk(3, dim=0)
+        if gate_compress is None and hasattr(self.attn_impl, "forward_qkv"):
+            # Keep the stacked tensor as one autograd input (fused Q/K/V gradient).
+            output = self.attn_impl.forward_qkv(qkvg, ctx_attn_metadata)
         else:
-            q, k, v, gate_compress = qkvg.chunk(4, dim=0)
-        output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)  # type: ignore[call-arg]
+            if gate_compress is None:
+                q, k, v = qkvg.chunk(3, dim=0)
+            else:
+                q, k, v, gate_compress = qkvg.chunk(4, dim=0)
+            output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)  # type: ignore[call-arg]
 
         # Redistribute back if using sequence parallelism
         replicated_output = None

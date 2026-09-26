@@ -130,11 +130,13 @@ class TailTraining(torch.autograd.Function):
         return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes), None, None, None)
 
 
-def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes=None):
+def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes=None, grad_views=(None, None, None)):
     """PACK_TAILS backward body (shared by TailTraining and the vsa256_bwd custom op): full-tile launch, then the
     packed-tail launch accumulating into the same dQ, scattered back into dK/dV. ``query_sizes`` (caller guarantee:
     rows past each parent's valid prefix get zero dO) lets the main backward skip wholly padded Q128 children; a present
-    dLSE always keeps the full lists."""
+    dLSE always keeps the full lists. ``grad_views``: optional caller-owned contiguous dq/dk/dv outputs (vsa256_bwd's
+    stacked route); the first launch writes them, the packed-tail launch accumulates into the same dQ (shared workspace)
+    and its packed dK/dV are scattered into them."""
     dout = dout.contiguous()
     dlse = dlse.contiguous() if dlse is not None else None
     full, child_sizes, tail = _prepare(routes, sizes, query_sizes if dlse is None else None)
@@ -143,7 +145,7 @@ def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes=None
     dq, dk, dv, workspace = backward(
         q, k, v, out, dout, lse, mask_mod=adapter._build_vbs_mask_mod(128),
         aux_tensors=[child_sizes], block_sparse_tensors=full, dlse=dlse,
-        _return_workspace=True,
+        dq=grad_views[0], dk=grad_views[1], dv=grad_views[2], _return_workspace=True,
     )
     # Invalid slots gather row 0; zero them so a non-finite row cannot leak as 0 * NaN.
     invalid = ~valid.view(1, -1, 1, 1)
