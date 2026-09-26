@@ -14,10 +14,10 @@ only exercised when the VSA-128/256 CuTe fastpath is explicitly selected
 (``FASTVIDEO_VSA_CUTEDSL=1``). The default path is Triton and does not require
 it. Also needs ``nvidia-cutlass-dsl`` and ``quack-kernels``.
 
-``FASTVIDEO_VSA_PACK_TAILS=1`` additionally enables VSA-256 training tail packing
-for contiguous BF16 inputs on SM10x (head dimensions 64/128). It requires FA4
-backward workspace support and is opt-in: short KV tails benefit, while full
-blocks and overflowing tail plans pay preparation overhead. A device-side
+VSA-256 training tail packing is enabled by default for contiguous BF16 inputs
+on SM10x (head dimensions 64/128), with FA4 backward workspace support.
+Set ``FASTVIDEO_VSA_PACK_TAILS=0`` to disable it. Short KV tails benefit, while
+full blocks and overflowing tail plans pay preparation overhead. A device-side
 capacity check preserves the original sparse calculation on overflow.
 """
 
@@ -454,7 +454,7 @@ def _cute_attention(
             and k_bshd.shape[1] == block_map.shape[3] * 256
             and q_bshd.dtype == torch.bfloat16 and q_bshd.shape[-1] in (64, 128)
             and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
-        if (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "0") == "1"
+        if (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
                 and q_bshd.shape[-1] == k_bshd.shape[-1] == v_bshd.shape[-1]
                 and q_bshd.shape[2] == k_bshd.shape[2] == v_bshd.shape[2]
                 and block_map.shape[:2] == (q_bshd.shape[0], q_bshd.shape[2])
