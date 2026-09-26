@@ -70,6 +70,7 @@ def _setup_context(ctx, inputs, output):
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse, block_map, sizes)
     ctx.pack_tails = pack_tails
+    ctx.set_materialize_grads(False)  # as the old autograd.Functions: an unused output's grad arrives as None
 
 
 def _backward(ctx, dout, dlse):
@@ -82,40 +83,3 @@ def _backward(ctx, dout, dlse):
 
 vsa256_fwd.register_autograd(_backward, setup_context=_setup_context)
 
-
-# Tile permutation pair: packed rows [B, S, H, D] -> fresh zero-padded tile buffer [B, P, H, D] (row i lands in padded
-# slot index[i]), and its adjoint (gather the same slots). Training calls must not reuse a shared scratch buffer, so the
-# forward always returns an invocation-owned tensor.
-@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_fwd", mutates_args=(), device_types="cuda")
-def vsa_tile_permute_fwd(x: torch.Tensor, index: torch.Tensor, padded_len: int) -> torch.Tensor:
-    out = x.new_zeros((x.shape[0], padded_len, *x.shape[2:]))
-    out[:, index] = x
-    return out
-
-
-@torch.library.register_fake("fastvideo_kernel::vsa_tile_permute_fwd")
-def _vsa_tile_permute_fwd_fake(x, index, padded_len):
-    return x.new_empty((x.shape[0], padded_len, *x.shape[2:]))
-
-
-@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_bwd", mutates_args=(), device_types="cuda")
-def vsa_tile_permute_bwd(grad: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    return grad.index_select(1, index)
-
-
-@torch.library.register_fake("fastvideo_kernel::vsa_tile_permute_bwd")
-def _vsa_tile_permute_bwd_fake(grad, index):
-    return grad.new_empty((grad.shape[0], index.shape[0], *grad.shape[2:]))
-
-
-def _permute_setup_context(ctx, inputs, output):
-    _, index, _ = inputs
-    ctx.save_for_backward(index)
-
-
-def _permute_backward(ctx, grad):
-    (index, ) = ctx.saved_tensors
-    return vsa_tile_permute_bwd(grad.contiguous(), index), None, None
-
-
-vsa_tile_permute_fwd.register_autograd(_permute_backward, setup_context=_permute_setup_context)

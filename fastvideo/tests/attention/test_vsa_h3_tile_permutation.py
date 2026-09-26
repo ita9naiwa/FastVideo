@@ -74,4 +74,9 @@ def test_fallbacks_keep_holder_path():
     assert impl.tile(small, md) is md.tile_buf_holder.buffer  # below the 2**25-element threshold
     md.non_pad_index.add_(0)  # in-place write: cached proof no longer trusted
     md.tile_buf_holder.buffer = None
-    assert impl.tile(x.requires_grad_(True), md) is md.tile_buf_holder.buffer
+    # The training op re-checks the recorded versions itself and falls back to the untile scatter into a fresh buffer:
+    # same values as the holder path, but never the shared holder (see bugs/...-h3-tile-holder-autograd-reuse).
+    out = impl.tile(x.requires_grad_(True), md)
+    assert md.tile_buf_holder.buffer is None
+    with torch.no_grad():
+        assert torch.equal(out, impl.tile(x.detach(), md))

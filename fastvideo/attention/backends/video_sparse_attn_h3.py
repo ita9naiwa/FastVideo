@@ -71,7 +71,7 @@ except ImportError:
 
 from fastvideo.attention.backends.abstract import (AttentionBackend, AttentionImpl, AttentionMetadata,
                                                    AttentionMetadataBuilder, layer_idx_from_prefix)
-from fastvideo.attention.backends.video_sparse_attn import (_TilePermutation, _tile_row_layout, compute_topk,
+from fastvideo.attention.backends.video_sparse_attn import (_tile_row_layout, compute_topk,
                                                             construct_variable_block_sizes, get_non_pad_index,
                                                             get_tile_partition_indices, scatter_into_tile_buf)
 from fastvideo.attention.backends.video_sparse_attn_h3_probe import probe_enabled, record_probe
@@ -561,12 +561,6 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                              "routed to the VSA-H3 backend; exclude it from the supported backends.")
         n_tiles = attn_metadata.variable_block_sizes.numel()
         grad_mode = torch.is_grad_enabled() and x.requires_grad
-        if grad_mode and block_sparse_attn_256_bshd is not None:
-            # Training: an invocation-owned padded buffer through the opaque permutation op pair (same op eager and
-            # compiled; never the shared no-grad scratch below, whose reuse would couple autograd graphs).
-            from fastvideo_kernel import vsa256_ops  # noqa: F401  (registers the fastvideo_kernel ops)
-            return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, attn_metadata.untile_combined_index,
-                                                                    n_tiles * attn_metadata.tile_elems)
         compiling = torch.compiler.is_compiling()
         regional_compiling = compiling and self._regional_compile_sm100a_enabled is True
         if regional_compiling:
@@ -586,9 +580,12 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
                 and state[0].device == x.device and state[2].device == x.device and x.numel() >= 2**25
                 and x.shape[1] == state[0].numel() == state[2].numel()
-                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index
-                and state[0]._version == state[1] and state[2]._version == state[3]):
-            return _TilePermutation.apply(x, state[0], state[2], target_shape[1])
+                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
+            # Opaque custom op (same key eager and compiled) around the shared _TilePermutation body; it re-checks the
+            # recorded index versions itself and falls back to a fresh untile scatter if they changed.
+            return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, state[0], state[2],
+                                                                    attn_metadata.untile_combined_index,
+                                                                    target_shape[1], state[1], state[3])
 
         # ``untile_combined_index`` maps each packed row to a logical tile
         # slot. Different geometries can share one transport shape; clear a

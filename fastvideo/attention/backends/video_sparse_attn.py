@@ -233,33 +233,86 @@ class _TilePermutation(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor,
                 padded_length: int) -> torch.Tensor:
-        source = partition.new_zeros(padded_length)
-        source.index_copy_(0, nonpad, partition)
-        padding = torch.ones(padded_length, device=x.device, dtype=torch.bool)
-        padding.index_fill_(0, nonpad, False)
-        inverse = partition.new_empty(partition.numel())
-        inverse.index_copy_(0, partition, nonpad)
         # Retain original needed-index mutation/version checks.
-        ctx.save_for_backward(partition, nonpad, inverse)
-        # Optional cold compilation must be warmed before CUDA Graph capture.
-        # Keep inspected 32-bit index extents and native fallback for other layouts.
-        if (os.environ.get("FASTVIDEO_VSA_COMPILE_TILE") == "1" and x.is_cuda and x.dtype == torch.bfloat16
-                and _tile_row_layout(x) and x.shape[-1] in (64, 128) and max(
-                    (x.shape[0] - 1) * x.stride(0) + x.shape[1] * x.stride(1),
-                    x.shape[0] * padded_length * x.shape[2] * x.shape[3]) < 2**31):
-            return _compiled_tile_copy()(x, source, padding)
-        out = _gather_tile_rows(x, source)
-        # Zero only the pad rows: the bijective partition fixes their count from shapes, so a fixed-size compaction
-        # (no device-dependent output size, no host sync) replaces a masked fill over every element.
-        pad_count = padded_length - partition.numel()
-        if pad_count:
-            out.index_fill_(1, torch.nonzero_static(padding, size=pad_count).flatten(), 0)
-        return out
+        ctx.save_for_backward(partition, nonpad)
+        return _tile_permute_rows(x, partition, nonpad, padded_length)
 
     @staticmethod
     def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
-        _partition, _nonpad, inverse = ctx.saved_tensors
-        return _gather_tile_rows(grad, inverse), None, None, None
+        partition, nonpad = ctx.saved_tensors
+        return _tile_unpermute_rows(grad, partition, nonpad), None, None, None
+
+
+def _tile_permute_rows(x: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor,
+                       padded_length: int) -> torch.Tensor:
+    """Shared tile-copy body: fresh [B, padded_length, H, D] with row partition[i] of x in slot nonpad[i], pads zero."""
+    source = partition.new_zeros(padded_length)
+    source.index_copy_(0, nonpad, partition)
+    padding = torch.ones(padded_length, device=x.device, dtype=torch.bool)
+    padding.index_fill_(0, nonpad, False)
+    # Optional cold compilation must be warmed before CUDA Graph capture.
+    # Keep inspected 32-bit index extents and native fallback for other layouts.
+    if (os.environ.get("FASTVIDEO_VSA_COMPILE_TILE") == "1" and x.is_cuda and x.dtype == torch.bfloat16
+            and _tile_row_layout(x) and x.shape[-1] in (64, 128) and max(
+                (x.shape[0] - 1) * x.stride(0) + x.shape[1] * x.stride(1),
+                x.shape[0] * padded_length * x.shape[2] * x.shape[3]) < 2**31):
+        return _compiled_tile_copy()(x, source, padding)
+    out = _gather_tile_rows(x, source)
+    # Zero only the pad rows: the bijective partition fixes their count from shapes, so a fixed-size compaction
+    # (no device-dependent output size, no host sync) replaces a masked fill over every element.
+    pad_count = padded_length - partition.numel()
+    if pad_count:
+        out.index_fill_(1, torch.nonzero_static(padding, size=pad_count).flatten(), 0)
+    return out
+
+
+def _tile_unpermute_rows(grad: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor) -> torch.Tensor:
+    """Adjoint of _tile_permute_rows: gather the non-pad slots back into packed row order."""
+    inverse = partition.new_empty(partition.numel())
+    inverse.index_copy_(0, partition, nonpad)
+    return _gather_tile_rows(grad, inverse)
+
+
+# Same tile copy as an opaque custom-op pair (fake + autograd registrations) so torch.compile(fullgraph=True) and
+# activation-checkpoint policies see one op key in eager and compiled mode (torch.ops.fastvideo_kernel.vsa_tile_permute_*).
+# The builder-trust check (index tensors unmodified since the metadata recorded their versions) runs inside the op, where
+# tensor versions are readable without a data-dependent guard; an untrusted call scatters through the authoritative
+# untile index into a fresh buffer (the same result as the no-grad holder path, never the shared holder itself).
+@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_fwd", mutates_args=())
+def vsa_tile_permute_fwd(x: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor, untile: torch.Tensor,
+                         padded_length: int, partition_version: int, nonpad_version: int) -> torch.Tensor:
+    if partition._version == partition_version and nonpad._version == nonpad_version:
+        return _tile_permute_rows(x, partition, nonpad, padded_length)
+    return scatter_into_tile_buf(x, (x.shape[0], padded_length, *x.shape[2:]), untile, None)
+
+
+@vsa_tile_permute_fwd.register_fake
+def _vsa_tile_permute_fwd_fake(x, partition, nonpad, untile, padded_length, partition_version, nonpad_version):
+    return x.new_empty((x.shape[0], padded_length, *x.shape[2:]))
+
+
+@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_bwd", mutates_args=())
+def vsa_tile_permute_bwd(grad: torch.Tensor, untile: torch.Tensor) -> torch.Tensor:
+    # untile[i] is the padded slot of packed row i: the inverse of the forward permutation (for trusted geometry it is
+    # the same index tensor _tile_unpermute_rows derives from partition/nonpad).
+    return _gather_tile_rows(grad, untile)
+
+
+@vsa_tile_permute_bwd.register_fake
+def _vsa_tile_permute_bwd_fake(grad, untile):
+    return grad.new_empty((grad.shape[0], untile.shape[0], *grad.shape[2:]))
+
+
+def _tile_permute_setup_context(ctx, inputs, output):
+    ctx.save_for_backward(inputs[3])
+
+
+def _tile_permute_backward(ctx, grad):
+    (untile, ) = ctx.saved_tensors
+    return vsa_tile_permute_bwd(grad.contiguous(), untile), None, None, None, None, None, None
+
+
+vsa_tile_permute_fwd.register_autograd(_tile_permute_backward, setup_context=_tile_permute_setup_context)
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):

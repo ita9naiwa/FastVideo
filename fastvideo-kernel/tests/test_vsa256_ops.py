@@ -29,9 +29,12 @@ def test_vsa256_ops_opcheck(pack_tails):
     q, k, v, block_map, sizes = _inputs()
     torch.library.opcheck(torch.ops.fastvideo_kernel.vsa256_fwd.default, (q, k, v, block_map, sizes, pack_tails),
                           test_utils=("test_schema", "test_faketensor", "test_autograd_registration"))
+    import fastvideo.attention.backends.video_sparse_attn  # noqa: F401  (registers vsa_tile_permute_*)
     x = torch.randn(2, 1000, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    index = torch.randperm(1536, device="cuda")[:1000]
-    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa_tile_permute_fwd.default, (x, index, 1536),
+    partition, nonpad = torch.randperm(1000, device="cuda"), torch.randperm(1536, device="cuda")[:1000]
+    untile = nonpad[torch.argsort(partition)]
+    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa_tile_permute_fwd.default,
+                          (x, partition, nonpad, untile, 1536, partition._version, nonpad._version),
                           test_utils=("test_schema", "test_faketensor", "test_autograd_registration"))
 
 
@@ -62,6 +65,38 @@ def test_vsa256_ops_match_autograd_function(monkeypatch, pack_tails, b):
     assert (new[2].float() - old1[2].float()).abs().max() <= max(2 * spread, 1e-3)
 
 
+@pytest.mark.parametrize("loss_on", ["out", "lse"])
+def test_vsa256_ops_single_output_losses(monkeypatch, loss_on):
+    """O-only and LSE-only losses: the unused output's gradient stays None (no materialized zeros), matching the old
+    autograd.Function behaviour, and gradients equal the old path (dQ within the eager repeat spread)."""
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo_kernel import vsa256_ops  # noqa: F401
+    from fastvideo_kernel.vsa_tail_backward import TailTraining
+    q, k, v, block_map, sizes = _inputs(seed=5)
+    seen = {}
+    orig = torch.ops.fastvideo_kernel.vsa256_bwd
+
+    def spy(dout, *args):
+        seen["dlse_is_none"] = args[-1] is None
+        return orig(dout, *args)
+
+    monkeypatch.setattr(vsa256_ops, "vsa256_bwd", spy)
+
+    def grads(fn):
+        out, lse = fn()
+        target = out if loss_on == "out" else lse
+        return torch.autograd.grad(target.float().square().sum(), (q, k, v))
+
+    new = grads(lambda: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, block_map, sizes, True))
+    if loss_on == "out":
+        assert seen["dlse_is_none"]
+    old1 = grads(lambda: TailTraining.apply(q, k, v, block_map, sizes))
+    old2 = grads(lambda: TailTraining.apply(q, k, v, block_map, sizes))
+    assert torch.equal(new[1], old1[1]) and torch.equal(new[2], old1[2])
+    spread = (old2[0].float() - old1[0].float()).abs().max()
+    assert (new[0].float() - old1[0].float()).abs().max() <= max(2 * spread, 1e-3)
+
+
 def test_vsa256_ops_changed_maps_and_outstanding_graphs(monkeypatch):
     """Two forwards outstanding before their backwards, and a different block map / sizes of the same shape: each
     backward uses its own saved metadata (no stale capture)."""
@@ -80,16 +115,29 @@ def test_vsa256_ops_changed_maps_and_outstanding_graphs(monkeypatch):
     assert all(torch.equal(a, b) for a, b in zip(g1, r1, strict=True)) and all(torch.equal(a, b) for a, b in zip(g2, r2, strict=True))
 
 
-def test_tile_permute_pair_roundtrip():
-    from fastvideo_kernel import vsa256_ops  # noqa: F401
+def test_tile_permute_pair_matches_autograd_function():
+    """Trusted indices: the op equals _TilePermutation (shared body) bitwise, forward and gradient, fresh output per
+    call. After an index tensor is modified in place, the op falls back to the untile scatter (still correct)."""
+    from fastvideo.attention.backends.video_sparse_attn import _TilePermutation
     x = torch.randn(3, 700, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    index = torch.randperm(1024, device="cuda")[:700]
-    padded = torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, index, 1024)
-    assert torch.equal(padded[:, index], x) and not padded.index_fill(1, index, 0).any()
+    partition, nonpad = torch.randperm(700, device="cuda"), torch.randperm(1024, device="cuda")[:700]
+    untile = nonpad[torch.argsort(partition)]
+    op = torch.ops.fastvideo_kernel.vsa_tile_permute_fwd
+    padded = op(x, partition, nonpad, untile, 1024, partition._version, nonpad._version)
+    ref = _TilePermutation.apply(x, partition, nonpad, 1024)
+    assert torch.equal(padded, ref)
+    assert torch.equal(padded[:, untile], x) and not padded.index_fill(1, untile, 0).any()
     g = torch.randn_like(padded)
     (gx, ) = torch.autograd.grad(padded, x, g)
-    assert torch.equal(gx, g[:, index])
-    assert padded.data_ptr() != torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, index, 1024).data_ptr()
+    (gr, ) = torch.autograd.grad(ref, x, g)
+    assert torch.equal(gx, gr)
+    assert padded.data_ptr() != op(x, partition, nonpad, untile, 1024, partition._version, nonpad._version).data_ptr()
+    stale_version = partition._version
+    partition.add_(0)  # bumps the version: the builder-trust contract no longer holds
+    fallback = op(x, partition, nonpad, untile, 1024, stale_version, nonpad._version)
+    assert torch.equal(fallback, ref)
+    (gf, ) = torch.autograd.grad(fallback, x, g)
+    assert torch.equal(gf, gr)
 
 
 @pytest.mark.parametrize("layout,merge", [("cube", False), ("chunk256", False), ("chunk256", True)])
@@ -98,9 +146,11 @@ def test_h3_block_fullgraph(monkeypatch, layout, merge):
     compiles without graph breaks; O, dK, dV bitwise equal to eager."""
     monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
     from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
-    impl = MiniMaxH3VSAImpl(num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5)
+    # 8 heads x ~15k rows keeps q/k/v above the tile-permutation eligibility size (the product training path; smaller
+    # inputs keep the pre-existing holder scatter, which is outside this seam)
+    impl = MiniMaxH3VSAImpl(num_heads=8, head_size=128, causal=False, softmax_scale=128**-0.5)
     impl.layer_idx = 0
-    meta = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=(20, 20, 36), patch_size=(1, 2, 2),
+    meta = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=(20, 40, 72), patch_size=(1, 2, 2),
                                                VSA_sparsity=0.75, prefix_segments=(250, 1, 0, 300),
                                                device=torch.device("cuda"), tile_layout=layout, merge_prefix=merge)
 
@@ -110,8 +160,9 @@ def test_h3_block_fullgraph(monkeypatch, layout, merge):
         return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
 
     torch.manual_seed(0)
-    q, k, v = (torch.randn(1, meta.total_seq_length, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    q, k, v = (torch.randn(1, meta.total_seq_length, 8, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
                for _ in range(3))
+    assert 3 * q.numel() >= 2**25
     dout = torch.randn_like(q)
     eager = block(q, k, v)
     ge = torch.autograd.grad(eager, (q, k, v), dout)
@@ -120,3 +171,8 @@ def test_h3_block_fullgraph(monkeypatch, layout, merge):
     gc = torch.autograd.grad(compiled, (q, k, v), dout)
     assert torch.equal(compiled, eager)
     assert torch.equal(gc[1], ge[1]) and torch.equal(gc[2], ge[2])
+    # the real-size training call takes the permutation op (not the holder scatter)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        block(q, k, v)
+    names = {e.key for e in prof.key_averages()}
+    assert "fastvideo_kernel::vsa_tile_permute_fwd" in names and "fastvideo_kernel::vsa256_fwd" in names, names
