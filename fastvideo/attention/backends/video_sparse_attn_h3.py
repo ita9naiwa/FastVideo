@@ -219,27 +219,41 @@ def _h3_tile_geometry(
     dit_seq_shape: tuple[int, int, int],
     device: torch.device,
     tile_shape: tuple[int, int, int] = VSA_H3_TILE_SIZE,
+    tile_layout: str = "cube",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Tile the packed sequence: segment-pure prefix chunks, then video tiles.
+    """Tile the packed sequence: prefix chunks, then video tiles.
+
+    ``tile_layout="cube"`` (default): segment-pure prefix chunks and one tile
+    per ``tile_shape`` cube of the video grid. ``"chunk256"``: the same
+    cube-ordered video tokens cut into consecutive full tiles (only the last
+    video tile is partial). ``"chunk256-merged-prefix"``: additionally chunk
+    the concatenated prefix as one sequence instead of per segment.
 
     Returns (tile_partition_indices, variable_block_sizes,
     untile_combined_index, num_prefix_tiles, num_video_tiles).
     """
+    if tile_layout not in ("cube", "chunk256", "chunk256-merged-prefix"):
+        raise ValueError(f"unknown VSA-H3 tile_layout {tile_layout!r}")
     tile_elems = math.prod(tile_shape)
     prefix_len = sum(prefix_segments)
 
-    prefix_sizes: list[int] = []
-    for segment in prefix_segments:
-        full, rem = divmod(segment, tile_elems)
-        prefix_sizes.extend([tile_elems] * full)
-        if rem:
-            prefix_sizes.append(rem)
+    def chunks(n: int) -> list[int]:
+        full, rem = divmod(n, tile_elems)
+        return [tile_elems] * full + ([rem] if rem else [])
+
+    if tile_layout == "chunk256-merged-prefix":
+        prefix_sizes = chunks(prefix_len)
+    else:
+        prefix_sizes = [size for segment in prefix_segments for size in chunks(segment)]
     num_prefix_tiles = len(prefix_sizes)
 
-    ts_t, ts_h, ts_w = tile_shape
-    t, h, w = dit_seq_shape
-    num_tiles = (math.ceil(t / ts_t), math.ceil(h / ts_h), math.ceil(w / ts_w))
-    video_sizes = construct_variable_block_sizes(dit_seq_shape, num_tiles, device, tile_shape)
+    if tile_layout in ("chunk256", "chunk256-merged-prefix"):
+        video_sizes = torch.tensor(chunks(math.prod(dit_seq_shape)), dtype=torch.long, device=device)
+    else:
+        ts_t, ts_h, ts_w = tile_shape
+        t, h, w = dit_seq_shape
+        num_tiles = (math.ceil(t / ts_t), math.ceil(h / ts_h), math.ceil(w / ts_w))
+        video_sizes = construct_variable_block_sizes(dit_seq_shape, num_tiles, device, tile_shape)
     num_video_tiles = int(video_sizes.numel())
 
     video_indices = get_tile_partition_indices(dit_seq_shape, tile_shape, device) + prefix_len
@@ -317,6 +331,9 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # populated the allocation so a same-shaped geometry change can clear
     # stale pad rows once while steady-state denoising reuses the buffer.
     tile_buf_holder: _MiniMaxH3VSATileBufferHolder | None = None
+    # "cube" (one tile per 4x8x8 video cube) or "chunk256" (consecutive
+    # 256-token chunks of the same cube-ordered tokens); see _h3_tile_geometry
+    tile_layout: str = "cube"
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -338,18 +355,29 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         exempt: bool = True,
         dense_layers: tuple[int, ...] = (),
         tile_size: int = _TILE_ELEMS,
+        tile_layout: str = "cube",
+        merge_prefix: bool = False,
         **kwargs: dict[str, Any],
     ) -> MiniMaxH3VSAMetadata:
         tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
         if tile_shape is None:
             raise ValueError(f"VSA-H3 tile_size must be one of {sorted(VSA_H3_TILE_SHAPES)}, got {tile_size!r}")
+        if tile_layout not in ("cube", "chunk256"):
+            raise ValueError(f"VSA-H3 tile_layout must be 'cube' or 'chunk256', got {tile_layout!r}")
+        if tile_layout == "chunk256" and int(tile_size) != 256:
+            raise ValueError("VSA-H3 tile_layout='chunk256' requires tile_size=256")
+        # Merged prefix tiles mix modalities; only exempt mode (prefix always
+        # selected) keeps them selection-neutral.
+        if merge_prefix and (tile_layout != "chunk256" or not exempt):
+            raise ValueError("VSA-H3 merge_prefix requires tile_layout='chunk256' and exempt=True")
         dit_seq_shape = (raw_latent_shape[0] // patch_size[0], raw_latent_shape[1] // patch_size[1],
                          raw_latent_shape[2] // patch_size[2])
         prefix_segments = tuple(int(s) for s in prefix_segments if s > 0)
         total_seq_length = sum(prefix_segments) + math.prod(dit_seq_shape)
 
         (_tile_partition_indices, variable_block_sizes, untile_combined_index, num_prefix_tiles,
-         num_video_tiles) = _h3_tile_geometry(prefix_segments, dit_seq_shape, device, tile_shape)
+         num_video_tiles) = _h3_tile_geometry(prefix_segments, dit_seq_shape, device, tile_shape,
+                                              "chunk256-merged-prefix" if merge_prefix else tile_layout)
 
         dense_layers = tuple(int(layer) for layer in dense_layers)
         return MiniMaxH3VSAMetadata(
@@ -365,6 +393,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             dense_layers=dense_layers,
             dense_layers_tensor=torch.tensor(dense_layers, device=device, dtype=torch.int64),
             tile_buf_holder=self._tile_buf_holder,
+            tile_layout=tile_layout,
         )
 
 

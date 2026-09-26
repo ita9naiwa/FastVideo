@@ -27,7 +27,7 @@ _PROD = dict(raw_latent_shape=(37, 48, 84), patch_size=(1, 2, 2), prefix_segment
 _CPU = torch.device("cpu")
 
 
-def _build(spec, sparsity=0.0, device=_CPU, tile_size=_TILE_ELEMS):
+def _build(spec, sparsity=0.0, device=_CPU, tile_size=_TILE_ELEMS, **kwargs):
     return MiniMaxH3VSAMetadataBuilder().build(
         current_timestep=0,
         raw_latent_shape=spec["raw_latent_shape"],
@@ -36,6 +36,7 @@ def _build(spec, sparsity=0.0, device=_CPU, tile_size=_TILE_ELEMS):
         prefix_segments=spec["prefix_segments"],
         device=device,
         tile_size=tile_size,
+        **kwargs,
     )
 
 
@@ -244,6 +245,80 @@ def test_builder_rejects_unknown_tile_size():
     for bad in (0, 128, 512):
         with pytest.raises(ValueError, match="tile_size"):
             _build(_TINY, tile_size=bad)
+
+
+# Real H3 packed-document grids (token t,h,w after patch (1,2,2)) with (text, vidclip, keyframe, audio)
+# prefixes, and the chunk256 video-tile count each must produce (ceil(video / 256)).
+_H3_REAL_GRIDS = [((61, 15, 28), (420, 1, 420, 810), 101), ((50, 15, 28), (300, 1, 0, 666), 83),
+                  ((91, 10, 18), (500, 1, 180, 1206), 64), ((60, 10, 18), (250, 1, 0, 800), 43),
+                  ((38, 15, 28), (350, 1, 420, 500), 63), ((75, 7, 13), (200, 1, 0, 1000), 27),
+                  ((61, 15, 28), (380, 1, 420, 810), 101), ((31, 7, 13), (600, 1, 0, 414), 12)]
+
+
+@pytest.mark.parametrize("merge_prefix", [False, True])
+@pytest.mark.parametrize("thw,prefix,n_video", _H3_REAL_GRIDS)
+def test_geometry_chunk256_real_grids(thw, prefix, n_video, merge_prefix):
+    spec = dict(raw_latent_shape=(thw[0], 2 * thw[1], 2 * thw[2]), patch_size=(1, 2, 2), prefix_segments=prefix)
+    meta = _build(spec, tile_layout="chunk256", merge_prefix=merge_prefix)
+    cube = _build(spec)
+    sizes = meta.variable_block_sizes
+    P, video = meta.num_prefix_tiles, math.prod(thw)
+    assert meta.tile_layout == "chunk256" and meta.num_video_tiles == n_video
+    assert int(sizes.sum()) == meta.total_seq_length == cube.total_seq_length
+    vs = sizes[P:].tolist()
+    assert vs[:-1] == [256] * (n_video - 1) and vs[-1] == video - 256 * (n_video - 1)
+    segments = [x for x in prefix if x > 0]
+    if merge_prefix:
+        assert P == math.ceil(sum(segments) / 256) and sizes[:P - 1].eq(256).all()
+    else:
+        assert P == cube.num_prefix_tiles and torch.equal(sizes[:P], cube.variable_block_sizes[:P])
+    # same token order as the cube layout, only the tile boundaries move
+    x = torch.randn(1, meta.total_seq_length, 1, 2)
+    impl = _impl()
+    buf, cube_buf = impl.tile(x, meta), impl.tile(x, cube)
+    assert torch.equal(buf[:, meta.untile_combined_index], x)
+    keep = lambda b, m: b[:, token_tile_and_valid(m.variable_block_sizes, m.tile_elems)[1]]
+    assert torch.equal(keep(buf, meta), keep(cube_buf, cube))
+
+
+def test_sparsity_zero_matches_dense_sdpa_chunk256():
+    torch.manual_seed(0)
+    # ragged token grid (9, 10, 13) = 1170 video rows -> 4 full tiles + 146; prefix 300 | 5 | 130 (merged)
+    spec = dict(raw_latent_shape=(9, 20, 26), patch_size=(1, 2, 2), prefix_segments=(300, 5, 130))
+    for merge_prefix in (False, True):
+        meta = _build(spec, tile_layout="chunk256", merge_prefix=merge_prefix)
+        seq = meta.total_seq_length
+        q, k, v = (torch.randn(1, seq, 2, 8) for _ in range(3))
+        impl = _impl()
+        tq, tk, tv = (impl.tile(t, meta).clone() for t in (q, k, v))
+        scores = torch.matmul(_pool_tiles(tq, meta.variable_block_sizes),
+                              _pool_tiles(tk, meta.variable_block_sizes).transpose(-2, -1))
+        mask = _build_block_mask(scores, meta.num_prefix_tiles, meta.num_video_tiles, 0.0, exempt=True)
+        sparse_out = impl.postprocess_output(reference_sparse_attention(tq, tk, tv, mask, meta), meta)
+        dense_out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                                   v.transpose(1, 2)).transpose(1, 2)
+        assert torch.allclose(sparse_out, dense_out, atol=1e-5), (sparse_out - dense_out).abs().max()
+
+
+def test_default_tile_layout_is_cube():
+    meta, explicit = _build(_720P), _build(_720P, tile_layout="cube")
+    assert meta.tile_layout == explicit.tile_layout == "cube"
+    assert torch.equal(meta.variable_block_sizes, explicit.variable_block_sizes)
+    assert torch.equal(meta.untile_combined_index, explicit.untile_combined_index)
+
+
+def test_builder_rejects_bad_tile_layout():
+    with pytest.raises(ValueError, match="tile_layout"):
+        _build(_TINY, tile_layout="rows")
+    with pytest.raises(ValueError, match="chunk256"):
+        _build(_TINY64, tile_size=64, tile_layout="chunk256")
+    with pytest.raises(ValueError, match="merge_prefix"):
+        _build(_TINY, merge_prefix=True)
+    with pytest.raises(ValueError, match="merge_prefix"):
+        MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=_TINY["raw_latent_shape"],
+                                            patch_size=_TINY["patch_size"], VSA_sparsity=0.0,
+                                            prefix_segments=_TINY["prefix_segments"], device=_CPU, exempt=False,
+                                            tile_layout="chunk256", merge_prefix=True)
 
 
 if __name__ == "__main__":
