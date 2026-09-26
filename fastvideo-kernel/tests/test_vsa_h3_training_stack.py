@@ -1233,7 +1233,10 @@ def test_fq_batch_dim_routes(reach, batch, dim, pack_tails):
     ordinary = _stack_grads(qkv, block_map, sizes, dout, stacked=False, pack_tails=pack_tails, **_proof(sizes))
     _clear(reach)
     stacked = _stack_grads(qkv, block_map, sizes, dout, stacked=True, pack_tails=pack_tails, **_proof(sizes))
+    # fused-QKV merge contract (worker-4 merge-checklist): with query pruning keep BOTH the query_sizes forwarding and
+    # the output views - the stacked backward prunes (packed plan with query sizes) AND writes one dqkv allocation.
     assert reach["stacked"][0] and reach["bwd"][0]["fused"]
+    assert reach["prepare"] == ([True] if pack_tails else []), reach["prepare"]
     _same("stacked vs ordinary", stacked, ordinary)
     compiled = _stack_grads(qkv, block_map, sizes, dout, stacked=True, pack_tails=pack_tails, compiled=True,
                             **_proof(sizes))
@@ -1257,3 +1260,21 @@ def test_fq_noncontiguous_stack_takes_gated_fallback(reach):
     assert torch.equal(out, ref[0])
     _check("strided dQ", ref[1], g[:1, :, :2], _GRAD_TOL)
     assert torch.equal(g[1:, :, :2], torch.cat(ref[2:]))
+
+
+
+@pytest.mark.parametrize("heads", [2, 8], ids=["holder_tile_path", "permutation_op_path"])
+def test_fq_tile_path_eligibility(reach, heads):
+    """The fused route on both H3 tile paths (merge contract: the fused path relies on the tile-permutation
+    eligibility guard, 3 * numel >= 2**25; at h3mh's H56 every real document passes it, 46/46). Below the guard (H2,
+    eager) H3 tiles into the builder-owned holder buffer; above it (H8) through the invocation-owned permutation op.
+    Both give the stacked single-allocation backward with results equal to fused_qkv_grad OFF."""
+    impl = _impl(heads)
+    meta = _meta(**_ALL_ON)
+    leaves, dout = _leaves(meta, heads, seed=33)
+    assert (3 * leaves[0].numel() >= 2**25) is (heads == 8)
+    ref = _run(_layer_block(impl, _meta(fused_qkv_grad=False, **_ALL_ON)), leaves, dout)
+    _clear(reach)
+    got = _run(_layer_block(impl, meta), leaves, dout)
+    assert reach["stacked"][0] and reach["bwd"][0]["fused"] and reach["bwd"][0]["storages"] == 1
+    _same(f"tile path heads={heads}", got, ref)
