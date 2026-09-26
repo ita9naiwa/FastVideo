@@ -153,7 +153,7 @@ class DistributedAttention(nn.Module):
                 cos, sin = freqs_cis
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata).chunk(3, dim=0)
+            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata)
             output = self.attn_impl.postprocess_output(self.attn_impl.forward(q, k, v, ctx_attn_metadata),
                                                        ctx_attn_metadata)
             return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None
@@ -260,7 +260,7 @@ class DistributedAttention_VSA(DistributedAttention):
                 cos, sin = freqs_cis
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata).chunk(3, dim=0)
+            q, k, v = self.attn_impl.preprocess_q_k_v(q, k, v, ctx_attn_metadata)
             output = self.attn_impl.forward(q, k, v, None, ctx_attn_metadata)  # type: ignore[call-arg]
             output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
             return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None

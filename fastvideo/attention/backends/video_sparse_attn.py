@@ -323,56 +323,55 @@ def _tile_permute_backward(ctx, grad):
 vsa_tile_permute_fwd.register_autograd(_tile_permute_backward, setup_context=_tile_permute_setup_context)
 
 
-# Three-operand form of the tile copy: q, k and v are gathered from their own tensors straight into the slices of one stacked
-# [3B, padded_length, H, D] output, so callers that hold separate q/k/v never materialize torch.cat([q, k, v]) (a full extra
-# write + read of Q/K/V that SAC also recomputes in backward). The output and gradients equal vsa_tile_permute_fwd of the cat.
+# Three-operand form of the tile copy: q, k and v are gathered from their own tensors into three tiled outputs, so callers
+# that hold separate q/k/v never materialize torch.cat([q, k, v]) (a full extra write + read of Q/K/V that SAC also recomputes)
+# and the backward receives dq/dk/dv tiles separately (no cat of the three gradients either). Each output and gradient equals
+# the matching chunk of vsa_tile_permute_fwd applied to the cat.
 @torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_qkv_fwd", mutates_args=())
 def vsa_tile_permute_qkv_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, partition: torch.Tensor,
                              nonpad: torch.Tensor, untile: torch.Tensor, padded_length: int, partition_version: int,
-                             nonpad_version: int) -> torch.Tensor:
-    batch = q.shape[0]
-    out = q.new_empty((3 * batch, padded_length, *q.shape[2:]))
-    slices = [out[i * batch:(i + 1) * batch] for i in range(3)]
+                             nonpad_version: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    outs = tuple(x.new_empty((x.shape[0], padded_length, *x.shape[2:])) for x in (q, k, v))
     if partition._version == partition_version and nonpad._version == nonpad_version:
         source = partition.new_zeros(padded_length)
         source.index_copy_(0, nonpad, partition)
-        for x, dst in zip((q, k, v), slices, strict=True):
-            torch.index_select(x, 1, source, out=dst)
         pad_count = padded_length - partition.numel()
         if pad_count:
             padding = torch.ones(padded_length, device=q.device, dtype=torch.bool)
             padding.index_fill_(0, nonpad, False)
-            out.index_fill_(1, torch.nonzero_static(padding, size=pad_count).flatten(), 0)
-        return out
-    out.zero_()
-    for x, dst in zip((q, k, v), slices, strict=True):
+            pad_rows = torch.nonzero_static(padding, size=pad_count).flatten()
+        for x, dst in zip((q, k, v), outs, strict=True):
+            torch.index_select(x, 1, source, out=dst)
+            if pad_count:
+                dst.index_fill_(1, pad_rows, 0)
+        return outs
+    for x, dst in zip((q, k, v), outs, strict=True):
+        dst.zero_()
         dst[:, untile] = x
-    return out
+    return outs
 
 
 @vsa_tile_permute_qkv_fwd.register_fake
 def _vsa_tile_permute_qkv_fwd_fake(q, k, v, partition, nonpad, untile, padded_length, partition_version,
                                    nonpad_version):
-    return q.new_empty((3 * q.shape[0], padded_length, *q.shape[2:]))
+    return tuple(x.new_empty((x.shape[0], padded_length, *x.shape[2:])) for x in (q, k, v))
 
 
 @torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_qkv_bwd", mutates_args=())
-def vsa_tile_permute_qkv_bwd(grad: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor, untile: torch.Tensor,
-                             partition_version: int,
+def vsa_tile_permute_qkv_bwd(gq: torch.Tensor, gk: torch.Tensor, gv: torch.Tensor, partition: torch.Tensor,
+                             nonpad: torch.Tensor, untile: torch.Tensor, partition_version: int,
                              nonpad_version: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch = grad.shape[0] // 3
-    parts = [grad[i * batch:(i + 1) * batch] for i in range(3)]
     if partition._version == partition_version and nonpad._version == nonpad_version:
-        inverse = partition.new_empty(partition.numel())
-        inverse.index_copy_(0, partition, nonpad)
-        return tuple(_gather_tile_rows(g, inverse) for g in parts)
-    return tuple(_gather_tile_rows(g, untile) for g in parts)
+        index = partition.new_empty(partition.numel())
+        index.index_copy_(0, partition, nonpad)
+    else:
+        index = untile
+    return tuple(_gather_tile_rows(g, index) for g in (gq, gk, gv))
 
 
 @vsa_tile_permute_qkv_bwd.register_fake
-def _vsa_tile_permute_qkv_bwd_fake(grad, partition, nonpad, untile, partition_version, nonpad_version):
-    shape = (grad.shape[0] // 3, untile.shape[0], *grad.shape[2:])
-    return grad.new_empty(shape), grad.new_empty(shape), grad.new_empty(shape)
+def _vsa_tile_permute_qkv_bwd_fake(gq, gk, gv, partition, nonpad, untile, partition_version, nonpad_version):
+    return tuple(g.new_empty((g.shape[0], untile.shape[0], *g.shape[2:])) for g in (gq, gk, gv))
 
 
 def _tile_permute_qkv_setup_context(ctx, inputs, output):
@@ -380,9 +379,10 @@ def _tile_permute_qkv_setup_context(ctx, inputs, output):
     ctx.versions = (inputs[7], inputs[8])
 
 
-def _tile_permute_qkv_backward(ctx, grad):
+def _tile_permute_qkv_backward(ctx, gq, gk, gv):
     partition, nonpad, untile = ctx.saved_tensors
-    dq, dk, dv = vsa_tile_permute_qkv_bwd(grad.contiguous(), partition, nonpad, untile, *ctx.versions)
+    dq, dk, dv = vsa_tile_permute_qkv_bwd(gq.contiguous(), gk.contiguous(), gv.contiguous(), partition, nonpad, untile,
+                                          *ctx.versions)
     return dq, dk, dv, None, None, None, None, None, None
 
 

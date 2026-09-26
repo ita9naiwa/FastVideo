@@ -37,8 +37,9 @@ def _both(impl, md, q, k, v, up):
     reference = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md)
     ref_grads = torch.autograd.grad(reference, (q, k, v), up)
     actual = impl.preprocess_q_k_v(q, k, v, md)
-    grads = torch.autograd.grad(actual, (q, k, v), up)
-    return reference, ref_grads, actual, grads
+    assert isinstance(actual, tuple) and len(actual) == 3
+    grads = torch.autograd.grad(actual, (q, k, v), up.chunk(3, dim=0))
+    return reference, ref_grads, torch.cat(actual, dim=0), grads
 
 
 @pytest.mark.parametrize("layout", _LAYOUTS, ids=["cube", "chunk256"])
@@ -69,7 +70,7 @@ def test_no_grad_and_ineligible_calls_take_the_stacked_route():
     q, k, v = (t.detach() for t in _qkv(md, seed=5))
     with torch.no_grad():
         expected = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md).clone()
-        assert torch.equal(impl.preprocess_q_k_v(q, k, v, md), expected)
+        assert torch.equal(torch.cat(impl.preprocess_q_k_v(q, k, v, md), dim=0), expected)
 
 
 def test_compiled_fullgraph_single_graph():
@@ -80,6 +81,6 @@ def test_compiled_fullgraph_single_graph():
     counts.clear()
     fn = torch.compile(lambda a, b, c: impl.preprocess_q_k_v(a, b, c, md), fullgraph=True, dynamic=True)
     out = fn(q, k, v)
-    assert torch.equal(out, impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md))
+    assert torch.equal(torch.cat(out, dim=0), impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md))
     fn(*_qkv(md, seed=8))  # same shapes: no recompile
     assert counts["stats"]["unique_graphs"] == 1
