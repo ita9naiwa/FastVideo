@@ -313,7 +313,7 @@ def _cute_attention_q128_forward(
         need_backward=need_backward,
         force_q_sparse_block_size=_FA4_Q_BLOCK_SIZE,
     )
-    mask_mod = _build_vbs_mask_mod(_FA4_Q_BLOCK_SIZE)
+    mask_mod = _build_vbs_fwd_mask_mod(q_bshd, _FA4_Q_BLOCK_SIZE, need_backward=need_backward)
     if (need_backward and q_bshd.dtype == torch.bfloat16 and q_bshd.shape[-1] in (64, 128)
             and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
         mask_mod = _build_vbs_vector_mask_mod(_FA4_Q_BLOCK_SIZE)
@@ -474,7 +474,7 @@ def _cute_attention(
         q_bshd,
         k_bshd,
         v_bshd,
-        mask_mod=_build_vbs_mask_mod(kv_block_size),
+        mask_mod=_build_vbs_fwd_mask_mod(q_bshd, kv_block_size, need_backward=need_backward),
         aux_tensors=[variable_block_sizes],
         block_sparse_tensors=forward_sparse_tensors,
         block_sparse_tensors_bwd=backward_sparse_tensors,
