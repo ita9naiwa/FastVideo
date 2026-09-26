@@ -47,6 +47,7 @@ import functools
 import math
 import os
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 import torch
@@ -341,6 +342,8 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     non_pad_index: torch.Tensor | None = None
     # compute_topk(VSA_sparsity, num_video_tiles) as a host int, so compiled forwards do not trace float math on the sparsity
     video_topk: int | None = None
+    # Optional cap on video top-k (ruling 71: k_vid = min(ceil((1 - s) * n_video), cap)); folded into video_topk.
+    video_topk_cap: int | None = None
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -364,6 +367,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         tile_size: int = _TILE_ELEMS,
         tile_layout: str = "cube",
         merge_prefix: bool = False,
+        topk_cap: int | None = None,
         **kwargs: dict[str, Any],
     ) -> MiniMaxH3VSAMetadata:
         tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
@@ -403,7 +407,8 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             tile_layout=tile_layout,
             tile_partition_indices=tile_partition_indices,
             non_pad_index=get_non_pad_index(variable_block_sizes, int(tile_size)),  # cached on sizes identity
-            video_topk=compute_topk(VSA_sparsity, num_video_tiles),
+            video_topk=_video_topk(VSA_sparsity, num_video_tiles, topk_cap),
+            video_topk_cap=topk_cap,
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
@@ -425,6 +430,15 @@ def _pool_tiles(x: torch.Tensor, variable_block_sizes: torch.Tensor, tile_elems:
     pooled = x.view(batch, n_tiles, tile_elems, heads, dim).sum(dim=2, dtype=torch.float32)
     pooled = pooled / variable_block_sizes.view(1, -1, 1, 1)
     return pooled.permute(0, 2, 1, 3)
+
+
+def _video_topk(sparsity: float, num_video_tiles: int, cap: int | None) -> int:
+    """The single host-int video top-k: ceil((1 - sparsity) * n) in exact integer arithmetic on the decimal sparsity
+    (0.85 -> (3n + 19) // 20; float ceil overshoots at n = 20m), clamped to [1, n], optionally capped (ruling 71:
+    s085k32 = min((3n + 19) // 20, 32)). Equals compute_topk for binary-exact sparsities such as 0.75 and 0.5."""
+    keep = 1 - Fraction(repr(float(sparsity)))
+    k = max(1, min(-(-keep.numerator * num_video_tiles // keep.denominator), num_video_tiles))
+    return k if cap is None else max(1, min(k, int(cap)))
 
 
 def _build_block_mask(
@@ -453,6 +467,26 @@ def _build_block_mask(
         mask.scatter_(-1, idx, True)
     mask[:, :, :num_prefix_tiles, :] = True
     return mask
+
+
+# Block selection as an opaque op (worker-1, h3-training-stack-integration 70cae9be; same implementation in the seam and the
+# integration): pooled block scores and the top-k run as ordinary eager kernels inside the body in eager AND compiled mode,
+# so Inductor never reassociates the fp32 score reduction and a top-k near-tie (observed: 2-ulp gap, cube f1c85686
+# pack4/doc0, also on the fullgraph seam alone) cannot select a different map than eager. Selection only (bool output,
+# detached inputs); the gate branch keeps its own differentiable scores.
+@torch.library.custom_op("fastvideo_kernel::vsa_h3_block_map", mutates_args=())
+def vsa_h3_block_map(query: torch.Tensor, key: torch.Tensor, variable_block_sizes: torch.Tensor, tile_elems: int,
+                     num_prefix_tiles: int, num_video_tiles: int, k_vid: int, exempt: bool) -> torch.Tensor:
+    scores = torch.matmul(_pool_tiles(query, variable_block_sizes, tile_elems),
+                          _pool_tiles(key, variable_block_sizes, tile_elems).transpose(-2, -1)) / (query.shape[-1]**0.5)
+    return _build_block_mask(scores, num_prefix_tiles, num_video_tiles, 1.0, exempt, k_vid)
+
+
+@vsa_h3_block_map.register_fake
+def _vsa_h3_block_map_fake(query, key, variable_block_sizes, tile_elems, num_prefix_tiles, num_video_tiles, k_vid,
+                           exempt):
+    n_tiles = query.shape[1] // tile_elems
+    return query.new_empty((query.shape[0], query.shape[2], n_tiles, n_tiles), dtype=torch.bool)
 
 
 def _sm100a_unavailable_reason(sm100a_mod: Any, query_bhsd: torch.Tensor, variable_block_sizes: torch.Tensor,
@@ -667,7 +701,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
         else:
             mask = _build_block_mask(scores, attn_metadata.num_prefix_tiles, attn_metadata.num_video_tiles,
-                                     layer_sparsity, attn_metadata.exempt)
+                                     layer_sparsity, attn_metadata.exempt,
+                                     _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
+                                     if layer_sparsity > 0.0 else None)
         mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(mask, sizes)
         out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128)[0].to(query.dtype)
         if gate_compress is not None:
@@ -750,24 +786,25 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         probe_dir = None if compiling else probe_enabled()
 
         scores = None
-        if layer_sparsity > 0.0 or gate_compress is not None or probe_dir is not None:
+        if gate_compress is not None or probe_dir is not None:
             q_pooled = _pool_tiles(logical_query, attn_metadata.variable_block_sizes, tile_elems)
             k_pooled = _pool_tiles(logical_key, attn_metadata.variable_block_sizes, tile_elems)
             scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) / (query.shape[-1]**0.5)
             if probe_dir is not None:
                 record_probe(probe_dir, self.layer_idx, logical_query, logical_key, scores, attn_metadata)
 
-        if scores is None:
+        if layer_sparsity > 0.0:
+            # video_topk is cached at build (metadata must be rebuilt when VSA_sparsity changes): eager recomputes
+            # on a mismatch; compiled graphs use the cached integer.
+            k_vid = attn_metadata.video_topk
+            if k_vid is None or (not compiling and k_vid != _video_topk(
+                    layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)):
+                k_vid = _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
+            mask = torch.ops.fastvideo_kernel.vsa_h3_block_map(
+                logical_query.detach(), logical_key.detach(), attn_metadata.variable_block_sizes, tile_elems,
+                attn_metadata.num_prefix_tiles, attn_metadata.num_video_tiles, k_vid, attn_metadata.exempt)
+        else:  # dense layer: compute_topk(0, n) == n selects every tile
             mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
-        else:
-            mask = _build_block_mask(
-                scores,
-                attn_metadata.num_prefix_tiles,
-                attn_metadata.num_video_tiles,
-                layer_sparsity,
-                attn_metadata.exempt,
-                attn_metadata.video_topk if layer_sparsity > 0.0 else None,
-            )
         if force_dense is not None:
             # A scalar bool tensor broadcasts over the block map. This exactly
             # preserves the eager dense-layer contract without a Python branch.

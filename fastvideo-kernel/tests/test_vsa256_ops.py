@@ -246,7 +246,8 @@ def test_h3_block_sac_policy_sees_op_keys(monkeypatch):
 def test_h3_block_h3mh_compile_config(monkeypatch, sparsity):
     """h3mh's training compile configuration (conductor ruling 31942): torch.compile(checkpointed(block), backend='inductor',
     mode='default', dynamic=True, fullgraph=True) with fail_on_recompile_limit_hit and use_duck_shape=False, SAC inside the
-    compiled region (MUST_SAVE vsa256_fwd, PREFER_RECOMPUTE elsewhere), attention metadata passed as an argument; one run per
+    compiled region (MUST_SAVE vsa256_fwd and vsa_h3_block_map, PREFER_RECOMPUTE elsewhere), attention metadata passed as an
+    argument, compiled block map == eager block map; one run per
     operating point (s=0.75 and s=0.5, a fresh compile each, as a training run uses one sparsity). Ten H3
     geometries (small ones take the size-gated tile path in eager) compile once: 0 graph breaks, 0 recompiles, O/dK/dV bitwise
     vs eager, dQ within the nondeterministic-atomics tolerance."""
@@ -266,8 +267,12 @@ def test_h3_block_h3mh_compile_config(monkeypatch, sparsity):
         q2, k2, v2 = x.chunk(3, dim=0)
         return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
 
-    policy = lambda ctx, op, *a, **k: (CheckpointPolicy.MUST_SAVE if op == torch.ops.fastvideo_kernel.vsa256_fwd.default
-                                       else CheckpointPolicy.PREFER_RECOMPUTE)
+    import fastvideo.attention.backends.video_sparse_attn_h3 as h3mod
+    must_save = {torch.ops.fastvideo_kernel.vsa256_fwd.default, torch.ops.fastvideo_kernel.vsa_h3_block_map.default}
+    policy = lambda ctx, op, *a, **k: (CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE)
+    maps = []  # the opaque block-map op calls _build_block_mask at runtime in eager and compiled mode alike
+    build_block_mask = h3mod._build_block_mask
+    monkeypatch.setattr(h3mod, "_build_block_mask", lambda *a, **k: maps.append(build_block_mask(*a, **k)) or maps[-1])
     compiled = torch.compile(lambda q, k, v, meta: checkpoint(block, q, k, v, meta, use_reentrant=False, context_fn=functools.partial(
         create_selective_checkpoint_contexts, policy)), backend="inductor", mode="default", dynamic=True, fullgraph=True)
     geometries = [((42, 14, 24), (175, 1, 170, 402)), ((42, 20, 20), (175, 1, 170, 402)), ((37, 16, 56), (250, 1, 0, 300)),
@@ -282,15 +287,19 @@ def test_h3_block_h3mh_compile_config(monkeypatch, sparsity):
                                                    VSA_sparsity=sparsity, prefix_segments=prefix, device=torch.device("cuda"),
                                                    tile_layout="chunk256", merge_prefix=True)
         before = counters["stats"]["unique_graphs"]
-        outs = []
+        outs, run_maps = [], []
         for fn in (compiled, block):
+            maps.clear()
             torch.manual_seed(100 + i)
             q, k, v = (torch.randn(1, meta.total_seq_length, 8, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
                        for _ in range(3))
             out = fn(q, k, v, meta)
             dout = torch.randn_like(out)
             outs.append((out.detach(), *torch.autograd.grad(out, (q, k, v), dout)))
+            run_maps.append(list(maps))
         (co, cq, ck, cv), (eo, eq, ek, ev) = outs
+        assert run_maps[0] and run_maps[1] and all(torch.equal(run_maps[1][0], m) for m in run_maps[0] + run_maps[1]), \
+            f"compiled block map differs from eager at geometry {i} {raw}"
         assert i == 0 or counters["stats"]["unique_graphs"] == before, f"recompiled at geometry {i} {raw}"
         assert torch.equal(co, eo) and torch.equal(ck, ek) and torch.equal(cv, ev), f"geometry {i} {raw}"
         avg_abs, max_rel = _metrics(eq.float(), cq)
