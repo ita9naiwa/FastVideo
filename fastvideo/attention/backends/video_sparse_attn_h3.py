@@ -71,9 +71,9 @@ except ImportError:
 
 from fastvideo.attention.backends.abstract import (AttentionBackend, AttentionImpl, AttentionMetadata,
                                                    AttentionMetadataBuilder, layer_idx_from_prefix)
-from fastvideo.attention.backends.video_sparse_attn import (compute_topk, construct_variable_block_sizes,
-                                                            get_non_pad_index, get_tile_partition_indices,
-                                                            scatter_into_tile_buf)
+from fastvideo.attention.backends.video_sparse_attn import (_TilePermutation, _tile_row_layout, compute_topk,
+                                                            construct_variable_block_sizes, get_non_pad_index,
+                                                            get_tile_partition_indices, scatter_into_tile_buf)
 from fastvideo.attention.backends.video_sparse_attn_h3_probe import probe_enabled, record_probe
 from fastvideo.logger import init_logger
 
@@ -334,6 +334,11 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # "cube" (one tile per 4x8x8 video cube) or "chunk256" (consecutive
     # 256-token chunks of the same cube-ordered tokens); see _h3_tile_geometry
     tile_layout: str = "cube"
+    # Row permutation of the same geometry (partition order + padded non-pad slots). Training tiles
+    # through the shared _TilePermutation (gather + inverse-gather backward, invocation-owned output)
+    # instead of the index_put scatter into the builder buffer; see MiniMaxH3VSAImpl.tile.
+    tile_partition_indices: torch.Tensor | None = None
+    non_pad_index: torch.Tensor | None = None
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -375,12 +380,12 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         prefix_segments = tuple(int(s) for s in prefix_segments if s > 0)
         total_seq_length = sum(prefix_segments) + math.prod(dit_seq_shape)
 
-        (_tile_partition_indices, variable_block_sizes, untile_combined_index, num_prefix_tiles,
+        (tile_partition_indices, variable_block_sizes, untile_combined_index, num_prefix_tiles,
          num_video_tiles) = _h3_tile_geometry(prefix_segments, dit_seq_shape, device, tile_shape,
                                               "chunk256-merged-prefix" if merge_prefix else tile_layout)
 
         dense_layers = tuple(int(layer) for layer in dense_layers)
-        return MiniMaxH3VSAMetadata(
+        metadata = MiniMaxH3VSAMetadata(
             current_timestep=current_timestep,
             VSA_sparsity=VSA_sparsity,
             total_seq_length=total_seq_length,
@@ -394,7 +399,14 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             dense_layers_tensor=torch.tensor(dense_layers, device=device, dtype=torch.int64),
             tile_buf_holder=self._tile_buf_holder,
             tile_layout=tile_layout,
+            tile_partition_indices=tile_partition_indices,
+            non_pad_index=get_non_pad_index(variable_block_sizes, int(tile_size)),  # cached on sizes identity
         )
+        # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
+        if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
+                and metadata.tile_partition_indices._version == 0 and metadata.non_pad_index._version == 0):
+            metadata._tile_index_state = (metadata.tile_partition_indices, 0, metadata.non_pad_index, 0)
+        return metadata
 
 
 def _pool_tiles(x: torch.Tensor, variable_block_sizes: torch.Tensor, tile_elems: int = _TILE_ELEMS) -> torch.Tensor:
@@ -536,9 +548,10 @@ class MiniMaxH3VSAImpl(AttentionImpl):
     def tile(self, x: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Scatter rows into the padded tile buffer (pad positions stay zero).
 
-        The returned tensor aliases the builder-owned buffer; callers must
-        consume it before the next ``tile()`` (both call sites in
-        ``forward()`` read it immediately). Odd tile-64 no-grad sm100a
+        No-grad calls return the builder-owned buffer; callers must consume it
+        before the next ``tile()`` (both call sites in ``forward()`` read it
+        immediately). Eligible training calls return an invocation-owned
+        tensor from ``_TilePermutation`` instead, since autograd retains it. Odd tile-64 no-grad sm100a
         requests carry one additional all-zero tile internally; metadata and
         all observable outputs retain the logical geometry.
         """
@@ -560,6 +573,16 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         needs_sm100a_pair = (attn_metadata.tile_elems == 64 and n_tiles % 2 != 0 and not grad_mode and sm100a_requested)
         kernel_tiles = n_tiles + int(needs_sm100a_pair)
         target_shape = (x.shape[0], kernel_tiles * attn_metadata.tile_elems, x.shape[-2], x.shape[-1])
+
+        # Training: gather into an invocation-owned buffer (autograd saves it; never the shared holder).
+        state = getattr(attn_metadata, "_tile_index_state", None)
+        if (state is not None and grad_mode and not needs_sm100a_pair and x.ndim == 4 and x.is_cuda
+                and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
+                and state[0].device == x.device and state[2].device == x.device and x.numel() >= 2**25
+                and x.shape[1] == state[0].numel() == state[2].numel()
+                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index
+                and state[0]._version == state[1] and state[2]._version == state[3]):
+            return _TilePermutation.apply(x, state[0], state[2], target_shape[1])
 
         # ``untile_combined_index`` maps each packed row to a logical tile
         # slot. Different geometries can share one transport shape; clear a
