@@ -308,6 +308,8 @@ class _MiniMaxH3VSATileBufferHolder:
     def __init__(self) -> None:
         self.buffer: torch.Tensor | None = None
         self.untile_geometry: torch.Tensor | None = None
+        # Fused VC route: (untile index it was built from, padded slot -> packed row map, padded query map)
+        self.vc_maps: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -603,8 +605,77 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             holder.buffer[:, n_tiles * attn_metadata.tile_elems:].zero_()
         return holder.buffer
 
+    def _vc_fused_route(self, x: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> bool:
+        """True when the no-grad VC (FP8) route applies and Q/K/V can skip the BF16 tile copy.
+
+        Exactly the calls that the generic path would send to VC attention (FASTVIDEO_VSA_VC=1 on the CuTe
+        backend, tile 256, no grad, BF16 head 128 on SM10x), minus compile and probe recording, which keep the
+        tiled path. preprocess_qkv and forward both use this predicate, so they always agree.
+        """
+        if (os.environ.get("FASTVIDEO_VSA_VC", "0") != "1" or not os.environ.get("FASTVIDEO_VSA_VC_ROOT")
+                or attn_metadata.tile_elems != 256 or block_sparse_attn_256_bshd is None or x.ndim != 4
+                or not x.is_cuda or x.dtype != torch.bfloat16 or x.shape[-1] != 128
+                or (torch.is_grad_enabled() and x.requires_grad) or torch.compiler.is_compiling()):
+            return False
+        from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
+        return (_resolve_backend() == "cutedsl" and torch.cuda.get_device_capability(x.device)[0] == 10
+                and probe_enabled() is None)
+
     def preprocess_qkv(self, qkv: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
+        if self._vc_fused_route(qkv, attn_metadata):
+            # The fused VC producer reads the packed rows directly into the padded FP8 layout.
+            return qkv
         return self.tile(qkv, attn_metadata)
+
+    def _vc_fused_forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                          gate_compress: torch.Tensor | None, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
+        """Fused VC route: one producer pass from packed rows to padded FP8 Q/K/V plus FP32 tile pools.
+
+        Replaces tile() + _pool_tiles + vc_preprocess.prepare of the generic route. Scores, the block mask and
+        the VC attention call (on the 128-granularity map, as block_sparse_attn_256_bshd sends no-grad calls)
+        are unchanged; the output is in the padded tile layout that postprocess_output expects.
+        """
+        from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
+        from fastvideo_kernel.block_sparse_attn_cute_fwd import (block_sparse_attn_vc_prepared_fwd_bshd,
+                                                                 prepare_vsa_vc_fwd_bshd)
+        sizes = attn_metadata.variable_block_sizes
+        n_tiles = sizes.numel()
+        padded = n_tiles * 256
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor.shape[1] != attn_metadata.total_seq_length:
+                raise ValueError(f"VSA-H3 fused VC {name} has length {tensor.shape[1]}, expected the packed length "
+                                 f"{attn_metadata.total_seq_length}.")
+        holder = attn_metadata.tile_buf_holder
+        if holder is None:
+            raise RuntimeError("VSA-H3 metadata has no builder-owned tile buffer holder")
+        untile = attn_metadata.untile_combined_index
+        if holder.vc_maps is None or holder.vc_maps[0] is not untile:
+            padded_to_original = torch.full((padded, ), -1, dtype=torch.int64, device=query.device)
+            padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=query.device)
+            holder.vc_maps = (untile, padded_to_original, torch.arange(padded, dtype=torch.int64, device=query.device))
+        _, padded_to_original, padded_to_query = holder.vc_maps
+
+        p, pools = prepare_vsa_vc_fwd_bshd(query.contiguous(), key.contiguous(), value.contiguous(), padded_to_original,
+                                           sizes, 256, padded_to_query, padded, 0)
+        layer_sparsity = 0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity
+        scores = None
+        if layer_sparsity > 0.0 or gate_compress is not None:
+            scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
+        if scores is None:
+            mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
+        else:
+            mask = _build_block_mask(scores, attn_metadata.num_prefix_tiles, attn_metadata.num_video_tiles,
+                                     layer_sparsity, attn_metadata.exempt)
+        mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(mask, sizes)
+        out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128)[0].to(query.dtype)
+        if gate_compress is not None:
+            out_c = torch.matmul(torch.softmax(scores, dim=-1), pools[2]).permute(0, 2, 1, 3).to(out.dtype)
+            batch, _, heads, dim = out.shape
+            gate = gate_compress.new_zeros(batch, padded, heads, dim)
+            gate[:, untile] = gate_compress
+            out = (out.view(batch, n_tiles, 256, heads, dim)
+                   + out_c.unsqueeze(2) * gate.view(batch, n_tiles, 256, heads, dim)).view(batch, padded, heads, dim)
+        return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         return output[:, attn_metadata.untile_combined_index]
@@ -617,6 +688,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         gate_compress: torch.Tensor | None,
         attn_metadata: MiniMaxH3VSAMetadata,
     ) -> torch.Tensor:
+        if self._vc_fused_route(query, attn_metadata) and query.shape[1] == attn_metadata.total_seq_length:
+            return self._vc_fused_forward(query, key, value, gate_compress, attn_metadata)
         compiling = torch.compiler.is_compiling()
         regional_compiling = compiling and self._regional_compile_sm100a_enabled is True
 
