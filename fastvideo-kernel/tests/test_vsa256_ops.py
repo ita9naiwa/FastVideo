@@ -140,6 +140,20 @@ def test_tile_permute_pair_matches_autograd_function():
     assert torch.equal(gf, gr)
 
 
+
+def test_tile_permute_backward_uses_forward_index():
+    """The backward is the adjoint of the index the forward consumed: trusted partition/nonpad with a diverged untile
+    (mutated in place before the forward) still routes gradient through partition/nonpad."""
+    x = torch.zeros(1, 3, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    partition, nonpad = torch.tensor([0, 1, 2], device="cuda"), torch.tensor([0, 1, 2], device="cuda")
+    untile = nonpad.clone()
+    untile[1:] = torch.tensor([0, 0], device="cuda")  # diverged; partition/nonpad keep their recorded versions
+    padded = torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, partition, nonpad, untile, 4, partition._version,
+                                                             nonpad._version)
+    g = torch.tensor([3.0, 5.0, 1.0, 7.0], device="cuda", dtype=torch.bfloat16).view(1, 4, 1, 1).expand(1, 4, 1, 128)
+    (gx, ) = torch.autograd.grad(padded, x, g)
+    assert torch.equal(gx[0, :, 0, 0].float().cpu(), torch.tensor([3.0, 5.0, 1.0]))
+
 @pytest.mark.parametrize("layout,merge", [("cube", False), ("chunk256", False), ("chunk256", True)])
 def test_h3_block_fullgraph(monkeypatch, layout, merge):
     """torch.compile(dynamic=True, fullgraph=True) of the H3 training block (tile -> pool/top-k -> attention -> untile)

@@ -292,24 +292,27 @@ def _vsa_tile_permute_fwd_fake(x, partition, nonpad, untile, padded_length, part
 
 
 @torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_bwd", mutates_args=())
-def vsa_tile_permute_bwd(grad: torch.Tensor, untile: torch.Tensor) -> torch.Tensor:
-    # untile[i] is the padded slot of packed row i: the inverse of the forward permutation (for trusted geometry it is
-    # the same index tensor _tile_unpermute_rows derives from partition/nonpad).
+def vsa_tile_permute_bwd(grad: torch.Tensor, partition: torch.Tensor, nonpad: torch.Tensor, untile: torch.Tensor,
+                         partition_version: int, nonpad_version: int) -> torch.Tensor:
+    # Adjoint of the index the forward consumed: repeat its trust decision (saved tensors cannot change in between).
+    if partition._version == partition_version and nonpad._version == nonpad_version:
+        return _tile_unpermute_rows(grad, partition, nonpad)
     return _gather_tile_rows(grad, untile)
 
 
 @vsa_tile_permute_bwd.register_fake
-def _vsa_tile_permute_bwd_fake(grad, untile):
+def _vsa_tile_permute_bwd_fake(grad, partition, nonpad, untile, partition_version, nonpad_version):
     return grad.new_empty((grad.shape[0], untile.shape[0], *grad.shape[2:]))
 
 
 def _tile_permute_setup_context(ctx, inputs, output):
-    ctx.save_for_backward(inputs[3])
+    ctx.save_for_backward(inputs[1], inputs[2], inputs[3])
+    ctx.versions = (inputs[5], inputs[6])
 
 
 def _tile_permute_backward(ctx, grad):
-    (untile, ) = ctx.saved_tensors
-    return vsa_tile_permute_bwd(grad.contiguous(), untile), None, None, None, None, None, None
+    partition, nonpad, untile = ctx.saved_tensors
+    return vsa_tile_permute_bwd(grad.contiguous(), partition, nonpad, untile, *ctx.versions), None, None, None, None, None, None
 
 
 vsa_tile_permute_fwd.register_autograd(_tile_permute_backward, setup_context=_tile_permute_setup_context)
