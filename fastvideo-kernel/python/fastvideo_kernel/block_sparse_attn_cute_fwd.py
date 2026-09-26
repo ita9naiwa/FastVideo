@@ -440,12 +440,11 @@ def _cute_attention(
     v_bshd: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
-    query_sizes: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FA4's autograd-enabled block-sparse attention with BSHD inputs.
 
-    ``query_sizes`` (per Q256 parent valid-prefix rows) is a caller guarantee that every
-    row past it receives zero output gradient; only the packed-tail backward uses it.
+    Native-256 training shares the public wrapper's single dispatch (``vsa256_ops.training_eligible`` /
+    ``training_attention``); query-padding pruning needs the trusted-map proof only the public wrapper carries.
     """
     if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
         return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
@@ -459,15 +458,10 @@ def _cute_attention(
             and k_bshd.shape[1] == block_map.shape[3] * 256
             and q_bshd.dtype == torch.bfloat16 and q_bshd.shape[-1] in (64, 128)
             and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
-        if (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
-                and q_bshd.shape[-1] == k_bshd.shape[-1] == v_bshd.shape[-1]
-                and q_bshd.shape[2] == k_bshd.shape[2] == v_bshd.shape[2]
-                and block_map.shape[:2] == (q_bshd.shape[0], q_bshd.shape[2])
-                and all(t.is_contiguous() for t in (q_bshd, k_bshd, v_bshd))):
-            from fastvideo_kernel.vsa_tail_backward import TailTraining
-            if query_sizes is not None and query_sizes.shape != (block_map.shape[2], ):
-                query_sizes = None
-            return TailTraining.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, query_sizes)
+        from fastvideo_kernel import vsa256_ops
+        if vsa256_ops.training_eligible(q_bshd, k_bshd, v_bshd, block_map):
+            return vsa256_ops.training_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+        # Outside the op's validated domain (same predicate as the public wrapper): plain Q256 training autograd.
         return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     forward_sparse_tensors, backward_sparse_tensors = _build_sparse_tensors(
         block_map,
@@ -693,7 +687,6 @@ def block_sparse_attn_cute_fwd_bshd(
     v: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
-    query_sizes: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
     if block_map.dim() == 3:
@@ -705,7 +698,6 @@ def block_sparse_attn_cute_fwd_bshd(
         v,
         block_map,
         variable_block_sizes,
-        query_sizes,
     )
     # lse is [B, H, S] regardless of the q/k/v layout; see above.
     return out, lse.detach()

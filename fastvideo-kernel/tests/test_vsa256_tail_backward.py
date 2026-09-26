@@ -129,7 +129,7 @@ def test_tail_backward_invalid_slot_poison(placement, poison, entry):
     if entry == 'custom_op':  # the fullgraph seam (vsa256_fwd/bwd) must share the fixed tail backward
         from fastvideo_kernel import vsa256_ops  # noqa: F401
         TailTraining = type('TailOp', (), {'apply': staticmethod(
-            lambda q, k, v, routes, sizes: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, routes, sizes, True))})
+            lambda q, k, v, routes, sizes: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, routes, sizes, None, None, 0, 0, True))})
     if "_workspace" not in inspect.signature(adapter._load_fa4_cute()[3]).parameters:
         pytest.skip("FA4 backward workspace support required")
     sizes, routes, bad, target = _poison_case(placement)

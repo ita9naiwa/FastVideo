@@ -27,7 +27,7 @@ def _inputs(b=1, n_tiles=12, heads=4, seed=0, requires_grad=True):
 def test_vsa256_ops_opcheck(pack_tails):
     from fastvideo_kernel import vsa256_ops  # noqa: F401
     q, k, v, block_map, sizes = _inputs()
-    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa256_fwd.default, (q, k, v, block_map, sizes, pack_tails),
+    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa256_fwd.default, (q, k, v, block_map, sizes, None, None, 0, 0, pack_tails),
                           test_utils=("test_schema", "test_faketensor", "test_autograd_registration"))
     import fastvideo.attention.backends.video_sparse_attn  # noqa: F401  (registers vsa_tile_permute_*)
     x = torch.randn(2, 1000, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -87,7 +87,7 @@ def test_vsa256_ops_single_output_losses(monkeypatch, loss_on):
         target = out if loss_on == "out" else lse
         return torch.autograd.grad(target.float().square().sum(), (q, k, v))
 
-    new = grads(lambda: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, block_map, sizes, True))
+    new = grads(lambda: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, block_map, sizes, None, None, 0, 0, True))
     if loss_on == "out":
         assert seen["dlse_is_none"]
     old1 = grads(lambda: TailTraining.apply(q, k, v, block_map, sizes))

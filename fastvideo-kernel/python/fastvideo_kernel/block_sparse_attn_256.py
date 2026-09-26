@@ -216,13 +216,17 @@ def block_sparse_attn_256_bshd(
     logical_block_map_256: torch.Tensor,
     logical_variable_block_sizes_256: torch.Tensor,
     query_sizes: torch.Tensor | None = None,
+    query_untile: torch.Tensor | None = None,
+    query_versions: tuple[int, int] = (0, 0),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, S, H, D] inputs.
 
     Default CuTe path consumes BSHD directly; Triton fallback transposes
     to BHSD as the legacy path expects. ``query_sizes``: optional caller
     guarantee that query rows past each tile's valid prefix get zero output
-    gradient (see ``block_sparse_attn_cute_fwd._cute_attention``).
+    gradient; honored only together with the trusted ``query_untile`` map and the
+    builder-recorded ``query_versions`` of (query_untile, query_sizes), re-checked inside the
+    backward op (``vsa256_ops``).
     """
     if logical_block_map_256.dim() == 3:
         logical_block_map_256 = logical_block_map_256.unsqueeze(0)
@@ -238,27 +242,12 @@ def block_sparse_attn_256_bshd(
         return out_bhsd.transpose(1, 2).contiguous(), aux
 
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
-    if (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
-            and q.is_cuda and q.dtype == k.dtype == v.dtype == torch.bfloat16
-            and q.ndim == k.ndim == v.ndim == 4
-            and q.shape[-1] == k.shape[-1] == v.shape[-1] and q.shape[-1] in (64, 128)
-            and q.shape[0] == k.shape[0] == v.shape[0]
-            and q.shape[2] == k.shape[2] == v.shape[2]
-            and k.shape[1] == v.shape[1]
-            and all(t.is_contiguous() or (t.stride(-1) == 1 and t.data_ptr() % 16 == 0
-                                         and all(s > 0 and s % 8 == 0 for s in t.stride()[:-1]))
-                    for t in (q, k, v))
-            and q.shape[1] == logical_block_map_256.shape[2] * 256
-            and k.shape[1] == logical_block_map_256.shape[3] * 256
-            and logical_block_map_256.shape[:2] == (q.shape[0], q.shape[2])
-            and torch.cuda.get_device_capability(q.device)[0] == 10
-            and os.environ.get("FASTVIDEO_VSA_VC", "0") != "1"):
+    if vsa256_ops.training_eligible(q, k, v, logical_block_map_256):
         # BF16 Q256 training: opaque custom-op pair (same op in eager and compiled mode, fullgraph-safe). The pack
         # policy is static per call: packed-tail backward when enabled (default) and the inputs are contiguous.
-        pack_tails = (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
-                      and all(t.is_contiguous() for t in (q, k, v)))
-        out, lse = torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, logical_block_map_256,
-                                                          logical_variable_block_sizes_256, pack_tails)
+        out, lse = vsa256_ops.training_attention(q, k, v, logical_block_map_256, logical_variable_block_sizes_256,
+                                                 query_sizes=query_sizes, query_untile=query_untile,
+                                                 query_versions=query_versions)
         return out, lse.detach()
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)

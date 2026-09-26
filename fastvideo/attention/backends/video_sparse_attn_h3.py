@@ -344,6 +344,10 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     video_topk: int | None = None
     # Optional cap on video top-k (ruling 71: k_vid = min(ceil((1 - s) * n_video), cap)); folded into video_topk.
     video_topk_cap: int | None = None
+    # Runtime switch (static per build, default on; same-head ablations): trusted cube geometry lets the packed backward
+    # skip wholly padded Q128 children. Further integrated options (pack_tails policy, prefix_split, fused_qkv_grad) are
+    # added next to it when their inputs are accepted.
+    query_pad_pruning: bool = True
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -368,6 +372,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         tile_layout: str = "cube",
         merge_prefix: bool = False,
         topk_cap: int | None = None,
+        query_pad_pruning: bool = True,
         **kwargs: dict[str, Any],
     ) -> MiniMaxH3VSAMetadata:
         tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
@@ -409,6 +414,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             non_pad_index=get_non_pad_index(variable_block_sizes, int(tile_size)),  # cached on sizes identity
             video_topk=_video_topk(VSA_sparsity, num_video_tiles, topk_cap),
             video_topk_cap=topk_cap,
+            query_pad_pruning=bool(query_pad_pruning),
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
@@ -729,7 +735,10 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if pinned is None:
             return output[:, attn_metadata.untile_combined_index]
         untile, version = pinned
-        if untile._version != version:
+        # Eager: reject an in-place change since the builder validated the map. Compiled: Dynamo cannot branch on
+        # _version; a change after the forward fails autograd's saved-tensor check on the map the vsa256 op saved,
+        # and its backward re-checks the recorded version (full backward on mismatch).
+        if not torch.compiler.is_compiling() and untile._version != version:
             raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
                                "postprocess_output; its backward assumed the original padded-row geometry.")
         return output[:, untile]
@@ -826,7 +835,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             # preserves the eager dense-layer contract without a Python branch.
             mask = mask | force_dense
 
-        query_sizes = None
+        query_sizes = query_untile = None
+        query_versions = (0, 0)
         if tile_elems == 64:
             # Native 64-token path: the block map is already at the kernels'
             # granularity. Both 64-token entries take BHSD ([B, H, S_pad, D]);
@@ -931,11 +941,15 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             # Padded query rows get zero dO through postprocess_output's untile gather, which lets
             # the CuTe backward skip wholly padded Q128 children (the LSE output is discarded; the
             # gate branch adds out of place, so it leaves the attention output's padded dO zero).
-            state = getattr(attn_metadata, "_query_pad_state", None)
+            # Trust only the builder-validated objects (identity is traceable). Eager also checks
+            # their version counters here; Dynamo cannot branch on _version, so compiled calls hand
+            # the builder-recorded versions to the opaque vsa256 op, whose backward re-checks them
+            # and falls back to the full backward on any in-place change.
+            state = getattr(attn_metadata, "_query_pad_state", None) if attn_metadata.query_pad_pruning else None
             if (state is not None and state[0] is attn_metadata.untile_combined_index
-                    and state[2] is attn_metadata.variable_block_sizes and state[0]._version == state[1]
-                    and state[2]._version == state[3]):
-                query_sizes = attn_metadata.variable_block_sizes
+                    and state[2] is attn_metadata.variable_block_sizes
+                    and (compiling or (state[0]._version == state[1] and state[2]._version == state[3]))):
+                query_sizes, query_untile, query_versions = state[2], state[0], (state[1], state[3])
             out, _ = block_sparse_attn_256_bshd(
                 logical_query,
                 logical_key,
@@ -943,6 +957,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 mask,
                 attn_metadata.variable_block_sizes,
                 query_sizes=query_sizes,
+                query_untile=query_untile,
+                query_versions=query_versions,
             )
 
         if logical_gate is not None:
@@ -962,6 +978,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             gate_tiled = logical_gate.view(batch, n_tiles, tile_elems, heads, dim)
             out = (out_tiled + out_c.unsqueeze(2) * gate_tiled).view(batch, seq_len, heads, dim)
         if query_sizes is not None:
-            untile = attn_metadata.untile_combined_index
-            out._vsa_h3_query_pad_untile = (untile, untile._version)  # type: ignore[attr-defined]
+            # Pin the trusted map (and its builder-recorded version) for postprocess_output. The pin is set in
+            # traced caller code on a view: Dynamo rejects setattr on a custom op's tuple output element.
+            out = out.view_as(out)
+            out._vsa_h3_query_pad_untile = (query_untile, query_versions[0])  # type: ignore[attr-defined]
         return out

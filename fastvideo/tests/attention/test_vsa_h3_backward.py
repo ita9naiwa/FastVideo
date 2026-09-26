@@ -117,6 +117,19 @@ def _cute_tail_or_skip(monkeypatch):
     monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1")
 
 
+def _spy_pruning(monkeypatch):
+    """Record, per packed-tail backward, whether the main lists were pruned (query sizes reached _prepare).
+
+    _prepare runs inside the opaque vsa256_bwd body, so this observes eager and compiled calls alike."""
+    from fastvideo_kernel import vsa_tail_backward as tail
+    conveyed = []
+    prepare = tail._prepare
+    monkeypatch.setattr(tail, "_prepare",
+                        lambda routes, sizes, query_sizes=None: conveyed.append(query_sizes is not None)
+                        or prepare(routes, sizes, query_sizes))
+    return conveyed
+
+
 def _padded_slot(meta):
     tile = int(torch.nonzero(meta.variable_block_sizes <= 128)[0])
     return tile * meta.tile_elems + meta.tile_elems - 1
@@ -135,10 +148,7 @@ def _tiled_inputs(impl, meta, gate_compress, device):
 def test_h3_query_pad_pruning_matches_full_backward(monkeypatch, gate_compress: bool) -> None:
     """Trusted cube metadata prunes padded query children; outputs and dK/dV stay bitwise equal."""
     _cute_tail_or_skip(monkeypatch)
-    from fastvideo_kernel import vsa_tail_backward as tail
-    conveyed = []
-    apply = tail.TailTraining.apply
-    monkeypatch.setattr(tail.TailTraining, "apply", lambda *a: conveyed.append(a[5] is not None) or apply(*a))
+    conveyed = _spy_pruning(monkeypatch)
     device = torch.device("cuda")
     impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
     results = []
@@ -219,3 +229,37 @@ def test_h3_empty_query_child_rows_get_exact_zero_dq(monkeypatch) -> None:
     for t in tiled:
         assert torch.isfinite(t.grad).all()
     assert torch.count_nonzero(tiled[0].grad[:, empty]) == 0
+
+
+def test_h3_query_pad_compiled_fullgraph_prunes_like_eager(monkeypatch) -> None:
+    """The query-padding proof is checked inside the opaque vsa256 op, so fullgraph=True, dynamic=True compiles the
+    real forward/postprocess with pruning (replaces the a815ab20 unpruned-compile fallback). Compiled pruned ==
+    eager pruned == eager full backward: O, dK, dV bitwise; dQ at FP32-atomic noise."""
+    _cute_tail_or_skip(monkeypatch)
+    conveyed = _spy_pruning(monkeypatch)
+    device = torch.device("cuda")
+    impl = MiniMaxH3VSAImpl(num_heads=_HEADS, head_size=_DIM, causal=False, softmax_scale=_DIM**-0.5)
+    results = []
+    for arm in ("eager", "compiled", "eager_full"):
+        meta = _build_meta(device)
+        if arm == "eager_full":
+            meta._query_pad_state = None
+        leaves, tiled, _ = _tiled_inputs(impl, meta, False, device)
+
+        def attend(q, k, v, meta=meta):
+            return impl.postprocess_output(impl.forward(q, k, v, None, meta), meta)
+
+        if arm == "compiled":
+            torch._dynamo.reset()
+            attend = torch.compile(attend, fullgraph=True, dynamic=True)
+        out = attend(*tiled)
+        out.float().pow(2).sum().backward()
+        results.append([out.detach()] + [leaf.grad for leaf in leaves])
+    torch._dynamo.reset()
+    assert conveyed == [True, True, False]
+    for other in results[1:]:
+        for name, got, ref in zip(("out", "dq", "dk", "dv"), other, results[0], strict=True):
+            if name == "dq":
+                torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
+            else:
+                torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=name)
