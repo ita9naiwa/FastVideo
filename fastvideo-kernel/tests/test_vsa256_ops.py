@@ -242,10 +242,12 @@ def test_h3_block_sac_policy_sees_op_keys(monkeypatch):
         assert any("vsa_tile_permute_fwd" in k for k in keys[m]), (m, keys[m])
 
 
-def test_h3_block_h3mh_compile_config(monkeypatch):
+@pytest.mark.parametrize("sparsity", [0.75, 0.5])  # both H3 operating points (ruling 67; spec f1c85686 / cd24cc2f)
+def test_h3_block_h3mh_compile_config(monkeypatch, sparsity):
     """h3mh's training compile configuration (conductor ruling 31942): torch.compile(checkpointed(block), backend='inductor',
     mode='default', dynamic=True, fullgraph=True) with fail_on_recompile_limit_hit and use_duck_shape=False, SAC inside the
-    compiled region (MUST_SAVE vsa256_fwd, PREFER_RECOMPUTE elsewhere), attention metadata passed as an argument. Ten H3
+    compiled region (MUST_SAVE vsa256_fwd, PREFER_RECOMPUTE elsewhere), attention metadata passed as an argument; one run per
+    operating point (s=0.75 and s=0.5, a fresh compile each, as a training run uses one sparsity). Ten H3
     geometries (small ones take the size-gated tile path in eager) compile once: 0 graph breaks, 0 recompiles, O/dK/dV bitwise
     vs eager, dQ within the nondeterministic-atomics tolerance."""
     import functools
@@ -277,7 +279,7 @@ def test_h3_block_h3mh_compile_config(monkeypatch):
     graphs0, breaks0 = counters["stats"]["unique_graphs"], sum(counters["graph_break"].values())
     for i, (raw, prefix) in enumerate(geometries):
         meta = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=raw, patch_size=(1, 2, 2),
-                                                   VSA_sparsity=0.75, prefix_segments=prefix, device=torch.device("cuda"),
+                                                   VSA_sparsity=sparsity, prefix_segments=prefix, device=torch.device("cuda"),
                                                    tile_layout="chunk256", merge_prefix=True)
         before = counters["stats"]["unique_graphs"]
         outs = []
