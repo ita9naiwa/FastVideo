@@ -918,7 +918,9 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
 
     def block(q, k, v, meta):
         x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
-        return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
+        if hasattr(impl, "forward_qkv"):  # the layer's gate-free entry (fused-QKV input)
+            return impl.postprocess_output(impl.forward_qkv(x, meta), meta)
+        return impl.postprocess_output(impl.forward(*x.chunk(3, dim=0), None, meta), meta)
 
     def checkpointed(q, k, v, meta):
         return checkpoint(block, q, k, v, meta, use_reentrant=False,
