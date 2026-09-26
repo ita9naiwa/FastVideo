@@ -359,7 +359,7 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # Optional cap on video top-k (ruling 71: k_vid = min(ceil((1 - s) * n_video), cap)); folded into video_topk.
     video_topk_cap: int | None = None
     # Runtime switch (static per build, default on; same-head ablations): trusted cube geometry lets the packed backward
-    # skip wholly padded Q128 children. Further integrated options (pack_tails policy, prefix_split, fused_qkv_grad) are
+    # skip wholly padded Q128 children. Further integrated options (pack_tails policy, fused_qkv_grad) are
     # added next to it when their inputs are accepted.
     query_pad_pruning: bool = True
     # forward_qkv keeps [3B, S, H, D] as one autograd input (one fused gradient allocation); OFF = the ordinary

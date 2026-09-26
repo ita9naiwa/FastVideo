@@ -19,8 +19,8 @@ is then the single autograd input; the backward allocates ONE fresh ``[3B, S, H,
 dQ/dK/dV into its three B-sized views (both pack policies), checks they did, and returns it whole, so no concat follows.
 (A mutation-free custom op cannot return three outputs that share storage, hence one output.)
 
-Integration note: the prefix split (conditional) would add a static ``q_split`` argument through the shared split
-forward helper - see candidate h3-training-stack-integration.
+Integration note (history): a prefix-split q_split argument was considered and DROPPED (conductor 33852: not adopted
+for chunk256), see candidate h3-training-stack-integration.
 """
 
 import os
