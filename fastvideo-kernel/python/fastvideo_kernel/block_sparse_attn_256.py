@@ -218,6 +218,7 @@ def block_sparse_attn_256_bshd(
     query_sizes: torch.Tensor | None = None,
     query_untile: torch.Tensor | None = None,
     query_versions: tuple[int, int] = (0, 0),
+    pack_tails: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, S, H, D] inputs.
 
@@ -227,6 +228,8 @@ def block_sparse_attn_256_bshd(
     gradient; honored only together with the trusted ``query_untile`` map and the
     builder-recorded ``query_versions`` of (query_untile, query_sizes), re-checked inside the
     backward op (``vsa256_ops``).
+    ``pack_tails`` (training backward tail packing, static per call): None follows
+    FASTVIDEO_VSA_PACK_TAILS (direct callers); a bool (the H3 metadata policy) forces it.
     """
     if logical_block_map_256.dim() == 3:
         logical_block_map_256 = logical_block_map_256.unsqueeze(0)
@@ -247,7 +250,7 @@ def block_sparse_attn_256_bshd(
         # policy is static per call: packed-tail backward when enabled (default) and the inputs are contiguous.
         out, lse = vsa256_ops.training_attention(q, k, v, logical_block_map_256, logical_variable_block_sizes_256,
                                                  query_sizes=query_sizes, query_untile=query_untile,
-                                                 query_versions=query_versions)
+                                                 query_versions=query_versions, pack_tails=pack_tails)
         return out, lse.detach()
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)

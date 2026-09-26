@@ -440,11 +440,14 @@ def _cute_attention(
     v_bshd: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    *,
+    pack_tails: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FA4's autograd-enabled block-sparse attention with BSHD inputs.
 
     Native-256 training shares the public wrapper's single dispatch (``vsa256_ops.training_eligible`` /
     ``training_attention``); query-padding pruning needs the trusted-map proof only the public wrapper carries.
+    Keyword-only training options: ``pack_tails`` None follows FASTVIDEO_VSA_PACK_TAILS (default on); a bool forces it.
     """
     if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
         return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
@@ -460,7 +463,8 @@ def _cute_attention(
             and torch.cuda.get_device_capability(q_bshd.device)[0] == 10):
         from fastvideo_kernel import vsa256_ops
         if vsa256_ops.training_eligible(q_bshd, k_bshd, v_bshd, block_map):
-            return vsa256_ops.training_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+            return vsa256_ops.training_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes,
+                                                 pack_tails=pack_tails)
         # Outside the op's validated domain (same predicate as the public wrapper): plain Q256 training autograd.
         return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     forward_sparse_tensors, backward_sparse_tensors = _build_sparse_tensors(
@@ -687,6 +691,8 @@ def block_sparse_attn_cute_fwd_bshd(
     v: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    *,
+    pack_tails: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
     if block_map.dim() == 3:
@@ -698,6 +704,7 @@ def block_sparse_attn_cute_fwd_bshd(
         v,
         block_map,
         variable_block_sizes,
+        pack_tails=pack_tails,
     )
     # lse is [B, H, S] regardless of the q/k/v layout; see above.
     return out, lse.detach()

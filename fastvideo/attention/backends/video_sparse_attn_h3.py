@@ -303,6 +303,20 @@ class MiniMaxH3VSABackend(AttentionBackend):
         return MiniMaxH3VSAMetadataBuilder
 
 
+@functools.lru_cache(maxsize=32)
+def _pack_tails_policy(variable_block_sizes: torch.Tensor, tile_elems: int, min_partial: float) -> bool:
+    """Training tail packing pays a second backward launch plus plan build; it only wins when many parents are partial
+    and the 128-residual rows fit TailTraining's bounded plan. Cached on the (geometry-cached) sizes tensor identity,
+    so the one host sync happens once per geometry, outside any compiled region."""
+    if tile_elems != 256:
+        return False
+    sizes = variable_block_sizes.clamp(0, 256).tolist()
+    residual_rows = sum(size % 128 for size in sizes)
+    capacity = math.ceil(max(128, len(sizes) * 8) / 128) * 128  # vsa_tail_backward._prepare
+    partial = sum(size < 256 for size in sizes) / len(sizes)
+    return residual_rows <= capacity and partial >= min_partial
+
+
 class _MiniMaxH3VSATileBufferHolder:
     """Builder-owned no-grad tile scratch and its active geometry."""
 
@@ -348,6 +362,8 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # skip wholly padded Q128 children. Further integrated options (pack_tails policy, prefix_split, fused_qkv_grad) are
     # added next to it when their inputs are accepted.
     query_pad_pruning: bool = True
+    # Training backward tail packing for tile-256 (static per step; see _pack_tails_policy).
+    pack_tails: bool = True
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -357,6 +373,14 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
 
     def prepare(self) -> None:
         pass
+
+    @staticmethod
+    def _pack_tails(requested: bool | str, sizes: torch.Tensor, tile_elems: int, min_partial: float) -> bool:
+        """"auto": an explicit FASTVIDEO_VSA_PACK_TAILS forces it, otherwise the partial-parent policy decides."""
+        if requested != "auto":
+            return bool(requested)
+        env = os.environ.get("FASTVIDEO_VSA_PACK_TAILS")
+        return env == "1" if env is not None else _pack_tails_policy(sizes, tile_elems, min_partial)
 
     def build(  # type: ignore
         self,
@@ -373,6 +397,8 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         merge_prefix: bool = False,
         topk_cap: int | None = None,
         query_pad_pruning: bool = True,
+        pack_tails: bool | str = "auto",
+        pack_tails_min_partial: float = 0.15,
         **kwargs: dict[str, Any],
     ) -> MiniMaxH3VSAMetadata:
         tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
@@ -415,6 +441,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             video_topk=_video_topk(VSA_sparsity, num_video_tiles, topk_cap),
             video_topk_cap=topk_cap,
             query_pad_pruning=bool(query_pad_pruning),
+            pack_tails=self._pack_tails(pack_tails, variable_block_sizes, int(tile_size), pack_tails_min_partial),
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
@@ -959,6 +986,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 query_sizes=query_sizes,
                 query_untile=query_untile,
                 query_versions=query_versions,
+                pack_tails=attn_metadata.pack_tails,
             )
 
         if logical_gate is not None:

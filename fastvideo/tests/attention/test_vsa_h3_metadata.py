@@ -281,6 +281,28 @@ def test_geometry_chunk256_real_grids(thw, prefix, n_video, merge_prefix):
     assert torch.equal(keep(buf, meta), keep(cube_buf, cube))
 
 
+@pytest.mark.parametrize("grid,prefix,n_video", _H3_REAL_GRIDS)
+def test_pack_tails_policy(monkeypatch, grid, prefix, n_video):
+    """Tail packing only when many parents are partial and the residual rows fit the bounded plan."""
+    from fastvideo.attention.backends.video_sparse_attn_h3 import _pack_tails_policy
+    monkeypatch.delenv("FASTVIDEO_VSA_PACK_TAILS", raising=False)
+    canonical = torch.tensor([256, 131] * 75, dtype=torch.int32)  # half the parents partial
+    assert _pack_tails_policy(canonical, 256, 0.15) and not _pack_tails_policy(canonical, 64, 0.15)
+    assert not _pack_tails_policy(canonical, 256, 0.6)
+    assert not _pack_tails_policy(torch.full((150, ), 255, dtype=torch.int32), 256, 0.15)  # residuals overflow
+    spec = dict(raw_latent_shape=(grid[0], 2 * grid[1], 2 * grid[2]), patch_size=(1, 2, 2), prefix_segments=prefix)
+    chunk = _build(spec, tile_layout="chunk256", merge_prefix=True)
+    assert chunk.pack_tails is False  # ~2 partial tiles per document
+    assert _build(spec, tile_layout="chunk256", pack_tails=True).pack_tails is True
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1")
+    assert _build(spec, tile_layout="chunk256", merge_prefix=True).pack_tails is True  # explicit env forces
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "0")
+    assert _build(spec, pack_tails="auto").pack_tails is False
+    other = _build(spec, tile_layout="chunk256", merge_prefix=True, pack_tails=False)
+    assert torch.equal(other.variable_block_sizes, chunk.variable_block_sizes)
+    assert torch.equal(other.untile_combined_index, chunk.untile_combined_index)
+
+
 def test_sparsity_zero_matches_dense_sdpa_chunk256():
     torch.manual_seed(0)
     # ragged token grid (9, 10, 13) = 1170 video rows -> 4 full tiles + 146; prefix 300 | 5 | 130 (merged)
@@ -315,10 +337,15 @@ def test_builder_rejects_bad_tile_layout():
     with pytest.raises(ValueError, match="merge_prefix"):
         _build(_TINY, merge_prefix=True)
     with pytest.raises(ValueError, match="merge_prefix"):
-        MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=_TINY["raw_latent_shape"],
-                                            patch_size=_TINY["patch_size"], VSA_sparsity=0.0,
-                                            prefix_segments=_TINY["prefix_segments"], device=_CPU, exempt=False,
-                                            tile_layout="chunk256", merge_prefix=True)
+        MiniMaxH3VSAMetadataBuilder().build(current_timestep=0,
+                                            raw_latent_shape=_TINY["raw_latent_shape"],
+                                            patch_size=_TINY["patch_size"],
+                                            VSA_sparsity=0.0,
+                                            prefix_segments=_TINY["prefix_segments"],
+                                            device=_CPU,
+                                            exempt=False,
+                                            tile_layout="chunk256",
+                                            merge_prefix=True)
 
 
 if __name__ == "__main__":
