@@ -590,6 +590,23 @@ def _vsa_h3_block_map_fake(query, key, variable_block_sizes, tile_elems, num_pre
     return query.new_empty((query.shape[0], query.shape[2], n_tiles, n_tiles), dtype=torch.bool)
 
 
+# Sibling of vsa_h3_block_map for the fused VC route, whose producer already returns the FP32 tile pools. Top-k from the
+# host metadata INSIDE the body (video tiles = all tiles after the prefix), so no per-document k reaches the graph.
+@torch.library.custom_op("fastvideo_kernel::vsa_h3_block_map_from_pools", mutates_args=())
+def vsa_h3_block_map_from_pools(pool_q: torch.Tensor, pool_k: torch.Tensor, num_prefix_tiles: int, sparsity: float,
+                                topk_cap: int | None, exempt: bool) -> torch.Tensor:
+    num_video_tiles = pool_q.shape[2] - num_prefix_tiles
+    scores = torch.matmul(pool_q, pool_k.transpose(-2, -1)) / (pool_q.shape[-1]**0.5)
+    return _build_block_mask(scores, num_prefix_tiles, num_video_tiles, sparsity, exempt,
+                             _video_topk(sparsity, num_video_tiles, topk_cap))
+
+
+@vsa_h3_block_map_from_pools.register_fake
+def _vsa_h3_block_map_from_pools_fake(pool_q, pool_k, num_prefix_tiles, sparsity, topk_cap, exempt):
+    b, h, n, _ = pool_q.shape
+    return pool_q.new_empty((b, h, n, n), dtype=torch.bool)
+
+
 def _versions_match(state: tuple) -> bool:
     """(tensor, recorded _version, tensor, recorded _version, ...) all unmodified."""
     return all(t._version == v for t, v in zip(state[::2], state[1::2], strict=True))
@@ -718,7 +735,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         # the prepared, static route.
         self._regional_compile_sm100a_enabled: bool | None = None
         # Compiled tile-256 inference route resolved by prepare_for_regional_compile: "bf16" (the opaque CuTe no-grad
-        # op, vsa256_ops.vsa256_nograd_fwd) or None (unavailable; such runs stay eager).
+        # op, vsa256_ops.vsa256_nograd_fwd), "vc" (the opaque fused VC ops, FASTVIDEO_VSA_VC=1) or None (unavailable;
+        # such runs stay eager).
         self._regional_compile_nograd_route: str | None = None
 
     def prepare_for_compile(self, device: torch.device) -> None:
@@ -775,22 +793,25 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             logger.warning_once(f"VSA-H3 regional compile is unavailable and will stay eager: {reason}")
         return reason
 
-    @staticmethod
-    def _resolve_cute256_route(device: torch.device) -> str | None:
-        """"bf16" when tile-256 no-grad calls reach the opaque CuTe op: CuTe backend, SM10x, VC off (the VC route is
-        eager-only)."""
-        if (block_sparse_attn_256_bshd is None or device.type != "cuda"
-                or os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"):
+    def _resolve_cute256_route(self, device: torch.device) -> str | None:
+        """"bf16" when tile-256 no-grad calls reach the opaque CuTe op: CuTe backend, SM10x, VC off. "vc" with
+        FASTVIDEO_VSA_VC=1 when the fused VC ops can run: head 128, probe off, VC-enabled FA4 checkout importable."""
+        if block_sparse_attn_256_bshd is None or device.type != "cuda":
             return None
         from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
         if _resolve_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
             return None
+        vc = os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"
+        if vc and (self.head_size != 128 or probe_enabled() is not None):
+            return None
         try:
-            from fastvideo_kernel.block_sparse_attn_cute_fwd import _load_fa4_cute
+            from fastvideo_kernel.block_sparse_attn_cute_fwd import _load_fa4_cute, _load_vc_module
             _load_fa4_cute()
+            for name in ("vc_vsa_preprocess", "interface") if vc else ():
+                _load_vc_module(name, os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
         except (ImportError, RuntimeError):
             return None
-        return "bf16"
+        return "vc" if vc else "bf16"
 
     def tile(self, x: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Scatter rows into the padded tile buffer (pad positions stay zero).
@@ -868,13 +889,17 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         """True when the no-grad VC (FP8) route applies and Q/K/V can skip the BF16 tile copy.
 
         Exactly the calls that the generic path would send to VC attention (FASTVIDEO_VSA_VC=1 on the CuTe
-        backend, tile 256, no grad, BF16 head 128 on SM10x), minus compile and probe recording, which keep the
-        tiled path. preprocess_qkv and forward both use this predicate, so they always agree.
+        backend, tile 256, no grad, BF16 head 128 on SM10x), minus probe recording, which keeps the tiled path.
+        preprocess_qkv and forward both use this predicate, so they always agree. Capture reads only the route
+        resolved before compile (no env or device query inside the graph).
         """
+        if (attn_metadata.tile_elems != 256 or x.ndim != 4 or not x.is_cuda or x.dtype != torch.bfloat16
+                or x.shape[-1] != 128 or (torch.is_grad_enabled() and x.requires_grad)):
+            return False
+        if torch.compiler.is_compiling():
+            return self._regional_compile_nograd_route == "vc"
         if (os.environ.get("FASTVIDEO_VSA_VC", "0") != "1" or not os.environ.get("FASTVIDEO_VSA_VC_ROOT")
-                or attn_metadata.tile_elems != 256 or block_sparse_attn_256_bshd is None or x.ndim != 4
-                or not x.is_cuda or x.dtype != torch.bfloat16 or x.shape[-1] != 128
-                or (torch.is_grad_enabled() and x.requires_grad) or torch.compiler.is_compiling()):
+                or block_sparse_attn_256_bshd is None):
             return False
         from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
         return (_resolve_backend() == "cutedsl" and torch.cuda.get_device_capability(x.device)[0] == 10
@@ -917,9 +942,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         the VC attention call (on the 128-granularity map, as block_sparse_attn_256_bshd sends no-grad calls)
         are unchanged; the output is in the padded tile layout that postprocess_output expects.
         """
-        from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
-        from fastvideo_kernel.block_sparse_attn_cute_fwd import (block_sparse_attn_vc_prepared_fwd_bshd,
-                                                                 prepare_vsa_vc_fwd_bshd)
+        import fastvideo_kernel.block_sparse_attn_cute_fwd  # noqa: F401 (registers the vc_h3_* ops)
         sizes = attn_metadata.variable_block_sizes
         n_tiles = sizes.numel()
         padded = n_tiles * 256
@@ -927,29 +950,30 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             if tensor.shape[1] != attn_metadata.total_seq_length:
                 raise ValueError(f"VSA-H3 fused VC {name} has length {tensor.shape[1]}, expected the packed length "
                                  f"{attn_metadata.total_seq_length}.")
-        # Rebuilt per call from the authoritative untile index (small next to the attention; never cached by identity).
+        # The padded-row maps are rebuilt per call inside the producer op from the authoritative untile index.
         untile = attn_metadata.untile_combined_index
-        padded_to_original = torch.full((padded, ), -1, dtype=torch.int64, device=query.device)
-        padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=query.device)
-        padded_to_query = torch.arange(padded, dtype=torch.int64, device=query.device)
-
-        p, pools = prepare_vsa_vc_fwd_bshd(query.contiguous(), key.contiguous(), value.contiguous(), padded_to_original,
-                                           sizes, 256, padded_to_query, padded, 0)
-        layer_sparsity = 0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity
-        scores = None
-        if layer_sparsity > 0.0 or gate_compress is not None:
-            scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
-        if scores is None:
-            mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
+        q8, k8, v8, qs, ks, vs, *pools = torch.ops.fastvideo_kernel.vc_h3_prepare_fused(
+            query, key, value, untile, sizes)
+        # Dense-layer decision: tensor-valued under capture (one graph for every layer), as in forward().
+        force_dense = None
+        if torch.compiler.is_compiling() and self._compile_layer_idx is not None:
+            force_dense = (attn_metadata.dense_layers_tensor == self._compile_layer_idx).any()
+            layer_sparsity = attn_metadata.VSA_sparsity
         else:
-            mask = _build_block_mask(scores, attn_metadata.num_prefix_tiles, attn_metadata.num_video_tiles,
-                                     layer_sparsity, attn_metadata.exempt,
-                                     _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
-                                     if layer_sparsity > 0.0 else None)
-        mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(mask, sizes)
-        out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128,
-                                                     alias_guard=attn_metadata.alias_guard_hint)[0].to(query.dtype)
+            layer_sparsity = 0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity
+        if layer_sparsity > 0.0:
+            mask = torch.ops.fastvideo_kernel.vsa_h3_block_map_from_pools(pools[0], pools[1],
+                                                                          attn_metadata.num_prefix_tiles,
+                                                                          layer_sparsity, attn_metadata.video_topk_cap,
+                                                                          attn_metadata.exempt)
+        else:
+            mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
+        if force_dense is not None:
+            mask = mask | force_dense
+        out = torch.ops.fastvideo_kernel.vc_h3_attn_prepared(q8, k8, v8, qs, ks, vs, mask, sizes,
+                                                               attn_metadata.alias_guard_hint)
         if gate_compress is not None:
+            scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
             out_c = torch.matmul(torch.softmax(scores, dim=-1), pools[2]).permute(0, 2, 1, 3).to(out.dtype)
             batch, _, heads, dim = out.shape
             gate = gate_compress.new_zeros(batch, padded, heads, dim)

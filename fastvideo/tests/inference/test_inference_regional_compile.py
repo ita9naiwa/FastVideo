@@ -93,13 +93,18 @@ def test_h3_vsa_unsupported_compile_route_degrades_to_eager(sm100a, tile_size, m
     assert "eager" in reason
 
 
-@pytest.mark.parametrize(("vc", "allowed"), [(False, True), (True, False)])
-def test_h3_vsa_cute_tile256_compile_route(vc, allowed, monkeypatch) -> None:
+@pytest.mark.parametrize(("vc", "vc_root", "allowed"), [(False, None, True), (True, None, False),
+                                                        (True, "/vc-fa4-checkout", True)])
+def test_h3_vsa_cute_tile256_compile_route(vc, vc_root, allowed, monkeypatch) -> None:
     monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
     monkeypatch.delenv("FASTVIDEO_H3_VSA_PROBE", raising=False)
     monkeypatch.delenv("FASTVIDEO_VSA_SM100A", raising=False)
     monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
     monkeypatch.setenv("FASTVIDEO_VSA_VC", "1" if vc else "0")
+    if vc_root is None:
+        monkeypatch.delenv("FASTVIDEO_VSA_VC_ROOT", raising=False)
+    else:  # the loader only checks the env; the impl hook verifies the checkout before capture
+        monkeypatch.setenv("FASTVIDEO_VSA_VC_ROOT", vc_root)
 
     reason = _regional_compile_unsupported_reason(
         _init_params_for("VIDEO_SPARSE_ATTN_H3"),

@@ -395,12 +395,13 @@ def _regional_compile_unsupported_reason(
             return ("FASTVIDEO_H3_VSA_PROBE records tensors and files from the VSA-H3 attention body, which "
                     "regional fullgraph compile cannot capture; this model stays eager")
         if vsa_tile_size == 256:
-            # Tile 256 compiles through the opaque CuTe no-grad op (vsa256_nograd_fwd); Triton and VC stay eager.
+            # Tile 256 compiles through the opaque CuTe no-grad op (vsa256_nograd_fwd), or with FASTVIDEO_VSA_VC=1 through
+            # the fused VC ops (the impl hook resolves the rest of the VC route); Triton stays eager.
             if os.environ.get("FASTVIDEO_VSA_CUTEDSL", "0") != "1":
                 return ("VIDEO_SPARSE_ATTN_H3 tile-256 regional compile requires the CuTe backend "
                         "(FASTVIDEO_VSA_CUTEDSL=1); Triton VSA stays eager")
-            if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
-                return ("VIDEO_SPARSE_ATTN_H3 tile-256 regional compile has no VC route yet "
+            if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1" and not os.environ.get("FASTVIDEO_VSA_VC_ROOT"):
+                return ("VIDEO_SPARSE_ATTN_H3 tile-256 VC regional compile requires FASTVIDEO_VSA_VC_ROOT "
                         "(FASTVIDEO_VSA_VC=1); this model stays eager")
         elif os.environ.get("FASTVIDEO_VSA_SM100A", "0") != "1":
             return ("VIDEO_SPARSE_ATTN_H3 regional compile requires the compile-safe sm_100a route "
