@@ -1,4 +1,6 @@
 """Opt-in tail packing preserves gradients across device-plan/Graph transitions."""
+import inspect
+
 import pytest
 import torch
 
@@ -91,3 +93,79 @@ def test_tail_broadcast_routes_use_native_fallback(monkeypatch, map_shape):
     for expected, got in zip(torch.autograd.grad(ref, (q, k, v), dout),
                              torch.autograd.grad(out, (q, k, v), dout)):
         _check("broadcast gradient", expected, got, _GRAD_TOL)
+
+
+def _poison_case(placement):
+    """Return (sizes, routes, poisoned K/V rows, target rows) for a 6-parent B1 call whose tails fit."""
+    gen = torch.Generator(device='cuda').manual_seed(613)
+    routes = torch.rand(1, 2, 6, 6, device='cuda', generator=gen) > .4
+    if placement == 'pad_row0':  # sizes[0] == 0: row 0 is padding
+        return [0, 131, 256, 140, 150, 256], routes, slice(0, 256), slice(256, None)
+    if placement == 'unreachable_row0':  # parent 0 has no tail and is never selected
+        routes[..., 0] = False
+        return [256, 131, 256, 140, 150, 128], routes, slice(0, 256), slice(0, None)
+    # Two documents packed block-diagonally: X = parents 0-1, target Y = parents 2-5.
+    routes[..., :2, 2:] = False
+    routes[..., 2:, :2] = False
+    if placement == 'other_doc_row0':  # X has no tails, so row 0 is reachable only via invalid slots
+        return [256, 256, 131, 256, 140, 150], routes, slice(0, 256), slice(512, None)
+    assert placement == 'other_doc_valid_tail'  # X's valid tail tokens share the packed tile with Y's tails
+    return [131, 256, 131, 256, 140, 150], routes, slice(128, 131), slice(512, None)
+
+
+@pytest.mark.parametrize('poison', [float('nan'), float('inf'), float('-inf'), torch.finfo(torch.bfloat16).max])
+@pytest.mark.parametrize('placement', [
+    'pad_row0', 'unreachable_row0', 'other_doc_row0',
+    pytest.param('other_doc_valid_tail', marks=pytest.mark.xfail(
+        strict=True, reason='known limitation: the global tail plan co-packs valid tails of different '
+        'parents/documents, so dO.V^T of a non-finite valid token reaches dS = 0 * NaN; needs a per-document plan')),
+])
+def test_tail_backward_invalid_slot_poison(placement, poison):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip('SM100 GPU required')
+    pytest.importorskip("flash_attn.cute.interface")
+    from fastvideo_kernel.vsa_tail_backward import TailTraining, _prepare
+    if "_workspace" not in inspect.signature(adapter._load_fa4_cute()[3]).parameters:
+        pytest.skip("FA4 backward workspace support required")
+    sizes, routes, bad, target = _poison_case(placement)
+    sizes = torch.tensor(sizes, device='cuda', dtype=torch.int32)
+    valid = _prepare(routes, sizes)[2][2]
+    assert valid.any() and not valid.all(), 'case must pack tails and leave invalid slots'
+    torch.manual_seed(614)
+    q, k, v, dout = [torch.randn(1, 1536, 2, 128, device='cuda', dtype=torch.bfloat16) for _ in range(4)]
+    k_bad, v_bad = k.clone(), v.clone()
+    k_bad[:, bad] = poison
+    v_bad[:, bad] = poison
+
+    def call(fn, k, v):
+        leaves = [t.detach().requires_grad_(True) for t in (q, k, v)]
+        out, lse = fn(*leaves, routes, sizes)
+        return (out, lse, *torch.autograd.grad(out, leaves, dout))
+
+    clean = call(TailTraining.apply, k, v)
+    ref = call(adapter._CuteAttentionQ256Training.apply, k_bad, v_bad)
+    got = call(TailTraining.apply, k_bad, v_bad)
+    for name, c, r, g in zip(('O', 'LSE', 'dQ', 'dK', 'dV'), clean, ref, got):
+        c, r, g = (x[:, :, target] if name == 'LSE' else x[:, target] for x in (c, r, g))
+        if name == 'dQ':
+            _check(name, c, g, _GRAD_TOL)
+        else:
+            assert torch.equal(c, g), f'{name} changed by poison outside the target rows'
+        if name in ('dQ', 'dK', 'dV'):
+            _check(f'{name} vs PACK_TAILS=0', r, g, _GRAD_TOL)
+
+    # CUDA-graph replay on the poisoned inputs matches eager.
+    leaves = [t.detach().requires_grad_(True) for t in (q, k_bad, v_bad)]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            torch.autograd.grad(TailTraining.apply(*leaves, routes, sizes)[0], leaves, dout)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        replayed = torch.autograd.grad(TailTraining.apply(*leaves, routes, sizes)[0], leaves, dout)
+    graph.replay()
+    torch.cuda.synchronize()
+    for name, e, g in zip(('dQ', 'dK', 'dV'), got[2:], replayed):
+        _check(f'replayed {name}', e[:, target], g[:, target], _GRAD_TOL)

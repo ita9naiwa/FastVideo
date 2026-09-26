@@ -128,8 +128,12 @@ class TailTraining(torch.autograd.Function):
             aux_tensors=[child_sizes], block_sparse_tensors=full, dlse=dlse,
             _return_workspace=True,
         )
+        # Invalid slots gather row 0; zero them so a non-finite row cannot leak as 0 * NaN.
+        invalid = ~valid.view(1, -1, 1, 1)
+        packed_k = k.index_select(1, index).masked_fill_(invalid, 0)
+        packed_v = v.index_select(1, index).masked_fill_(invalid, 0)
         _, packed_dk, packed_dv = backward(
-            q, k.index_select(1, index), v.index_select(1, index), out, dout, lse,
+            q, packed_k, packed_v, out, dout, lse,
             mask_mod=_tail_mask_mod(), aux_tensors=[routes, parents, valid],
             block_sparse_tensors=sparse, dlse=dlse, dq=dq, _workspace=workspace,
         )
