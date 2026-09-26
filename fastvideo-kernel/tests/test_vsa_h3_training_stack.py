@@ -113,7 +113,9 @@ def _impl(heads):
 
 
 def _meta(spec=_BIG, layout="cube", merge=False, **opts):
+    """Test metadata; pack_tails defaults to True (always pack) so pruning is reachable, "auto" = the policy."""
     from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAMetadataBuilder
+    opts.setdefault("pack_tails", True)
     return MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, VSA_sparsity=opts.pop("VSA_sparsity", 0.75),
                                                device=torch.device("cuda"),
                                                tile_layout=layout, merge_prefix=merge, **spec, **opts)
@@ -198,33 +200,60 @@ def _op_grads(qkv, block_map, sizes, dout, dlse=None, compiled=False, **kw):
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "fullgraph"])
-@pytest.mark.parametrize("pack", ["1", "0"], ids=["pack1", "pack0"])
-def test_f1_public_dispatch_reach(monkeypatch, reach, pack, compiled):
-    """Real H3 layer block, cube: the vsa256 op pair runs (eager and fullgraph dynamic), the pack policy
-    (FASTVIDEO_VSA_PACK_TAILS, the seam default) reaches the backward, query pruning reaches the packed backward; each
-    arm equals the pruning-off eager arm."""
-    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", pack)
+@pytest.mark.parametrize("pack", [True, False, "auto"], ids=["pack1", "pack0", "auto"])
+def test_f1_public_dispatch_reach(reach, pack, compiled):
+    """Real H3 layer block, cube: the vsa256 op pair runs (eager and fullgraph dynamic), the metadata pack policy
+    (builder pack_tails True / False / "auto") reaches the backward as the op's static bool, query pruning reaches the
+    packed backward; each arm equals the pruning-off eager arm with the same policy."""
     impl = _impl(8)
-    meta = _meta(**_ALL_ON)
+    meta = _meta(pack_tails=pack, **_ALL_ON)
+    if pack == "auto":
+        pack = meta.pack_tails
+    assert meta.pack_tails is pack
     assert bool((meta.variable_block_sizes <= 128).any())
     leaves, dout = _leaves(meta, 8)
-    ref = _run(_layer_block(impl, _meta(**_ALL_OFF)), leaves, dout)
+    ref = _run(_layer_block(impl, _meta(pack_tails=meta.pack_tails, **_ALL_OFF)), leaves, dout)
     _clear(reach)
     block = _layer_block(impl, meta)
     got, ops = _op_calls(_run, torch.compile(block, fullgraph=True, dynamic=True) if compiled else block, leaves, dout)
     assert ops >= 1 and len(reach["fwd"]) == 1  # the compiled profile also lists the op's inner call events
-    assert reach["tail"] == ([True] if pack == "1" else [])
-    assert reach["prepare"] == ([True] if pack == "1" else [])  # cube + trusted geometry: pruned main lists
+    assert reach["tail"] == ([True] if pack else [])
+    assert reach["prepare"] == ([True] if pack else [])  # cube + trusted geometry: pruned main lists
     _same(f"pack={pack} compiled={compiled}", got, ref)
+
+
+def test_f1_policy_decided_once_in_builder(monkeypatch, reach):
+    """pack_tails="auto": the builder reads the environment once; later environment changes do not reach the op."""
+    meta = _meta(pack_tails="auto", **_ALL_ON)
+    policy = meta.pack_tails
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "0" if policy else "1")
+    leaves, dout = _leaves(meta, 8, seed=2)
+    _run(_layer_block(_impl(8), meta), leaves, dout)
+    assert reach["tail"] == ([True] if policy else [])
+
+
+@pytest.mark.parametrize("pack", [True, "auto"], ids=["policy_off_always_pack", "policy_on_auto"])
+def test_f1_pack_policy_flag_reach(reach, pack):
+    """Same-head ablation of the pack policy: pack_tails=True (policy OFF = the pre-policy default, always pack)
+    vs "auto" (policy ON): the op's static bool follows the metadata; results equal the matching reference."""
+    impl = _impl(8)
+    meta = _meta(pack_tails=pack, **_ALL_ON)
+    leaves, dout = _leaves(meta, 8, seed=4)
+    _clear(reach)
+    got = _run(_layer_block(impl, meta), leaves, dout)
+    assert reach["tail"] == ([True] if meta.pack_tails else [])
+    print("ablation-diagnostic", json.dumps(dict(pack_tails_request=str(pack), effective_pack_tails=meta.pack_tails)))
+    ref = _run(_layer_block(impl, _meta(pack_tails=meta.pack_tails, **_ALL_OFF)), leaves, dout)
+    _same(f"pack={pack}", got, ref)
 
 
 @pytest.mark.parametrize("on", [False, True], ids=["pruning_off", "pruning_on"])
 def test_f1_ablation_flags_reach(reach, on):
     """The query_pad_pruning metadata flag switches exactly its option (diagnostic: pruned Q128 children)."""
     impl = _impl(8)
-    meta = _meta(query_pad_pruning=on)
+    meta = _meta(pack_tails=True, query_pad_pruning=on)
     leaves, dout = _leaves(meta, 8, seed=1)
-    ref = _run(_layer_block(impl, _meta(**_ALL_OFF)), leaves, dout)
+    ref = _run(_layer_block(impl, _meta(pack_tails=True, **_ALL_OFF)), leaves, dout)
     _clear(reach)
     got = _run(_layer_block(impl, meta), leaves, dout)
     qs = reach["prepare_sizes"][0]
@@ -830,9 +859,9 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
     if spec == "pack1_witness":
         if layout != "cube":
             pytest.skip("the auto-PACK1 witnesses are cube documents")
-        # The two frozen cube documents the (conditional, not yet merged) auto policy packs (pack2/doc4, pack3/doc9),
-        # at the primary s085k32 operating point. In this subset every document runs PACK1 (seam default); the
-        # witnesses stay as the policy's future PACK1 reach.
+        # The two frozen cube documents the auto policy packs (pack2/doc4, pack3/doc9; the policy is geometry-only),
+        # at the primary s085k32 operating point. pack_tails is a static bool, so PACK1 is its own compiled graph:
+        # one graph per static policy value, no recompile within.
         name = "h3-real-shape-spec-s085k32.json"
         by_label = {d[0]: d for d in _real_docs(10**6, name)}
         docs = [by_label[f"{name}:s0.85k32:pack2:doc4"], by_label[f"{name}:s0.85k32:pack3:doc9"]]
@@ -843,7 +872,7 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
     assert len({(tuple(d[2]["latent_grid_THW"]), tuple(n for _, n in d[2]["segments"])) for d in docs}) >= \
         (2 if spec == "pack1_witness" else 10)
     assert len({d[1] for d in docs}) == (len(_SPECS) if spec is None else 1)
-    parity = []
+    parity, policies = [], set()
     import fastvideo.attention.backends.video_sparse_attn_h3 as h3
     torch._dynamo.reset()
     counters.clear()
@@ -857,6 +886,7 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
                                  device=torch.device("cuda"), tile_layout=layout, merge_prefix=merge,
                                  topk_cap=cap, **_ALL_ON)
             assert meta.total_seq_length == doc["rows"], label
+            policies.add(meta.pack_tails)
             if cap is not None:  # s085k32 v4: builder k == the spec's exact rule, per document
                 n = meta.num_video_tiles
                 assert meta.video_topk == max(1, min((3 * n + 19) // 20, int(cap), n)), (label, n, meta.video_topk)
@@ -881,14 +911,15 @@ def test_f4_h3mh_compile_mode_sac_real_shapes(monkeypatch, reach, layout, merge,
             reach["maps"] = None
             _clear(reach)
             _run(lambda q, k, v: compiled(q, k, v, meta), leaves, dout)  # reach of a clean compiled call
-            assert len(reach["fwd"]) == 1 and reach["tail"] == [True], label  # PACK1 (seam default)
-            assert reach["prepare"] == [layout == "cube"], label  # cube: compiled query pruning
+            assert len(reach["fwd"]) == 1 and reach["tail"] == ([True] if meta.pack_tails else []), label
+            assert reach["prepare"] == ([layout == "cube"] if meta.pack_tails else []), label  # compiled pruning
     graphs = counters["stats"]["unique_graphs"]
     breaks = sum(counters["graph_break"].values())
     print(f"h3mh-compile {layout} {spec}: docs={[d[0] for d in docs]} unique_graphs={graphs} graph_breaks={breaks} "
           f"flip_docs={[r['doc'] for r in parity if r['flipped_blocks']]}")
     for r in parity:
         print("h3mh-parity", json.dumps(r))
+    assert policies == ({True} if spec == "pack1_witness" else {False}), policies  # one static policy per corpus
     if spec == "pack1_witness":
         assert reach["tail"] and reach["prepare"] == [True], "PACK1 witness must run the pruned packed backward"
     assert breaks == 0 and graphs == 1, (graphs, dict(counters["graph_break"]), dict(counters["frames"]))
