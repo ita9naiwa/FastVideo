@@ -218,3 +218,49 @@ def test_public_route_invalid_slot_poison_eager_and_fullgraph(monkeypatch, poiso
                 _check('dQ compiled vs eager', p, c, _GRAD_TOL)
             else:
                 assert torch.equal(c, p), f'{name} compiled != eager'
+
+
+def test_tail_query_sizes_skip_padded_children(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
+    pytest.importorskip("flash_attn.cute.interface")
+    from fastvideo_kernel import vsa_tail_backward as tail
+    monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1")
+    torch.manual_seed(613)
+    sizes = torch.tensor([256, 129, 128, 1, 0, 200], device="cuda", dtype=torch.int32)
+    routes = torch.rand(2, 3, 6, 6, device="cuda") > .4
+    q, k, v = [torch.randn(2, 1536, 3, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    # Main lists keep exactly the Q128 children that hold a valid query row.
+    live = torch.stack((sizes > 0, sizes > 128), -1).flatten()
+    base, cand = tail._prepare(routes, sizes)[0], tail._prepare(routes, sizes, sizes)[0]
+    assert cand.block_size == (128, 128)
+
+    def child_counts(sparse, kind, factor):
+        idx, cnt = getattr(sparse, f"{kind}_block_idx"), getattr(sparse, f"{kind}_block_cnt")
+        counts = torch.zeros(*cnt.shape, 12, dtype=torch.int32, device="cuda")
+        for j in range(idx.shape[-1]):
+            for c in range(factor):
+                child = (idx[..., j] * factor + c).clamp(0, 11).long()[..., None]
+                counts.scatter_add_(-1, child, (j < cnt)[..., None].int())
+        return counts
+
+    for kind in ("full", "mask"):
+        assert torch.equal(child_counts(cand, kind, 1), child_counts(base, kind, 2) * live)
+
+    pad = (torch.arange(256, device="cuda") >= sizes[:, None]).flatten()
+    dout = torch.randn_like(q).masked_fill(pad[None, :, None, None], 0)
+    dlse = torch.randn(2, 3, 1536, device="cuda") * .1
+
+    def grads(query_sizes, with_lse):
+        leaves = [t.detach().requires_grad_(True) for t in (q, k, v)]
+        out, lse = tail.TailTraining.apply(*leaves, routes, sizes, query_sizes)
+        if with_lse:
+            return torch.autograd.grad((out, lse), leaves, (dout, dlse.masked_fill(~torch.isfinite(lse), 0)))
+        return torch.autograd.grad(out, leaves, dout)
+
+    for with_lse in (False, True):
+        ref, got = grads(None, with_lse), grads(sizes, with_lse)
+        _check("query-size gradient", ref[0], got[0], _GRAD_TOL)
+        torch.testing.assert_close(got[1], ref[1], rtol=0, atol=0)
+        torch.testing.assert_close(got[2], ref[2], rtol=0, atol=0)
+    assert torch.count_nonzero(grads(sizes, False)[0][:, pad]) == 0

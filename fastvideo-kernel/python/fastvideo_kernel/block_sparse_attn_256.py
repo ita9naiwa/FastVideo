@@ -215,11 +215,14 @@ def block_sparse_attn_256_bshd(
     v: torch.Tensor,
     logical_block_map_256: torch.Tensor,
     logical_variable_block_sizes_256: torch.Tensor,
+    query_sizes: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, S, H, D] inputs.
 
     Default CuTe path consumes BSHD directly; Triton fallback transposes
-    to BHSD as the legacy path expects.
+    to BHSD as the legacy path expects. ``query_sizes``: optional caller
+    guarantee that query rows past each tile's valid prefix get zero output
+    gradient (see ``block_sparse_attn_cute_fwd._cute_attention``).
     """
     if logical_block_map_256.dim() == 3:
         logical_block_map_256 = logical_block_map_256.unsqueeze(0)

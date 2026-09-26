@@ -36,7 +36,7 @@ def _tail_mask_mod():
     return mask
 
 
-def _prepare(routes, sizes):
+def _prepare(routes, sizes, query_sizes=None):
     lengths = sizes.clamp(0, 256)
     counts = lengths.remainder(128)
     ends = counts.cumsum(0)
@@ -53,10 +53,18 @@ def _prepare(routes, sizes):
 
     child_sizes = torch.stack((lengths.clamp_max(128), (lengths - 128).clamp(0, 128)), -1).flatten()
     child_routes = routes.repeat_interleave(2, -1)
+    q_block = 256
+    if query_sizes is not None:
+        # Caller contract: rows at or past query_sizes[parent] get zero dO and dLSE is absent,
+        # so a wholly padded Q128 child adds nothing to dK/dV. List main-backward Q128 children
+        # and drop those; packed-tail lists below keep their Q256 parents.
+        live = torch.stack((query_sizes > 0, query_sizes > 128), -1).flatten()
+        child_routes = child_routes.repeat_interleave(2, 2) & live.view(1, 1, -1, 1)
+        q_block = 128
     _, full = adapter._build_sparse_tensors(
         child_routes, child_sizes, q_len=routes.shape[2] * 256,
-        q_block_size=256, kv_block_size=128, need_backward=True,
-        need_forward=False, force_q_sparse_block_size=256,
+        q_block_size=q_block, kv_block_size=128, need_backward=True,
+        need_forward=False, force_q_sparse_block_size=q_block,
     )
     full = full._replace(mask_block_cnt=torch.where(fits, 0, full.mask_block_cnt))
     sparse_type = adapter._load_fa4_cute()[0]
@@ -100,7 +108,7 @@ def scatter(dk, dv, tk, tv, index, valid):
 
 class TailTraining(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, routes, sizes):
+    def forward(ctx, q, k, v, routes, sizes, query_sizes=None):
         _, _, forward, backward = adapter._load_fa4_cute()
         _check_workspace_support(backward)
         sparse, _ = adapter._build_sparse_tensors(
@@ -111,23 +119,25 @@ class TailTraining(torch.autograd.Function):
             q, k, v, mask_mod=adapter._build_vbs_vector_mask_mod(256),
             aux_tensors=[sizes], block_sparse_tensors=sparse, return_lse=True,
         )[:2]
-        ctx.save_for_backward(q, k, v, out, lse, routes, sizes)
+        ctx.save_for_backward(q, k, v, out, lse, routes, sizes, query_sizes)
         ctx.set_materialize_grads(False)
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, out, lse, routes, sizes = ctx.saved_tensors
+        q, k, v, out, lse, routes, sizes, query_sizes = ctx.saved_tensors
         dout = torch.zeros_like(out) if dout is None else dout
-        return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse), None, None)
+        return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes), None, None, None)
 
 
-def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse):
+def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse, query_sizes=None):
     """PACK_TAILS backward body (shared by TailTraining and the vsa256_bwd custom op): full-tile launch, then the
-    packed-tail launch accumulating into the same dQ, scattered back into dK/dV."""
+    packed-tail launch accumulating into the same dQ, scattered back into dK/dV. ``query_sizes`` (caller guarantee:
+    rows past each parent's valid prefix get zero dO) lets the main backward skip wholly padded Q128 children; a present
+    dLSE always keeps the full lists."""
     dout = dout.contiguous()
     dlse = dlse.contiguous() if dlse is not None else None
-    full, child_sizes, tail = _prepare(routes, sizes)
+    full, child_sizes, tail = _prepare(routes, sizes, query_sizes if dlse is None else None)
     index, parents, valid, sparse = tail
     _, _, _, backward = adapter._load_fa4_cute()
     dq, dk, dv, workspace = backward(

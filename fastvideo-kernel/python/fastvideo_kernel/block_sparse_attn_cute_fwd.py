@@ -440,8 +440,13 @@ def _cute_attention(
     v_bshd: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    query_sizes: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run FA4's autograd-enabled block-sparse attention with BSHD inputs."""
+    """Run FA4's autograd-enabled block-sparse attention with BSHD inputs.
+
+    ``query_sizes`` (per Q256 parent valid-prefix rows) is a caller guarantee that every
+    row past it receives zero output gradient; only the packed-tail backward uses it.
+    """
     if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
         return _vc_sparse_attention(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     _, flash_attn_func, _, _ = _load_fa4_cute()
@@ -460,7 +465,9 @@ def _cute_attention(
                 and block_map.shape[:2] == (q_bshd.shape[0], q_bshd.shape[2])
                 and all(t.is_contiguous() for t in (q_bshd, k_bshd, v_bshd))):
             from fastvideo_kernel.vsa_tail_backward import TailTraining
-            return TailTraining.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
+            if query_sizes is not None and query_sizes.shape != (block_map.shape[2], ):
+                query_sizes = None
+            return TailTraining.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes, query_sizes)
         return _CuteAttentionQ256Training.apply(q_bshd, k_bshd, v_bshd, block_map, variable_block_sizes)
     forward_sparse_tensors, backward_sparse_tensors = _build_sparse_tensors(
         block_map,
@@ -686,6 +693,7 @@ def block_sparse_attn_cute_fwd_bshd(
     v: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    query_sizes: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
     if block_map.dim() == 3:
@@ -697,6 +705,7 @@ def block_sparse_attn_cute_fwd_bshd(
         v,
         block_map,
         variable_block_sizes,
+        query_sizes,
     )
     # lse is [B, H, S] regardless of the q/k/v layout; see above.
     return out, lse.detach()

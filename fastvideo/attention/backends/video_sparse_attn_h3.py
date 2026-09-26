@@ -414,6 +414,13 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
                 and metadata.tile_partition_indices._version == 0 and metadata.non_pad_index._version == 0):
             metadata._tile_index_state = (metadata.tile_partition_indices, 0, metadata.non_pad_index, 0)
+        # _h3_tile_geometry validated that this untile index reads only non-pad rows of these sizes,
+        # so postprocess_output leaves padded query rows with zero output gradient. Trust the pair
+        # only while both tensors are the unmodified cached objects.
+        untile, sizes = metadata.untile_combined_index, metadata.variable_block_sizes
+        if (tile_layout == "cube" and not untile.is_inference() and not sizes.is_inference()
+                and untile._version == 0 and sizes._version == 0):
+            metadata._query_pad_state = (untile, 0, sizes, 0)
         return metadata
 
 
@@ -911,12 +918,21 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 out_bhsd = out_bhsd[:, :, :logical_seq_len]
             out = out_bhsd.transpose(1, 2).contiguous()
         else:
+            # Padded query rows get zero dO through postprocess_output's untile gather, which lets
+            # the CuTe backward skip wholly padded Q128 children (the LSE output is discarded).
+            state = getattr(attn_metadata, "_query_pad_state", None)
+            query_sizes = None
+            if (logical_gate is None and state is not None and state[0] is attn_metadata.untile_combined_index
+                    and state[2] is attn_metadata.variable_block_sizes and state[0]._version == state[1]
+                    and state[2]._version == state[3]):
+                query_sizes = attn_metadata.variable_block_sizes
             out, _ = block_sparse_attn_256_bshd(
                 logical_query,
                 logical_key,
                 logical_value,
                 mask,
                 attn_metadata.variable_block_sizes,
+                query_sizes=query_sizes,
             )
 
         if logical_gate is not None:
