@@ -39,16 +39,8 @@ def vsa256_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Te
     dlse = dlse.contiguous() if dlse is not None else None
     _, _, _, flash_attn_bwd = adapter._load_fa4_cute()
     if pack_tails:
-        from fastvideo_kernel.vsa_tail_backward import _prepare, _tail_mask_mod, scatter
-        full, child_sizes, (index, parents, valid, tails) = _prepare(block_map, sizes)
-        dq, dk, dv, workspace = flash_attn_bwd(q, k, v, out, dout, lse, mask_mod=adapter._build_vbs_mask_mod(128),
-                                               aux_tensors=[child_sizes], block_sparse_tensors=full, dlse=dlse,
-                                               _return_workspace=True)
-        _, packed_dk, packed_dv = flash_attn_bwd(q, k.index_select(1, index), v.index_select(1, index), out, dout, lse,
-                                                 mask_mod=_tail_mask_mod(), aux_tensors=[block_map, parents, valid],
-                                                 block_sparse_tensors=tails, dlse=dlse, dq=dq, _workspace=workspace)
-        scatter(dk, dv, packed_dk, packed_dv, index, valid)
-        return dq, dk, dv
+        from fastvideo_kernel.vsa_tail_backward import tail_backward
+        return tail_backward(dout, q, k, v, out, lse, block_map, sizes, dlse)
     # A partially filled logical block can contain a full physical KV tile: classify 128-token children so backward
     # does not mask that full tile (planning moved here from the old forward; same tensors, built once).
     child_sizes = torch.stack((sizes.clamp(0, 128), (sizes - 128).clamp(0, 128)), -1).flatten()

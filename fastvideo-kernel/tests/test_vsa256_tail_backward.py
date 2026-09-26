@@ -120,11 +120,16 @@ def _poison_case(placement):
         strict=True, reason='known limitation: the global tail plan co-packs valid tails of different '
         'parents/documents, so dO.V^T of a non-finite valid token reaches dS = 0 * NaN; needs a per-document plan')),
 ])
-def test_tail_backward_invalid_slot_poison(placement, poison):
+@pytest.mark.parametrize('entry', ['autograd_function', 'custom_op'])
+def test_tail_backward_invalid_slot_poison(placement, poison, entry):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip('SM100 GPU required')
     pytest.importorskip("flash_attn.cute.interface")
     from fastvideo_kernel.vsa_tail_backward import TailTraining, _prepare
+    if entry == 'custom_op':  # the fullgraph seam (vsa256_fwd/bwd) must share the fixed tail backward
+        from fastvideo_kernel import vsa256_ops  # noqa: F401
+        TailTraining = type('TailOp', (), {'apply': staticmethod(
+            lambda q, k, v, routes, sizes: torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, routes, sizes, True))})
     if "_workspace" not in inspect.signature(adapter._load_fa4_cute()[3]).parameters:
         pytest.skip("FA4 backward workspace support required")
     sizes, routes, bad, target = _poison_case(placement)

@@ -118,24 +118,31 @@ class TailTraining(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, dlse):
         q, k, v, out, lse, routes, sizes = ctx.saved_tensors
-        dout = torch.zeros_like(out) if dout is None else dout.contiguous()
-        dlse = dlse.contiguous() if dlse is not None else None
-        full, child_sizes, tail = _prepare(routes, sizes)
-        index, parents, valid, sparse = tail
-        _, _, _, backward = adapter._load_fa4_cute()
-        dq, dk, dv, workspace = backward(
-            q, k, v, out, dout, lse, mask_mod=adapter._build_vbs_mask_mod(128),
-            aux_tensors=[child_sizes], block_sparse_tensors=full, dlse=dlse,
-            _return_workspace=True,
-        )
-        # Invalid slots gather row 0; zero them so a non-finite row cannot leak as 0 * NaN.
-        invalid = ~valid.view(1, -1, 1, 1)
-        packed_k = k.index_select(1, index).masked_fill_(invalid, 0)
-        packed_v = v.index_select(1, index).masked_fill_(invalid, 0)
-        _, packed_dk, packed_dv = backward(
-            q, packed_k, packed_v, out, dout, lse,
-            mask_mod=_tail_mask_mod(), aux_tensors=[routes, parents, valid],
-            block_sparse_tensors=sparse, dlse=dlse, dq=dq, _workspace=workspace,
-        )
-        scatter(dk, dv, packed_dk, packed_dv, index, valid)
-        return dq, dk, dv, None, None
+        dout = torch.zeros_like(out) if dout is None else dout
+        return (*tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse), None, None)
+
+
+def tail_backward(dout, q, k, v, out, lse, routes, sizes, dlse):
+    """PACK_TAILS backward body (shared by TailTraining and the vsa256_bwd custom op): full-tile launch, then the
+    packed-tail launch accumulating into the same dQ, scattered back into dK/dV."""
+    dout = dout.contiguous()
+    dlse = dlse.contiguous() if dlse is not None else None
+    full, child_sizes, tail = _prepare(routes, sizes)
+    index, parents, valid, sparse = tail
+    _, _, _, backward = adapter._load_fa4_cute()
+    dq, dk, dv, workspace = backward(
+        q, k, v, out, dout, lse, mask_mod=adapter._build_vbs_mask_mod(128),
+        aux_tensors=[child_sizes], block_sparse_tensors=full, dlse=dlse,
+        _return_workspace=True,
+    )
+    # Invalid slots gather row 0; zero them so a non-finite row cannot leak as 0 * NaN.
+    invalid = ~valid.view(1, -1, 1, 1)
+    packed_k = k.index_select(1, index).masked_fill_(invalid, 0)
+    packed_v = v.index_select(1, index).masked_fill_(invalid, 0)
+    _, packed_dk, packed_dv = backward(
+        q, packed_k, packed_v, out, dout, lse,
+        mask_mod=_tail_mask_mod(), aux_tensors=[routes, parents, valid],
+        block_sparse_tensors=sparse, dlse=dlse, dq=dq, _workspace=workspace,
+    )
+    scatter(dk, dv, packed_dk, packed_dv, index, valid)
+    return dq, dk, dv
