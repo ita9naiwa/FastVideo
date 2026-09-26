@@ -332,3 +332,14 @@ if __name__ == "__main__":
     test_geometry_guard_enforces_tile64_bound()
     test_builder_rejects_unknown_tile_size()
     print("all VSA-H3 CPU checks passed")
+
+
+@pytest.mark.parametrize("n_blocks", [20, 40, 60, 80, 100, 120, 160, 19, 33])
+def test_compute_topk_is_exact(n_blocks):
+    from fastvideo.attention.backends.video_sparse_attn import compute_topk
+    assert compute_topk(0.85, n_blocks) == (3 * n_blocks + 19) // 20  # float ceil gave one more at multiples of 20
+    assert compute_topk(0.75, n_blocks) == (n_blocks + 3) // 4
+    assert compute_topk(0.9, n_blocks) == (n_blocks + 9) // 10
+    assert compute_topk(1e-9, n_blocks) == n_blocks
+    for k in range(1, n_blocks + 1):  # the per-document midpoint encoding used to pin k through the sparsity
+        assert compute_topk(1 - (k - 0.5) / n_blocks, n_blocks) == k

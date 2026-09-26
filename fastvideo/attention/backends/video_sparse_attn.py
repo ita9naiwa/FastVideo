@@ -162,8 +162,13 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
 
 
 def compute_topk(sparsity: float, num_blocks: int) -> int:
-    """Blocks to keep for a sparsity level, clamped to [1, num_blocks]."""
-    return max(1, min(math.ceil((1 - sparsity) * num_blocks), num_blocks))
+    """Blocks to keep for a sparsity level, clamped to [1, num_blocks].
+
+    ceil((1 - sparsity) * num_blocks) in exact integer arithmetic on the keep fraction in parts per million: the float
+    product overshoots at exact multiples (1 - 0.85 = 0.15000000000000002, so 20 blocks gave 4 instead of 3).
+    """
+    keep_ppm = round((1 - sparsity) * 1_000_000)
+    return max(1, min(-(-keep_ppm * num_blocks // 1_000_000), num_blocks))
 
 
 def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
