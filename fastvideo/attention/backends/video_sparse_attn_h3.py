@@ -466,8 +466,8 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         # so postprocess_output leaves padded query rows with zero output gradient. Trust the pair
         # only while both tensors are the unmodified cached objects.
         untile, sizes = metadata.untile_combined_index, metadata.variable_block_sizes
-        if (tile_layout == "cube" and not untile.is_inference() and not sizes.is_inference()
-                and untile._version == 0 and sizes._version == 0):
+        if (tile_layout == "cube" and not untile.is_inference() and not sizes.is_inference() and untile._version == 0
+                and sizes._version == 0):
             metadata._query_pad_state = (untile, 0, sizes, 0)
         return metadata
 
@@ -567,8 +567,8 @@ def _vsa_h3_untile_fwd_fake(output, untile, source, pad_rows, partition, nonpad,
 @torch.library.custom_op("fastvideo_kernel::vsa_h3_untile_bwd", mutates_args=())
 def vsa_h3_untile_bwd(grad: torch.Tensor, untile: torch.Tensor, source: torch.Tensor, pad_rows: torch.Tensor,
                       partition: torch.Tensor, nonpad: torch.Tensor, versions: list[int]) -> torch.Tensor:
-    if _versions_match((untile, versions[0], source, versions[1], pad_rows, versions[2], partition, versions[3], nonpad,
-                        versions[4])):
+    if _versions_match(
+        (untile, versions[0], source, versions[1], pad_rows, versions[2], partition, versions[3], nonpad, versions[4])):
         return _gather_tile_rows(grad, source).index_fill_(1, pad_rows, 0)
     zeros = grad.new_zeros((grad.shape[0], source.shape[0], *grad.shape[2:]))
     return torch.ops.aten.index_put_.default(zeros, [None, untile], grad, True)  # IndexBackward0's computation
@@ -620,10 +620,9 @@ def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> 
             and tile_state[2] is attn_metadata.non_pad_index and state[2].device == output.device
             and output.shape[1] == state[2].numel()
             and (torch.compiler.is_compiling() or (_versions_match(tile_state) and _versions_match(state)))):
-        return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(output, untile, state[2], state[4], tile_state[0],
-                                                             tile_state[2],
-                                                             [state[1], state[3], state[5], tile_state[1],
-                                                              tile_state[3]])
+        return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(
+            output, untile, state[2], state[4], tile_state[0], tile_state[2],
+            [state[1], state[3], state[5], tile_state[1], tile_state[3]])
     return output[:, untile]
 
 
@@ -863,7 +862,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         CuTe training keeps ``qkv`` as one autograd input so backward writes a
         single fused gradient instead of a ChunkBackward concat.
         """
-        return self.forward(*qkv.chunk(3, dim=0), None, attn_metadata,
+        return self.forward(*qkv.chunk(3, dim=0),
+                            None,
+                            attn_metadata,
                             qkv=qkv if attn_metadata.fused_qkv_grad else None)
 
     def forward(  # type: ignore[override]
