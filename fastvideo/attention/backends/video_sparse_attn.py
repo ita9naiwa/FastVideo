@@ -249,7 +249,11 @@ class _TilePermutation(torch.autograd.Function):
                     x.shape[0] * padded_length * x.shape[2] * x.shape[3]) < 2**31):
             return _compiled_tile_copy()(x, source, padding)
         out = _gather_tile_rows(x, source)
-        out.masked_fill_(padding[None, :, None, None], 0)
+        # Zero only the pad rows: the bijective partition fixes their count from shapes, so a fixed-size compaction
+        # (no device-dependent output size, no host sync) replaces a masked fill over every element.
+        pad_count = padded_length - partition.numel()
+        if pad_count:
+            out.index_fill_(1, torch.nonzero_static(padding, size=pad_count).flatten(), 0)
         return out
 
     @staticmethod
