@@ -174,3 +174,47 @@ def test_tail_backward_invalid_slot_poison(placement, poison, entry):
     torch.cuda.synchronize()
     for name, e, g in zip(('dQ', 'dK', 'dV'), got[2:], replayed):
         _check(f'replayed {name}', e[:, target], g[:, target], _GRAD_TOL)
+
+
+@pytest.mark.parametrize('poison', [float('nan'), float('inf')])
+def test_public_route_invalid_slot_poison_eager_and_fullgraph(monkeypatch, poison):
+    """Public training entry (block_sparse_attn_256_bshd -> vsa256_fwd/bwd custom ops), PACK_TAILS on: a non-finite row
+    reachable only through invalid packed slots (sizes[0] == 0 padding) must not reach dQ/dK/dV, in eager and under
+    torch.compile(fullgraph=True); packed == non-packed on the target rows, compiled == eager (dQ uses atomics)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip('SM100 GPU required')
+    pytest.importorskip("flash_attn.cute.interface")
+    if "_workspace" not in inspect.signature(adapter._load_fa4_cute()[3]).parameters:
+        pytest.skip("FA4 backward workspace support required")
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.delenv("FASTVIDEO_VSA_VC", raising=False)
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    sizes, routes, bad, target = _poison_case('pad_row0')
+    sizes = torch.tensor(sizes, device='cuda', dtype=torch.int32)
+    torch.manual_seed(615)
+    q, k, v, dout = [torch.randn(1, 1536, 2, 128, device='cuda', dtype=torch.bfloat16) for _ in range(4)]
+    k[:, bad] = poison
+    v[:, bad] = poison
+
+    def call(fn, pack):
+        monkeypatch.setenv("FASTVIDEO_VSA_PACK_TAILS", "1" if pack else "0")
+        leaves = [t.detach().requires_grad_(True) for t in (q, k, v)]
+        out = fn(*leaves, routes, sizes)[0]
+        return (out, *torch.autograd.grad(out, leaves, dout))
+
+    unpacked = call(block_sparse_attn_256_bshd, False)
+    packed = call(block_sparse_attn_256_bshd, True)
+    torch._dynamo.reset()
+    compiled = call(torch.compile(block_sparse_attn_256_bshd, fullgraph=True, dynamic=True), True)
+    torch._dynamo.reset()
+    for name, u, p, c in zip(('O', 'dQ', 'dK', 'dV'), unpacked, packed, compiled, strict=True):
+        u, p, c = u[:, target], p[:, target], c[:, target]
+        assert torch.isfinite(p).all() and torch.isfinite(c).all(), f'{name} non-finite on the target rows'
+        if name == 'O':
+            assert torch.equal(p, u) and torch.equal(c, p)
+        else:
+            _check(f'{name} packed vs unpacked', u, p, _GRAD_TOL)
+            if name == 'dQ':
+                _check('dQ compiled vs eager', p, c, _GRAD_TOL)
+            else:
+                assert torch.equal(c, p), f'{name} compiled != eager'
