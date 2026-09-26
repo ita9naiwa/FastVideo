@@ -55,7 +55,7 @@ def reach(monkeypatch):
     from fastvideo_kernel import vsa_tail_backward as tail
     from fastvideo_kernel import vsa256_ops
     rec = dict(fwd=[], prepare=[], prepare_sizes=[], tail=[], maps=None, stacked=[], bwd=[])
-    chunks = vsa256_ops._chunks
+    chunks = getattr(vsa256_ops, "_chunks", None)
 
     def spy_chunks(q, k, v):  # op bodies: k = v = None is the stacked [3B, S, H, D] input
         rec["stacked"].append(k is None)
@@ -100,7 +100,8 @@ def reach(monkeypatch):
         return tail_backward(*args, **kwargs)
 
     monkeypatch.setattr(adapter, "_build_sparse_tensors", spy_bst)
-    monkeypatch.setattr(vsa256_ops, "_chunks", spy_chunks)
+    if hasattr(vsa256_ops, "_chunks"):  # stacked route present (fused-QKV input)
+        monkeypatch.setattr(vsa256_ops, "_chunks", spy_chunks)
     monkeypatch.setattr(adapter, "_load_fa4_cute", spy_load)
     monkeypatch.setattr(tail, "_prepare", spy_prepare)
     monkeypatch.setattr(tail, "tail_backward", spy_tail)
@@ -219,12 +220,18 @@ def _op_inputs(b=1, n=12, heads=2, dim=128, seed=0, sizes=None):
     return qkv, block_map, sizes, dout.masked_fill(pad[None, :, None, None], 0), pad
 
 
-def _public(q, k, v, block_map, sizes, **kw):
+def _pack_kw(kw):
+    """Trees without the policy input have no pack_tails argument on the public wrapper (the seam reads
+    FASTVIDEO_VSA_PACK_TAILS per call): translate the request into the env OUTSIDE any compiled region."""
     from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
     if "pack_tails" in kw and "pack_tails" not in inspect.signature(block_sparse_attn_256_bshd).parameters:
-        # tree without the policy input: the seam reads FASTVIDEO_VSA_PACK_TAILS per call
         os.environ["FASTVIDEO_VSA_PACK_TAILS"] = "1" if kw.pop("pack_tails") else "0"
-    return block_sparse_attn_256_bshd(q, k, v, block_map, sizes, **kw)
+    return kw
+
+
+def _public(q, k, v, block_map, sizes, **kw):
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    return block_sparse_attn_256_bshd(q, k, v, block_map, sizes, **_pack_kw(kw))
 
 
 def _proof(sizes):
@@ -235,6 +242,7 @@ def _proof(sizes):
 def _op_grads(qkv, block_map, sizes, dout, dlse=None, compiled=False, **kw):
     """Public training entry; returns (O, dQ, dK, dV)."""
     leaves = [t.detach().clone().requires_grad_(True) for t in qkv.chunk(3, dim=0)]
+    kw = _pack_kw(kw)
 
     def call(q, k, v):
         return _public(q, k, v, block_map, sizes, **kw)
@@ -1179,6 +1187,7 @@ def _stack_grads(qkv, block_map, sizes, dout, stacked, compiled=False, **kw):
     """Public entry on the stacked (qkv=) or ordinary route; returns (O, dQ, dK, dV)."""
     leaf = qkv.detach().clone().requires_grad_(True)
     b = qkv.shape[0] // 3
+    kw = _pack_kw(kw)
 
     def call(x):
         q, k, v = x.chunk(3, dim=0)
