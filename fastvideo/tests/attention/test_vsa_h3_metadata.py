@@ -269,9 +269,9 @@ def test_geometry_chunk256_real_grids(thw, prefix, n_video, merge_prefix):
     assert vs[:-1] == [256] * (n_video - 1) and vs[-1] == video - 256 * (n_video - 1)
     segments = [x for x in prefix if x > 0]
     if merge_prefix:
-        assert P == math.ceil(sum(segments) / 256) and sizes[:P - 1].eq(256).all()
+        assert math.ceil(sum(segments) / 256) == P and sizes[:P - 1].eq(256).all()
     else:
-        assert P == cube.num_prefix_tiles and torch.equal(sizes[:P], cube.variable_block_sizes[:P])
+        assert cube.num_prefix_tiles == P and torch.equal(sizes[:P], cube.variable_block_sizes[:P])
     # same token order as the cube layout, only the tile boundaries move
     x = torch.randn(1, meta.total_seq_length, 1, 2)
     impl = _impl()
