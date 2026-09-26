@@ -24,6 +24,7 @@ from typing import Tuple
 import torch
 
 from .block_sparse_attn import block_sparse_attn_triton, _force_triton
+from . import vsa256_ops  # noqa: F401  (registers torch.ops.fastvideo_kernel.vsa256_fwd/bwd at import, e.g. for SAC policies)
 
 # NOTE: ``block_sparse_attn_cute_fwd`` is imported lazily inside the CuTe
 # branches below. Importing it at module load would pull in the optional
@@ -251,7 +252,6 @@ def block_sparse_attn_256_bshd(
             and os.environ.get("FASTVIDEO_VSA_VC", "0") != "1"):
         # BF16 Q256 training: opaque custom-op pair (same op in eager and compiled mode, fullgraph-safe). The pack
         # policy is static per call: packed-tail backward when enabled (default) and the inputs are contiguous.
-        from . import vsa256_ops  # noqa: F401  (registers torch.ops.fastvideo_kernel.vsa256_fwd/bwd)
         pack_tails = (os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
                       and all(t.is_contiguous() for t in (q, k, v)))
         out, lse = torch.ops.fastvideo_kernel.vsa256_fwd(q, k, v, logical_block_map_256,

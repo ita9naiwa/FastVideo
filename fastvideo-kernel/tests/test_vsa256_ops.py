@@ -176,3 +176,53 @@ def test_h3_block_fullgraph(monkeypatch, layout, merge):
         block(q, k, v)
     names = {e.key for e in prof.key_averages()}
     assert "fastvideo_kernel::vsa_tile_permute_fwd" in names and "fastvideo_kernel::vsa256_fwd" in names, names
+
+
+def test_h3_block_sac_policy_sees_op_keys(monkeypatch):
+    """Selective activation checkpointing: the policy sees the same op keys (vsa256_fwd, vsa_tile_permute_fwd) in eager
+    and compiled mode; MUST_SAVE on vsa256_fwd with recompute elsewhere gives the eager gradients."""
+    import functools
+
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
+    impl = MiniMaxH3VSAImpl(num_heads=8, head_size=128, causal=False, softmax_scale=128**-0.5)
+    impl.layer_idx = 0
+    meta = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=(20, 40, 72), patch_size=(1, 2, 2),
+                                               VSA_sparsity=0.75, prefix_segments=(250, 1, 0, 300),
+                                               device=torch.device("cuda"), tile_layout="chunk256", merge_prefix=True)
+
+    def block(q, k, v):
+        x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
+        q2, k2, v2 = x.chunk(3, dim=0)
+        return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
+
+    keys = {"eager": set(), "compiled": set()}
+    mode = {"now": "eager"}
+    must_save = {torch.ops.fastvideo_kernel.vsa256_fwd.default}
+
+    def policy(ctx, op, *args, **kwargs):
+        keys[mode["now"]].add(str(op))
+        return CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE
+
+    def sac(q, k, v):
+        return checkpoint(block, q, k, v, use_reentrant=False,
+                          context_fn=functools.partial(create_selective_checkpoint_contexts, policy))
+
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, meta.total_seq_length, 8, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+               for _ in range(3))
+    dout = torch.randn_like(q)
+    ref = torch.autograd.grad(block(q, k, v), (q, k, v), dout)
+    got = torch.autograd.grad(sac(q, k, v), (q, k, v), dout)
+    assert torch.equal(got[1], ref[1]) and torch.equal(got[2], ref[2])
+    mode["now"] = "compiled"
+    torch._dynamo.reset()
+    # aot_eager: the policy/op-key contract without Inductor codegen (Inductor + SAC + dynamic is recorded separately in
+    # the candidate notes: a PyTorch codegen failure in the untile-gather backward, outside these ops)
+    got_c = torch.autograd.grad(torch.compile(sac, backend="aot_eager", fullgraph=True, dynamic=True)(q, k, v),
+                                (q, k, v), dout)
+    assert torch.equal(got_c[1], ref[1]) and torch.equal(got_c[2], ref[2])
+    for m in ("eager", "compiled"):
+        assert any("vsa256_fwd" in k for k in keys[m]), (m, keys[m])
+        assert any("vsa_tile_permute_fwd" in k for k in keys[m]), (m, keys[m])
