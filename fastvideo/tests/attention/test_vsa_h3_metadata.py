@@ -3,6 +3,7 @@
 end-to-end equivalence against dense SDPA through a token-level mask
 reference. The same reference doubles as the GPU kernel parity oracle."""
 
+import contextlib
 import math
 
 import pytest
@@ -346,6 +347,254 @@ def test_builder_rejects_bad_tile_layout():
                                             exempt=False,
                                             tile_layout="chunk256",
                                             merge_prefix=True)
+
+
+# ---------------------------------------------------------------------------
+# Training untile gradient (vsa_h3_untile_fwd/bwd op pair) vs the generic indexed backward
+# ---------------------------------------------------------------------------
+
+# (avg_abs, max_rel) gradient tolerance of fastvideo-kernel/tests/test_vsa256_backward.py
+_GRAD_TOL = (1e-3, 0.25)
+# s085k32 spec v4 pack-4 docs: token grid (t, h, w), prefixes (text, vidclip, keyframe, audio)
+_S085K32_DOCS = [((47, 7, 12), (87, 1, 84, 514)), ((52, 15, 26), (476, 1, 390, 572)),
+                 ((37, 12, 31), (224, 1, 0, 402)), ((42, 25, 10), (223, 1, 250, 458))]
+_UNTILE_CASES = [(dict(raw_latent_shape=(t, 2 * h, 2 * w), patch_size=(1, 2, 2), prefix_segments=prefix),
+                  dict(tile_layout="chunk256", merge_prefix=True), 0.85) for (t, h, w), prefix in _S085K32_DOCS]
+_UNTILE_CASES.append((_720P, {}, 0.75))
+_UNTILE_IDS = [f"chunk256-{t}x{h}x{w}" for (t, h, w), _ in _S085K32_DOCS] + ["cube-720p"]
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+# autograd node of the opaque training untile op (torch.ops.fastvideo_kernel.vsa_h3_untile_fwd)
+_UNTILE_OP = "GeneratedBackwardFor_fastvideo_kernel_vsa_h3_untile_fwd_defaultBackward"
+
+
+@contextlib.contextmanager
+def _indexed(meta):
+    """The unchanged indexed postprocess_output: drop the untile certificate for the block."""
+    state = meta.__dict__.pop("_untile_grad_state", None)
+    try:
+        yield
+    finally:
+        if state is not None:
+            meta._untile_grad_state = state
+
+
+def _untile_and_grad(impl, meta, output, grad_out):
+    out = impl.postprocess_output(output, meta)
+    grad, = torch.autograd.grad(out, output, grad_out)
+    return out, grad, type(out.grad_fn).__name__
+
+
+@_requires_cuda
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("spec,layout,sparsity", _UNTILE_CASES, ids=_UNTILE_IDS)
+def test_untile_grad_matches_indexed_exactly(spec, layout, sparsity, batch):
+    meta = _build(spec, sparsity, torch.device("cuda"), **layout)
+    impl = MiniMaxH3VSAImpl(num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5)
+    padded = meta.variable_block_sizes.numel() * meta.tile_elems
+    output = torch.randn(batch, padded, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # non-contiguous upstream gradient (the op backward makes it contiguous)
+    grad_out = torch.randn(batch, meta.total_seq_length, 4, 256, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    out, grad, path = _untile_and_grad(impl, meta, output, grad_out)
+    with _indexed(meta):
+        ref, ref_grad, ref_path = _untile_and_grad(impl, meta, output, grad_out)
+    assert (path, ref_path) == (_UNTILE_OP, "IndexBackward0")
+    assert torch.equal(out, ref) and torch.equal(grad, ref_grad)
+    pad = ~token_tile_and_valid(meta.variable_block_sizes, meta.tile_elems)[1]
+    assert int(pad.sum()) > 0 and not grad[:, pad].any(), "pad-row gradients must be exactly zero"
+    with torch.no_grad():
+        nograd = impl.postprocess_output(output, meta)
+    assert nograd.grad_fn is None and torch.equal(nograd, output.detach()[:, meta.untile_combined_index])
+
+
+def _h3_block_grads(impl, meta, inputs, grad_out):
+    q, k, v = (t.detach().clone().requires_grad_(True) for t in inputs)
+    tiled = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
+    out = impl.postprocess_output(impl.forward(*tiled.chunk(3, dim=0), None, meta), meta)
+    return (out.detach(), *torch.autograd.grad(out, (q, k, v), grad_out)), type(out.grad_fn).__name__
+
+
+def _grad_metrics(ref, got):  # test_vsa256_backward._metrics form
+    diff = (ref.float() - got.float()).abs()
+    return float(diff.mean()), float(diff.max() / (ref.float().abs().mean() + 1e-6)), float(diff.max())
+
+
+@_requires_cuda
+@pytest.mark.parametrize("spec,layout,sparsity", _UNTILE_CASES, ids=_UNTILE_IDS)
+def test_untile_grad_attention_dkdv_bitwise_dq_in_envelope(monkeypatch, spec, layout, sparsity):
+    """Real H3 attention fwd+bwd (FA4 CuTe). O/dK/dV bitwise vs the indexed baseline; dQ is not repeatable
+    (FA4 dQ accumulation order), so it must stay within the baseline's own repeat spread + _GRAD_TOL."""
+    pytest.importorskip("flash_attn.cute.block_sparsity", reason="optional FA4 CuTe build (flash_attn.cute) not installed")
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.delenv("FASTVIDEO_VSA_TRITON", raising=False)
+    monkeypatch.delenv("FASTVIDEO_KERNEL_VSA_FORCE_TRITON", raising=False)
+    heads = 8
+    meta = _build(spec, sparsity, torch.device("cuda"), **layout)
+    impl = MiniMaxH3VSAImpl(num_heads=heads, head_size=128, causal=False, softmax_scale=128**-0.5,
+                            prefix="blocks.0.attn")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    inputs = [
+        torch.randn(1, meta.total_seq_length, heads, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        for _ in range(4)
+    ]
+    with _indexed(meta):
+        (base, base_path), (repeat, _) = (_h3_block_grads(impl, meta, inputs[:3], inputs[3]) for _ in range(2))
+    cand, cand_path = _h3_block_grads(impl, meta, inputs[:3], inputs[3])
+    assert (cand_path, base_path) == (_UNTILE_OP, "IndexBackward0")
+    for name, i in (("O", 0), ("dK", 2), ("dV", 3)):
+        assert torch.equal(repeat[i], base[i]), f"baseline {name} is not repeatable"
+        assert torch.equal(cand[i], base[i]), f"{name} differs from the indexed baseline"
+    spread, delta = _grad_metrics(base[1], repeat[1]), _grad_metrics(base[1], cand[1])
+    print(f"[untile-grad {spec['raw_latent_shape']} {layout or 'cube'}] dQ baseline spread "
+          f"avg_abs={spread[0]:.3e} max_rel={spread[1]:.3e} max_abs={spread[2]:.3e}; cand-vs-base "
+          f"avg_abs={delta[0]:.3e} max_rel={delta[1]:.3e} max_abs={delta[2]:.3e}")
+    assert delta[0] <= spread[0] + _GRAD_TOL[0] and delta[1] <= spread[1] + _GRAD_TOL[1], (spread, delta)
+
+
+def _graph_recorder(graphs):
+
+    def backend(gm, example_inputs):
+        graphs.append(gm.code)
+        return gm.forward
+
+    return backend
+
+
+def _untile_case(mutate, text_len, compiled):
+    # Own geometry per case: the index tensors are lru-cached per geometry, so a mutation taints later builds.
+    meta = _build(dict(_720P, prefix_segments=(text_len, 1760, 400)), 0.75, torch.device("cuda"))
+    impl = MiniMaxH3VSAImpl(num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5)
+    output = torch.randn(1, meta.variable_block_sizes.numel() * meta.tile_elems, 2, 128, device="cuda",
+                         dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(1, meta.total_seq_length, 2, 128, device="cuda", dtype=torch.bfloat16)
+    mutate(meta)
+    graphs = []
+    post = impl.postprocess_output
+    if compiled:
+        torch._dynamo.reset()
+        post = torch.compile(impl.postprocess_output, backend=_graph_recorder(graphs), fullgraph=True, dynamic=True)
+    out = post(output, meta)
+    grad, = torch.autograd.grad(out, output, grad_out)
+    with _indexed(meta):
+        ref, ref_grad, _ = _untile_and_grad(impl, meta, output, grad_out)
+    assert torch.equal(out, ref) and torch.equal(grad, ref_grad)
+    assert torch.equal(out, output.detach()[:, meta.untile_combined_index])
+    return type(out.grad_fn).__name__, graphs
+
+
+# explorer-1's guard cases (init/check_untile_v2_explorer1.py): every replaced or mutated index, derived plan tensor, or
+# missing certificate must end in IndexBackward0's result.
+_MUTATIONS = {
+    "untile_replaced": lambda m: setattr(m, "untile_combined_index", m.untile_combined_index.roll(1)),
+    "untile_in_place": lambda m: m.untile_combined_index.copy_(m.untile_combined_index.roll(1)),
+    "partition_replaced": lambda m: setattr(m, "tile_partition_indices", m.tile_partition_indices.clone()),
+    "partition_in_place": lambda m: m.tile_partition_indices.add_(0),
+    "nonpad_replaced": lambda m: setattr(m, "non_pad_index", m.non_pad_index.clone()),
+    "nonpad_in_place": lambda m: m.non_pad_index.add_(0),
+    "source_in_place": lambda m: m._untile_grad_state[2].add_(0),
+    "pad_rows_in_place": lambda m: m._untile_grad_state[4].add_(0),
+    "missing_certificate": lambda m: delattr(m, "_untile_grad_state"),
+}
+_MUTATION_NAMES = list(_MUTATIONS)
+
+
+@_requires_cuda
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("mutation", _MUTATION_NAMES)
+def test_untile_grad_untrusted_metadata_falls_back(mutation, compiled):
+    # Distinct geometry per (mutation, mode): a mutation taints the cached index tensors of its geometry.
+    path, _ = _untile_case(_MUTATIONS[mutation], 520 + 2 * _MUTATION_NAMES.index(mutation) + int(compiled), compiled)
+    if not compiled:
+        assert path == "IndexBackward0", "untrusted metadata must take the indexed fallback in eager"
+    # compiled: identity mismatches trace the indexed path; version mismatches reach the op, whose backward re-checks the
+    # recorded versions and computes IndexBackward0's adjoint (asserted bitwise above)
+
+
+@_requires_cuda
+def test_untile_grad_compiled_reaches_the_op():
+    path, graphs = _untile_case(lambda m: None, 540, compiled=True)
+    assert path == _UNTILE_OP and graphs and all("vsa_h3_untile_fwd" in g for g in graphs), graphs
+
+
+@_requires_cuda
+def test_untile_grad_op_stale_versions_use_indexed_adjoint():
+    meta = _build(dict(_720P, prefix_segments=(541, 1760, 400)), 0.75, torch.device("cuda"))
+    untile, uv, source, sv, pad, pv = meta._untile_grad_state
+    partition, nonpad = meta.tile_partition_indices, meta.non_pad_index
+    output = torch.randn(2, source.numel(), 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(2, untile.numel(), 2, 128, device="cuda", dtype=torch.bfloat16)
+    ref_grad, = torch.autograd.grad(output[:, untile], output, grad_out)
+    for slot in range(5):
+        versions = [uv, sv, pv, 0, 0]
+        versions[slot] += 1  # as if that index changed after the metadata recorded it
+        out = torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(output, untile, source, pad, partition, nonpad, versions)
+        grad, = torch.autograd.grad(out, output, grad_out)
+        assert torch.equal(out, output.detach()[:, untile]) and torch.equal(grad, ref_grad)
+
+
+@_requires_cuda
+def test_untile_grad_mutation_before_backward_raises():
+    meta = _build(dict(_720P, prefix_segments=(514, 1760, 400)), 0.75, torch.device("cuda"))
+    impl = MiniMaxH3VSAImpl(num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5)
+    output = torch.randn(1, meta.variable_block_sizes.numel() * meta.tile_elems, 2, 128, device="cuda",
+                         dtype=torch.bfloat16, requires_grad=True)
+    out = impl.postprocess_output(output, meta)
+    assert type(out.grad_fn).__name__ == _UNTILE_OP
+    meta.untile_combined_index.add_(0)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        out.sum().backward()
+
+
+
+def _pinned(output, untile, version=0):
+    """What a query-pad-pruning forward returns: a view carrying the untile map its backward trusted."""
+    output = output.view_as(output)
+    output._vsa_h3_query_pad_untile = (untile, version)
+    return output
+
+
+@_requires_cuda
+@pytest.mark.parametrize("case", ["pinned_certified", "metadata_replaced_after_forward", "pinned_uncertified"])
+def test_untile_grad_uses_the_pinned_effective_map(case):
+    """Composition with the query-pad pin: the effective map is the pinned one; the op runs only when the certificate is
+    for exactly that map, and otherwise the fallback indexes the pinned map (never a newer metadata map)."""
+    meta = _build(dict(_720P, prefix_segments=(550 + ["pinned_certified", "metadata_replaced_after_forward",
+                                                      "pinned_uncertified"].index(case), 1760, 400)), 0.75,
+                  torch.device("cuda"))
+    impl = MiniMaxH3VSAImpl(num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5)
+    leaf = torch.randn(1, meta.variable_block_sizes.numel() * meta.tile_elems, 2, 128, device="cuda",
+                       dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(1, meta.total_seq_length, 2, 128, device="cuda", dtype=torch.bfloat16)
+    pinned_map = meta.untile_combined_index
+    if case == "pinned_uncertified":
+        pinned_map = pinned_map.roll(1)  # a valid map the builder never certified
+    output = _pinned(leaf, pinned_map)
+    if case == "metadata_replaced_after_forward":
+        meta.untile_combined_index = meta.untile_combined_index.roll(1)
+    out = impl.postprocess_output(output, meta)
+    grad, = torch.autograd.grad(out, leaf, grad_out)
+    ref_grad, = torch.autograd.grad(leaf[:, pinned_map], leaf, grad_out)
+    assert torch.equal(out, leaf.detach()[:, pinned_map]) and torch.equal(grad, ref_grad)
+    pad = ~token_tile_and_valid(meta.variable_block_sizes, meta.tile_elems)[1]
+    assert not grad[:, pad].any(), "the pin requires exact zero dO on padded rows"
+    assert type(out.grad_fn).__name__ == (_UNTILE_OP if case != "pinned_uncertified" else "IndexBackward0")
+
+
+@_requires_cuda
+def test_untile_grad_pinned_map_mutated_raises():
+    meta = _build(dict(_720P, prefix_segments=(553, 1760, 400)), 0.75, torch.device("cuda"))
+    impl = MiniMaxH3VSAImpl(num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5)
+    leaf = torch.randn(1, meta.variable_block_sizes.numel() * meta.tile_elems, 2, 128, device="cuda",
+                       dtype=torch.bfloat16, requires_grad=True)
+    output = _pinned(leaf, meta.untile_combined_index)
+    meta.untile_combined_index.add_(0)
+    with pytest.raises(RuntimeError, match="modified in place between forward and postprocess_output"):
+        impl.postprocess_output(output, meta)
+
+def test_untile_grad_not_certified_for_inference_tensors():
+    with torch.inference_mode():
+        meta = _build(dict(_TINY, raw_latent_shape=(8, 8, 14)))  # own geometry: inference tensors stay local
+    assert getattr(meta, "_untile_grad_state", None) is None
+    assert _build(_TINY)._untile_grad_state[0] is not None
 
 
 if __name__ == "__main__":

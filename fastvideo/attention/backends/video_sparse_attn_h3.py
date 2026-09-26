@@ -72,7 +72,7 @@ except ImportError:
 
 from fastvideo.attention.backends.abstract import (AttentionBackend, AttentionImpl, AttentionMetadata,
                                                    AttentionMetadataBuilder, layer_idx_from_prefix)
-from fastvideo.attention.backends.video_sparse_attn import (_tile_row_layout, compute_topk,
+from fastvideo.attention.backends.video_sparse_attn import (_gather_tile_rows, _tile_row_layout, compute_topk,
                                                             construct_variable_block_sizes, get_non_pad_index,
                                                             get_tile_partition_indices, scatter_into_tile_buf)
 from fastvideo.attention.backends.video_sparse_attn_h3_probe import probe_enabled, record_probe
@@ -452,6 +452,16 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
                 and metadata.tile_partition_indices._version == 0 and metadata.non_pad_index._version == 0):
             metadata._tile_index_state = (metadata.tile_partition_indices, 0, metadata.non_pad_index, 0)
+            # untile is what postprocess_output indexes with, so its exact tensor is certified too; the inverse plan
+            # (source slot per padded row, pad rows) is built once here, not per layer.
+            if not untile_combined_index.is_inference() and untile_combined_index._version == 0:
+                partition, nonpad = metadata.tile_partition_indices, metadata.non_pad_index
+                padded = variable_block_sizes.numel() * int(tile_size)
+                source = partition.new_zeros(padded).index_copy_(0, nonpad, partition)
+                padding = torch.ones(padded, device=partition.device, dtype=torch.bool).index_fill_(0, nonpad, False)
+                pad_rows = torch.nonzero_static(padding, size=padded - partition.numel()).flatten()
+                metadata._untile_grad_state = (untile_combined_index, 0, source, source._version, pad_rows,
+                                               pad_rows._version)
         # _h3_tile_geometry validated that this untile index reads only non-pad rows of these sizes,
         # so postprocess_output leaves padded query rows with zero output gradient. Trust the pair
         # only while both tensors are the unmodified cached objects.
@@ -532,6 +542,54 @@ def _vsa_h3_block_map_fake(query, key, variable_block_sizes, tile_elems, num_pre
                            exempt):
     n_tiles = query.shape[1] // tile_elems
     return query.new_empty((query.shape[0], query.shape[2], n_tiles, n_tiles), dtype=torch.bool)
+
+
+def _versions_match(state: tuple) -> bool:
+    """(tensor, recorded _version, tensor, recorded _version, ...) all unmodified."""
+    return all(t._version == v for t, v in zip(state[::2], state[1::2], strict=True))
+
+
+# Training untile as an opaque op pair (same op keys eager and compiled). Forward is today's ``output[:, untile]``. The
+# backward gathers the live-row gradient through the builder's inverse plan and zeroes only the pad rows, instead of
+# IndexBackward0 (zero fill + sort + index_put accumulate). It re-checks the recorded versions of every index it relies on
+# (Dynamo cannot branch on ``_version``) and otherwise computes exactly IndexBackward0's adjoint of the consumed map.
+@torch.library.custom_op("fastvideo_kernel::vsa_h3_untile_fwd", mutates_args=())
+def vsa_h3_untile_fwd(output: torch.Tensor, untile: torch.Tensor, source: torch.Tensor, pad_rows: torch.Tensor,
+                      partition: torch.Tensor, nonpad: torch.Tensor, versions: list[int]) -> torch.Tensor:
+    return output[:, untile]
+
+
+@vsa_h3_untile_fwd.register_fake
+def _vsa_h3_untile_fwd_fake(output, untile, source, pad_rows, partition, nonpad, versions):
+    return output.new_empty((output.shape[0], untile.shape[0], *output.shape[2:]))
+
+
+@torch.library.custom_op("fastvideo_kernel::vsa_h3_untile_bwd", mutates_args=())
+def vsa_h3_untile_bwd(grad: torch.Tensor, untile: torch.Tensor, source: torch.Tensor, pad_rows: torch.Tensor,
+                      partition: torch.Tensor, nonpad: torch.Tensor, versions: list[int]) -> torch.Tensor:
+    if _versions_match((untile, versions[0], source, versions[1], pad_rows, versions[2], partition, versions[3], nonpad,
+                        versions[4])):
+        return _gather_tile_rows(grad, source).index_fill_(1, pad_rows, 0)
+    zeros = grad.new_zeros((grad.shape[0], source.shape[0], *grad.shape[2:]))
+    return torch.ops.aten.index_put_.default(zeros, [None, untile], grad, True)  # IndexBackward0's computation
+
+
+@vsa_h3_untile_bwd.register_fake
+def _vsa_h3_untile_bwd_fake(grad, untile, source, pad_rows, partition, nonpad, versions):
+    return grad.new_empty((grad.shape[0], source.shape[0], *grad.shape[2:]))
+
+
+def _untile_setup_context(ctx, inputs, output):
+    # Saved for backward and for autograd's saved-tensor mutation check.
+    ctx.save_for_backward(*inputs[1:6])
+    ctx.versions = inputs[6]
+
+
+def _untile_backward(ctx, grad):
+    return (vsa_h3_untile_bwd(grad.contiguous(), *ctx.saved_tensors, ctx.versions), None, None, None, None, None, None)
+
+
+vsa_h3_untile_fwd.register_autograd(_untile_backward, setup_context=_untile_setup_context)
 
 
 def _sm100a_unavailable_reason(sm100a_mod: Any, query_bhsd: torch.Tensor, variable_block_sizes: torch.Tensor,
@@ -761,18 +819,34 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
-        # A forward that let the backward skip padded query rows pins the untile map it trusted;
-        # untile with exactly that map so padded rows keep zero dO.
+        # A forward that let the backward skip padded query rows pins the untile map it trusted; untile with exactly
+        # that map (the effective map) so padded rows keep zero dO.
         pinned = getattr(output, "_vsa_h3_query_pad_untile", None)
         if pinned is None:
-            return output[:, attn_metadata.untile_combined_index]
-        untile, version = pinned
-        # Eager: reject an in-place change since the builder validated the map. Compiled: Dynamo cannot branch on
-        # _version; a change after the forward fails autograd's saved-tensor check on the map the vsa256 op saved,
-        # and its backward re-checks the recorded version (full backward on mismatch).
-        if not torch.compiler.is_compiling() and untile._version != version:
-            raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
-                               "postprocess_output; its backward assumed the original padded-row geometry.")
+            untile = attn_metadata.untile_combined_index
+        else:
+            untile, version = pinned
+            # Eager: reject an in-place change since the builder validated the map. Compiled: Dynamo cannot branch on
+            # _version; a change after the forward fails autograd's saved-tensor check on the map the vsa256 op saved,
+            # and its backward re-checks the recorded version (full backward on mismatch).
+            if not torch.compiler.is_compiling() and untile._version != version:
+                raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
+                                   "postprocess_output; its backward assumed the original padded-row geometry.")
+        # Training with builder-certified partition/nonpad (tile()'s state) AND a certificate for exactly the effective
+        # map: opaque op pair with the gather backward (pad rows get exact zero dO, as the pin requires). Eager also
+        # checks the recorded versions here; compiled graphs pass them as explicit values and the backward op re-checks
+        # them. Anything else indexes the effective map (IndexBackward0).
+        tile_state = getattr(attn_metadata, "_tile_index_state", None)
+        state = getattr(attn_metadata, "_untile_grad_state", None)
+        if (state is not None and tile_state is not None and torch.is_grad_enabled() and output.requires_grad
+                and state[0] is untile and tile_state[0] is attn_metadata.tile_partition_indices
+                and tile_state[2] is attn_metadata.non_pad_index and state[2].device == output.device
+                and output.shape[1] == state[2].numel()
+                and (torch.compiler.is_compiling() or (_versions_match(tile_state) and _versions_match(state)))):
+            return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(output, untile, state[2], state[4], tile_state[0],
+                                                                 tile_state[2],
+                                                                 [state[1], state[3], state[5], tile_state[1],
+                                                                  tile_state[3]])
         return output[:, untile]
 
     def forward_qkv(self, qkv: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
