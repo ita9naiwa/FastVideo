@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """preprocess_q_k_v tiles separate q, k, v without a stacked copy: byte-identical to preprocess_qkv(cat([q, k, v]))."""
 
+import types
+
 import pytest
 import torch
 
+from fastvideo.attention import layer
 from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
 
 # token grid (37, 24, 42) + text/audio prefix: 38,010 rows; 3 x [1, S, 4, 128] is >= 2**25 elements (eligible eager).
@@ -84,3 +87,45 @@ def test_compiled_fullgraph_single_graph():
     assert torch.equal(torch.cat(out, dim=0), impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md))
     fn(*_qkv(md, seed=8))  # same shapes: no recompile
     assert counts["stats"]["unique_graphs"] == 1
+
+
+class _RecordingImpl:
+    """Stand-in backend that records which preprocess/forward route the layer takes."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        if name not in ("preprocess_q_k_v", "preprocess_qkv", "forward", "forward_qkv", "postprocess_output"):
+            raise AttributeError(name)
+
+        def record(*args):
+            self.calls.append(name)
+            if name == "preprocess_q_k_v":
+                return args[:3]
+            return args[0][:1] if name == "forward_qkv" else args[0]
+
+        return record
+
+
+@pytest.mark.parametrize("vsa", [False, True], ids=["dense", "vsa"])
+@pytest.mark.parametrize("sp,gate", [(1, False), (2, False), (1, True)], ids=["sp1", "sp2", "gate"])
+def test_route_selection(monkeypatch, vsa, sp, gate):
+    """SP=1 without gate/replicated input tiles q, k, v separately; SP>1 or a gate keeps the stacked route."""
+    if gate and not vsa:
+        pytest.skip("gate_compress is VSA-only")
+    monkeypatch.setattr(layer, "get_sp_world_size", lambda: sp)
+    monkeypatch.setattr(layer, "get_sp_parallel_rank", lambda: 0)
+    monkeypatch.setattr(layer, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=None))
+    monkeypatch.setattr(layer, "sequence_model_parallel_all_to_all_4D", lambda x, **_: x)
+    impl = _RecordingImpl()
+    this = types.SimpleNamespace(attn_impl=impl, _compile_forward_enabled=True)
+    q, k, v = (torch.randn(1, 8, 2, 4) for _ in range(3))
+    if vsa:
+        layer.DistributedAttention_VSA.forward(this, q, k, v, 8, gate_compress=torch.randn_like(q) if gate else None)
+    else:
+        layer.DistributedAttention.forward(this, q, k, v, 8)
+    separate = sp == 1 and not gate
+    assert ("preprocess_q_k_v" in impl.calls) == separate
+    assert ("preprocess_qkv" in impl.calls) != separate
+    assert ("forward_qkv" in impl.calls) == (vsa and not separate and not gate)  # VSA stacked no-gate: fused-QKV input
