@@ -592,6 +592,41 @@ def _untile_backward(ctx, grad):
 vsa_h3_untile_fwd.register_autograd(_untile_backward, setup_context=_untile_setup_context)
 
 
+def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
+    """``output[:, untile_combined_index]`` for [B, S_pad, ...] attention output (same result as
+    ``output.index_select(1, attn_metadata.untile_combined_index)``). Public so wrappers outside the backend (h3mh's
+    per-doc loop) take the same gather backward as ``postprocess_output``."""
+    # A forward that let the backward skip padded query rows pins the untile map it trusted; untile with exactly
+    # that map (the effective map) so padded rows keep zero dO.
+    pinned = getattr(output, "_vsa_h3_query_pad_untile", None)
+    if pinned is None:
+        untile = attn_metadata.untile_combined_index
+    else:
+        untile, version = pinned
+        # Eager: reject an in-place change since the builder validated the map. Compiled: Dynamo cannot branch on
+        # _version; a change after the forward fails autograd's saved-tensor check on the map the vsa256 op saved,
+        # and its backward re-checks the recorded version (full backward on mismatch).
+        if not torch.compiler.is_compiling() and untile._version != version:
+            raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
+                               "postprocess_output; its backward assumed the original padded-row geometry.")
+    # Training with builder-certified partition/nonpad (tile()'s state) AND a certificate for exactly the effective
+    # map: opaque op pair with the gather backward (pad rows get exact zero dO, as the pin requires). Eager also
+    # checks the recorded versions here; compiled graphs pass them as explicit values and the backward op re-checks
+    # them. Anything else indexes the effective map (IndexBackward0).
+    tile_state = getattr(attn_metadata, "_tile_index_state", None)
+    state = getattr(attn_metadata, "_untile_grad_state", None)
+    if (state is not None and tile_state is not None and torch.is_grad_enabled() and output.requires_grad
+            and state[0] is untile and tile_state[0] is attn_metadata.tile_partition_indices
+            and tile_state[2] is attn_metadata.non_pad_index and state[2].device == output.device
+            and output.shape[1] == state[2].numel()
+            and (torch.compiler.is_compiling() or (_versions_match(tile_state) and _versions_match(state)))):
+        return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(output, untile, state[2], state[4], tile_state[0],
+                                                             tile_state[2],
+                                                             [state[1], state[3], state[5], tile_state[1],
+                                                              tile_state[3]])
+    return output[:, untile]
+
+
 def _sm100a_unavailable_reason(sm100a_mod: Any, query_bhsd: torch.Tensor, variable_block_sizes: torch.Tensor,
                                grad_mode: bool) -> str | None:
     """Why the opt-in data-center Blackwell route cannot run here, or None if it can.
@@ -819,35 +854,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
-        # A forward that let the backward skip padded query rows pins the untile map it trusted; untile with exactly
-        # that map (the effective map) so padded rows keep zero dO.
-        pinned = getattr(output, "_vsa_h3_query_pad_untile", None)
-        if pinned is None:
-            untile = attn_metadata.untile_combined_index
-        else:
-            untile, version = pinned
-            # Eager: reject an in-place change since the builder validated the map. Compiled: Dynamo cannot branch on
-            # _version; a change after the forward fails autograd's saved-tensor check on the map the vsa256 op saved,
-            # and its backward re-checks the recorded version (full backward on mismatch).
-            if not torch.compiler.is_compiling() and untile._version != version:
-                raise RuntimeError("VSA-H3 untile_combined_index was modified in place between forward and "
-                                   "postprocess_output; its backward assumed the original padded-row geometry.")
-        # Training with builder-certified partition/nonpad (tile()'s state) AND a certificate for exactly the effective
-        # map: opaque op pair with the gather backward (pad rows get exact zero dO, as the pin requires). Eager also
-        # checks the recorded versions here; compiled graphs pass them as explicit values and the backward op re-checks
-        # them. Anything else indexes the effective map (IndexBackward0).
-        tile_state = getattr(attn_metadata, "_tile_index_state", None)
-        state = getattr(attn_metadata, "_untile_grad_state", None)
-        if (state is not None and tile_state is not None and torch.is_grad_enabled() and output.requires_grad
-                and state[0] is untile and tile_state[0] is attn_metadata.tile_partition_indices
-                and tile_state[2] is attn_metadata.non_pad_index and state[2].device == output.device
-                and output.shape[1] == state[2].numel()
-                and (torch.compiler.is_compiling() or (_versions_match(tile_state) and _versions_match(state)))):
-            return torch.ops.fastvideo_kernel.vsa_h3_untile_fwd(output, untile, state[2], state[4], tile_state[0],
-                                                                 tile_state[2],
-                                                                 [state[1], state[3], state[5], tile_state[1],
-                                                                  tile_state[3]])
-        return output[:, untile]
+        return vsa_h3_untile(output, attn_metadata)
 
     def forward_qkv(self, qkv: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Gate-free entry on the batch-stacked tiled ``[3B, S, H, D]`` tensor.

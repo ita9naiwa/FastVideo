@@ -516,6 +516,33 @@ def test_untile_grad_compiled_reaches_the_op():
 
 
 @_requires_cuda
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_untile_public_entry_h3mh_shape(compiled):
+    """h3mh's wrapper shape (conductor 34247, worker-3 34269): per doc, out [1, P, 56, 128] bf16 and
+    out.index_select(1, meta.untile_combined_index). The public vsa_h3_untile, called as a free function under the h3mh
+    compile config (inductor, dynamic, fullgraph), reaches the op pair and equals index_select + its index_add adjoint."""
+    from fastvideo.attention.backends.video_sparse_attn_h3 import vsa_h3_untile
+    meta = _build(dict(_720P, prefix_segments=(515, 1760, 400)), 0.85, torch.device("cuda"))
+    output = torch.randn(1, meta.variable_block_sizes.numel() * meta.tile_elems, 56, 128, device="cuda",
+                         dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(1, meta.total_seq_length, 56, 128, device="cuda", dtype=torch.bfloat16)
+    ref = output.index_select(1, meta.untile_combined_index)
+    ref_grad, = torch.autograd.grad(ref, output, grad_out)
+    fn = vsa_h3_untile
+    if compiled:
+        torch._dynamo.reset()
+        fn = torch.compile(vsa_h3_untile, backend="inductor", fullgraph=True, dynamic=True)
+        torch.autograd.grad(fn(output, meta), output, grad_out)  # compile fwd + bwd outside the profiled call
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        out = fn(output, meta)
+        grad, = torch.autograd.grad(out, output, grad_out)
+    names = [e.name for e in prof.events()]
+    assert names.count("fastvideo_kernel::vsa_h3_untile_fwd") == 1 and names.count("fastvideo_kernel::vsa_h3_untile_bwd") == 1
+    assert not any("index_add" in n or "index_put" in n for n in names), [n for n in names if "index" in n]
+    assert torch.equal(out, ref.detach()) and torch.equal(grad, ref_grad)
+
+
+@_requires_cuda
 def test_untile_grad_op_stale_versions_use_indexed_adjoint():
     meta = _build(dict(_720P, prefix_segments=(541, 1760, 400)), 0.75, torch.device("cuda"))
     untile, uv, source, sv, pad, pv = meta._untile_grad_state
