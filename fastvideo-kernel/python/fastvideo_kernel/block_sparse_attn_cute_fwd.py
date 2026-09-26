@@ -529,24 +529,14 @@ def _vc_physical_sizes(sizes, block_size):
 
 
 def _vc_sparse_tensors(block_map, sizes, q_len, q_block_size, kv_block_size):
-    if kv_block_size == 128:
-        sparse, _ = _build_sparse_tensors(
-            block_map, sizes, q_len=q_len, q_block_size=q_block_size,
-            kv_block_size=128, need_backward=False, force_q_sparse_block_size=q_block_size,
-        )
-        return sparse, sizes, 128
-    sparse_type, _, _, _ = _load_fa4_cute()
-    # Preserve the original full/masked traversal, including zero-valid children;
-    # reclassifying children changes ExpCast rounding as the running max evolves.
-    full = (block_map & (sizes == 256).view(1, 1, 1, -1)).repeat_interleave(2, -1)
-    masked = (block_map & ((sizes > 0) & (sizes < 256)).view(1, 1, 1, -1)).repeat_interleave(2, -1)
-    full_idx, full_cnt = _map_to_index(full.contiguous())
-    mask_idx, mask_cnt = _map_to_index(masked.contiguous())
-    sparse = sparse_type(full_block_idx=full_idx, full_block_cnt=full_cnt,
-                         mask_block_idx=mask_idx, mask_block_cnt=mask_cnt,
-                         block_size=(q_block_size, 128))
-    physical_sizes = _vc_physical_sizes(sizes, kv_block_size)
-    return sparse, physical_sizes, 128
+    if kv_block_size == 256:
+        block_map = block_map.repeat_interleave(2, -1)
+        sizes = _vc_physical_sizes(sizes, kv_block_size)
+    sparse, _ = _build_sparse_tensors(
+        block_map, sizes, q_len=q_len, q_block_size=q_block_size,
+        kv_block_size=128, need_backward=False, force_q_sparse_block_size=q_block_size,
+    )
+    return sparse, sizes, 128
 
 
 @functools.lru_cache(maxsize=4)
@@ -593,7 +583,7 @@ def block_sparse_attn_vc_routes_fwd_bshd(
     selected is int64 [B,H,Q_blocks,K], using document-global block IDs.
     Each row must contain unique IDs from this document's non-prefix blocks;
     callers own value validation. Prefix blocks are included automatically.
-    Parent classification and ascending full/partial traversal match the map API.
+    Physical-child classification and ascending full/partial traversal match the map API.
     LSE is quantized auxiliary state, not a BF16 partition-merge weight.
     """
     q, k, v = (p[name] for name in ("q", "k", "v"))
@@ -608,14 +598,33 @@ def block_sparse_attn_vc_routes_fwd_bshd(
             or any(t.device != q.device or t.dtype != q.dtype for t in (k, v))):
         raise ValueError("prepared Q/K/V lengths, devices and route dimensions must agree")
     native = _load_vc_module("vc_vsa_preprocess", os.environ.get("FASTVIDEO_VSA_VC_ROOT"))
-    full_idx, full_cnt, mask_idx, mask_cnt = native.prepare_vsa_routes(
-        selected, variable_block_sizes, block_size, prefix, document_start,
+    parents = variable_block_sizes.numel()
+    # Preserve provider validations that changing units would otherwise hide.
+    physical_route = (
+        type(block_size) is int and block_size == 256
+        and type(prefix) is int and type(document_start) is int
+        and selected.dtype == torch.int64 and selected.is_cuda
+        and variable_block_sizes.ndim == 1 and variable_block_sizes.dtype == torch.int32
+        and variable_block_sizes.device == selected.device
+        and 0 <= document_start <= 2**31 - 1 - parents
     )
+    if physical_route:
+        physical_sizes = _vc_physical_sizes(variable_block_sizes, block_size)
+        local = (selected - document_start).clamp(-1, parents)
+        child0 = local * 2
+        children = torch.stack((child0, child0 + 1), dim=-1).flatten(-2)
+        full_idx, full_cnt, mask_idx, mask_cnt = native.prepare_vsa_routes(
+            children, physical_sizes, 128, 2 * prefix, 0,
+        )
+    else:
+        full_idx, full_cnt, mask_idx, mask_cnt = native.prepare_vsa_routes(
+            selected, variable_block_sizes, block_size, prefix, document_start,
+        )
+        physical_sizes = _vc_physical_sizes(variable_block_sizes, block_size)
     sparse_type, _, _, _ = _load_fa4_cute()
     sparse = sparse_type(full_block_idx=full_idx, full_block_cnt=full_cnt,
                         mask_block_idx=mask_idx, mask_block_cnt=mask_cnt,
                         block_size=(block_size, 128))
-    physical_sizes = _vc_physical_sizes(variable_block_sizes, block_size)
     return _vc_prepared_sparse(p, sparse, physical_sizes, block_size, 128, return_lse)
 
 
