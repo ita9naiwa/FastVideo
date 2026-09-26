@@ -18,8 +18,11 @@ def _impl():
 
 
 def _metadata(spec=_SPEC, **layout):
-    return MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, VSA_sparsity=0.75, device=torch.device("cuda"),
-                                               **spec, **layout)
+    return MiniMaxH3VSAMetadataBuilder().build(current_timestep=0,
+                                               VSA_sparsity=0.75,
+                                               device=torch.device("cuda"),
+                                               **spec,
+                                               **layout)
 
 
 def _qkvg(md, heads=2, seed=0):
@@ -57,7 +60,7 @@ def test_repeated_live_training_calls(layout):
     xs = [_qkvg(md, seed=s).requires_grad_(True) for s in (1, 2)]
     outs = [impl.tile(x, md) for x in xs]  # two live graphs before any backward
     assert outs[0].data_ptr() != outs[1].data_ptr()
-    for x, out in zip(xs, outs):
+    for x, out in zip(xs, outs, strict=True):
         grad, = torch.autograd.grad(out, x, torch.ones_like(out))
         assert torch.equal(grad, torch.ones_like(x))  # each row lands in exactly one slot
 
