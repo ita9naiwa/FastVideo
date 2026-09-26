@@ -240,3 +240,59 @@ def test_h3_block_sac_policy_sees_op_keys(monkeypatch):
     for m in ("eager", "compiled"):
         assert any("vsa256_fwd" in k for k in keys[m]), (m, keys[m])
         assert any("vsa_tile_permute_fwd" in k for k in keys[m]), (m, keys[m])
+
+
+def test_h3_block_h3mh_compile_config(monkeypatch):
+    """h3mh's training compile configuration (conductor ruling 31942): torch.compile(checkpointed(block), backend='inductor',
+    mode='default', dynamic=True, fullgraph=True) with fail_on_recompile_limit_hit and use_duck_shape=False, SAC inside the
+    compiled region (MUST_SAVE vsa256_fwd, PREFER_RECOMPUTE elsewhere), attention metadata passed as an argument. Ten H3
+    geometries (small ones take the size-gated tile path in eager) compile once: 0 graph breaks, 0 recompiles, O/dK/dV bitwise
+    vs eager, dQ within the nondeterministic-atomics tolerance."""
+    import functools
+    import torch.fx.experimental._config as fx_config
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
+    from .test_vsa256_backward import _metrics
+    impl = MiniMaxH3VSAImpl(num_heads=8, head_size=128, causal=False, softmax_scale=128**-0.5)
+    impl.layer_idx = 0
+
+    def block(q, k, v, meta):
+        x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
+        q2, k2, v2 = x.chunk(3, dim=0)
+        return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
+
+    policy = lambda ctx, op, *a, **k: (CheckpointPolicy.MUST_SAVE if op == torch.ops.fastvideo_kernel.vsa256_fwd.default
+                                       else CheckpointPolicy.PREFER_RECOMPUTE)
+    compiled = torch.compile(lambda q, k, v, meta: checkpoint(block, q, k, v, meta, use_reentrant=False, context_fn=functools.partial(
+        create_selective_checkpoint_contexts, policy)), backend="inductor", mode="default", dynamic=True, fullgraph=True)
+    geometries = [((42, 14, 24), (175, 1, 170, 402)), ((42, 20, 20), (175, 1, 170, 402)), ((37, 16, 56), (250, 1, 0, 300)),
+                  ((102, 14, 24), (120, 1, 0, 402)), ((62, 26, 24), (175, 1, 170, 0)), ((42, 30, 34), (300, 1, 0, 402)),
+                  ((47, 32, 30), (175, 1, 170, 402)), ((37, 24, 62), (175, 0, 0, 402)), ((77, 14, 52), (250, 1, 170, 402)),
+                  ((72, 26, 36), (175, 1, 170, 402))]
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters  # process-global: compare deltas from this test's start
+    graphs0, breaks0 = counters["stats"]["unique_graphs"], sum(counters["graph_break"].values())
+    for i, (raw, prefix) in enumerate(geometries):
+        meta = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0, raw_latent_shape=raw, patch_size=(1, 2, 2),
+                                                   VSA_sparsity=0.75, prefix_segments=prefix, device=torch.device("cuda"),
+                                                   tile_layout="chunk256", merge_prefix=True)
+        before = counters["stats"]["unique_graphs"]
+        outs = []
+        for fn in (compiled, block):
+            torch.manual_seed(100 + i)
+            q, k, v = (torch.randn(1, meta.total_seq_length, 8, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                       for _ in range(3))
+            out = fn(q, k, v, meta)
+            dout = torch.randn_like(out)
+            outs.append((out.detach(), *torch.autograd.grad(out, (q, k, v), dout)))
+        (co, cq, ck, cv), (eo, eq, ek, ev) = outs
+        assert i == 0 or counters["stats"]["unique_graphs"] == before, f"recompiled at geometry {i} {raw}"
+        assert torch.equal(co, eo) and torch.equal(ck, ek) and torch.equal(cv, ev), f"geometry {i} {raw}"
+        avg_abs, max_rel = _metrics(eq.float(), cq)
+        assert avg_abs < 1e-3 and max_rel < 0.25, (i, avg_abs, max_rel)
+    assert sum(counters["graph_break"].values()) == breaks0
+    assert counters["stats"]["unique_graphs"] - graphs0 == 1
+    torch._dynamo.reset()

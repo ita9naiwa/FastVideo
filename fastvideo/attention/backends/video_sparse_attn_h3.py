@@ -339,6 +339,8 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # instead of the index_put scatter into the builder buffer; see MiniMaxH3VSAImpl.tile.
     tile_partition_indices: torch.Tensor | None = None
     non_pad_index: torch.Tensor | None = None
+    # compute_topk(VSA_sparsity, num_video_tiles) as a host int, so compiled forwards do not trace float math on the sparsity
+    video_topk: int | None = None
 
 
 class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
@@ -401,6 +403,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
             tile_layout=tile_layout,
             tile_partition_indices=tile_partition_indices,
             non_pad_index=get_non_pad_index(variable_block_sizes, int(tile_size)),  # cached on sizes identity
+            video_topk=compute_topk(VSA_sparsity, num_video_tiles),
         )
         # Trust the cached index tensors only while unmodified (same contract as the generic VSA backend).
         if (not metadata.tile_partition_indices.is_inference() and not metadata.non_pad_index.is_inference()
@@ -430,10 +433,12 @@ def _build_block_mask(
     num_video_tiles: int,
     VSA_sparsity: float,
     exempt: bool,
+    k_vid: int | None = None,
 ) -> torch.Tensor:
-    """scores: [B, H, n_tiles, n_tiles] -> bool mask, same shape."""
+    """scores: [B, H, n_tiles, n_tiles] -> bool mask, same shape. k_vid: precomputed compute_topk(VSA_sparsity, num_video_tiles)."""
     n_tiles = scores.shape[-1]
-    k_vid = compute_topk(VSA_sparsity, num_video_tiles)
+    if k_vid is None:
+        k_vid = compute_topk(VSA_sparsity, num_video_tiles)
     if k_vid == num_video_tiles:
         return torch.ones_like(scores, dtype=torch.bool)
     mask = torch.zeros_like(scores, dtype=torch.bool)
@@ -578,7 +583,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         state = getattr(attn_metadata, "_tile_index_state", None)
         if (state is not None and grad_mode and not needs_sm100a_pair and x.ndim == 4 and x.is_cuda
                 and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
-                and state[0].device == x.device and state[2].device == x.device and x.numel() >= 2**25
+                and state[0].device == x.device and state[2].device == x.device and (compiling or x.numel() >= 2**25)
                 and x.shape[1] == state[0].numel() == state[2].numel()
                 and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
             # Opaque custom op (same key eager and compiled) around the shared _TilePermutation body; it re-checks the
@@ -761,6 +766,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 attn_metadata.num_video_tiles,
                 layer_sparsity,
                 attn_metadata.exempt,
+                attn_metadata.video_topk if layer_sparsity > 0.0 else None,
             )
         if force_dense is not None:
             # A scalar bool tensor broadcasts over the block map. This exactly
