@@ -147,14 +147,21 @@ def _triton_via_route_a_128(
     return block_sparse_attn_triton(q, k, v, q2k_idx, q2k_num, sizes_64)
 
 
+def _hint_kwargs(alias_guard):
+    """Forward the alias-guard hint only when set, so hint-less calls keep their exact previous arguments."""
+    return {} if alias_guard is None else {"alias_guard": alias_guard}
+
+
 def block_sparse_attn_128(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     logical_block_map_128: torch.Tensor,
     logical_variable_block_sizes_128: torch.Tensor,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """VSA-128 sparse-branch entrypoint for [B, H, S, D] inputs."""
+    """VSA-128 sparse-branch entrypoint for [B, H, S, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
     if logical_block_map_128.dim() == 3:
         logical_block_map_128 = logical_block_map_128.unsqueeze(0)
 
@@ -162,7 +169,8 @@ def block_sparse_attn_128(
         return _triton_via_route_a_128(q, k, v, logical_block_map_128, logical_variable_block_sizes_128)
 
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd
-    return block_sparse_attn_cute_fwd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128)
+    return block_sparse_attn_cute_fwd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128,
+                                      **_hint_kwargs(alias_guard))
 
 
 def block_sparse_attn_128_bshd(
@@ -171,8 +179,10 @@ def block_sparse_attn_128_bshd(
     v: torch.Tensor,
     logical_block_map_128: torch.Tensor,
     logical_variable_block_sizes_128: torch.Tensor,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """VSA-128 sparse-branch entrypoint for [B, S, H, D] inputs."""
+    """VSA-128 sparse-branch entrypoint for [B, S, H, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
     if logical_block_map_128.dim() == 3:
         logical_block_map_128 = logical_block_map_128.unsqueeze(0)
 
@@ -187,7 +197,8 @@ def block_sparse_attn_128_bshd(
         return out_bhsd.transpose(1, 2).contiguous(), aux
 
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
-    return block_sparse_attn_cute_fwd_bshd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128)
+    return block_sparse_attn_cute_fwd_bshd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128,
+                                           **_hint_kwargs(alias_guard))
 
 
 def block_sparse_attn_256(
@@ -196,8 +207,10 @@ def block_sparse_attn_256(
     v: torch.Tensor,
     logical_block_map_256: torch.Tensor,
     logical_variable_block_sizes_256: torch.Tensor,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """VSA-256 sparse-branch entrypoint for [B, H, S, D] inputs."""
+    """VSA-256 sparse-branch entrypoint for [B, H, S, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
     if logical_block_map_256.dim() == 3:
         logical_block_map_256 = logical_block_map_256.unsqueeze(0)
 
@@ -206,7 +219,7 @@ def block_sparse_attn_256(
 
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd
-    return block_sparse_attn_cute_fwd(q, k, v, mask_128, sizes_128)
+    return block_sparse_attn_cute_fwd(q, k, v, mask_128, sizes_128, **_hint_kwargs(alias_guard))
 
 
 def block_sparse_attn_256_bshd(
@@ -220,7 +233,8 @@ def block_sparse_attn_256_bshd(
     query_versions: tuple[int, int] = (0, 0),
     pack_tails: bool | None = None,
     qkv: torch.Tensor | None = None,
-    alias_guard: bool | None = None,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, S, H, D] inputs.
 
@@ -261,5 +275,4 @@ def block_sparse_attn_256_bshd(
                                                  qkv=qkv, alias_guard=alias_guard)
         return out, lse.detach()
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
-    hint = {} if alias_guard is None else {"alias_guard": alias_guard}  # hint-less calls stay byte-identical
-    return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128, **hint)
+    return block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128, **_hint_kwargs(alias_guard))

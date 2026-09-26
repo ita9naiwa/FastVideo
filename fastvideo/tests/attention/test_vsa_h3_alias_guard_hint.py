@@ -220,3 +220,92 @@ def test_h3mh_compile_config_mixed_prefix_docs(monkeypatch, hinted, entry):
     print(f"h3mh compile config ({entry}), mixed prefix/prefix-0 docs: {graphs} graph(s)", flush=True)
     assert graphs == 1, f"{graphs} graphs (recompiles) across prefix and prefix-0 documents"
     torch._dynamo.reset()
+
+
+# h3mh calls the fastvideo_kernel public entry points directly (its own wrapper, H3 metadata from the builder).
+def _public_inputs(grad, n=4):
+    torch.manual_seed(2)
+    q, k, v = (torch.randn(1, n * 256, _HEADS, _DIM, device="cuda", dtype=torch.bfloat16, requires_grad=grad)
+               for _ in range(3))
+    block_map = torch.rand(1, _HEADS, n, n, device="cuda") > 0.3
+    block_map[..., 0] = True
+    return q, k, v, block_map, torch.full((n, ), 256, device="cuda", dtype=torch.int32)
+
+
+_HINTS = [(True, True), (False, False), (torch.tensor(True, device="cpu"), True), (None, "absent")]
+
+
+@pytest.mark.parametrize("grad", [True, False], ids=["training", "nograd"])
+@pytest.mark.parametrize("entry", ["block_sparse_attn_256_bshd", "block_sparse_attn_cute_fwd_bshd"])
+def test_public_entry_points_forward_hint(monkeypatch, hinted, grad, entry):
+    import fastvideo_kernel.block_sparse_attn_256 as ep256
+    import fastvideo_kernel.block_sparse_attn_cute_fwd as epcute
+    calls = _spy(monkeypatch, hinted)
+    q, k, v, block_map, sizes = _public_inputs(grad)
+    if entry == "block_sparse_attn_cute_fwd_bshd":  # 128-granularity map as the 256 wrapper sends it
+        block_map, sizes = ep256._expand_mask_and_sizes_256_to_128(block_map, sizes)
+    fn = getattr(ep256 if entry.startswith("block_sparse_attn_256") else epcute, entry)
+    outs = []
+    for hint, expected in _HINTS:
+        calls.clear()
+        kwargs = {} if hint is None else {"alias_guard": hint}
+        with torch.set_grad_enabled(grad):
+            leaves = [t.detach().requires_grad_(grad) for t in (q, k, v)]
+            out = fn(*leaves, block_map, sizes, **kwargs)[0]
+            if grad:
+                out.float().sum().backward()
+        assert calls and set(calls) == {expected}, (entry, grad, hint, calls)
+        outs.append(out.detach())
+    assert all(torch.equal(outs[0], o) for o in outs[1:])  # the hint never changes values
+
+
+@pytest.mark.parametrize("stacked_route", [False, True], ids=["qkv3", "fused_qkv"])
+def test_public_entry_point_compiled_h3mh_style(monkeypatch, hinted, stacked_route):
+    """h3mh-style compiled training through the public 256 entry: inductor, dynamic=True, fullgraph, SAC MUST_SAVE
+    vsa256_fwd; the hint is a CPU tensor argument, so True/False share one graph and still reach the kernel. The
+    fused_qkv arm passes ``qkv=`` so the op takes the stacked [3B, S, H, D] input (k = v = None)."""
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+
+    from fastvideo_kernel import vsa256_ops
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    calls = _spy(monkeypatch, hinted)
+    stacked, chunks = [], vsa256_ops._chunks  # the op body (opaque, runs per call) reports which input form it got
+    monkeypatch.setattr(vsa256_ops, "_chunks", lambda q, k, v: (stacked.append(k is None), chunks(q, k, v))[1])
+    q, k, v, block_map, sizes = _public_inputs(grad=True)
+    must_save = {torch.ops.fastvideo_kernel.vsa256_fwd.default}
+    policy = lambda ctx, op, *a, **kw: (CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE)
+
+    def attend(q, k, v, block_map, sizes, hint):
+        if stacked_route:
+            qkv = torch.cat([q, k, v], dim=0)
+            return block_sparse_attn_256_bshd(*qkv.chunk(3, dim=0), block_map, sizes, qkv=qkv, alias_guard=hint)[0]
+        return block_sparse_attn_256_bshd(q, k, v, block_map, sizes, alias_guard=hint)[0]
+
+    compiled = torch.compile(lambda *args: checkpoint(attend, *args, use_reentrant=False, context_fn=functools.partial(
+        create_selective_checkpoint_contexts, policy)), backend="inductor", mode="default", dynamic=True, fullgraph=True)
+    torch._dynamo.reset()
+    counters = torch._dynamo.utils.counters
+    graphs0 = counters["stats"]["unique_graphs"]
+    for hint in (True, False, True):
+        calls.clear()
+        stacked.clear()
+        leaves = [t.detach().requires_grad_(True) for t in (q, k, v)]
+        out = compiled(*leaves, block_map, sizes, torch.tensor(hint, device="cpu"))
+        torch.autograd.grad(out, leaves, torch.randn_like(out))
+        assert calls and set(calls) == {hint}, (hint, calls)
+        assert stacked and set(stacked) == {stacked_route}, (hint, stacked)
+    assert counters["stats"]["unique_graphs"] - graphs0 == 1
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("grad", [True, False])
+def test_public_entry_old_provider_tolerance(monkeypatch, cute, grad):
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    q, k, v, block_map, sizes = _public_inputs(grad)
+    with torch.set_grad_enabled(grad):
+        reference = block_sparse_attn_256_bshd(q, k, v, block_map, sizes)[0].detach()
+        calls = _spy(monkeypatch, cute, old_provider=True)
+        out = block_sparse_attn_256_bshd(q, k, v, block_map, sizes, alias_guard=True)[0].detach()
+    assert calls and set(calls) == {"absent"}, calls
+    assert torch.equal(out, reference)

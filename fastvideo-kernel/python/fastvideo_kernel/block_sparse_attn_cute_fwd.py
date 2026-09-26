@@ -613,7 +613,7 @@ def _vc_prepared_sparse(p, sparse, variable_block_sizes, q_block_size, kv_block_
 
 
 def block_sparse_attn_vc_routes_fwd_bshd(
-    p, selected, variable_block_sizes, block_size, prefix, document_start=0, *, return_lse=True,
+    p, selected, variable_block_sizes, block_size, prefix, document_start=0, *, return_lse=True, alias_guard=None,
 ):
     """Consume unique top-k parent IDs directly, without a dense block map.
 
@@ -662,7 +662,7 @@ def block_sparse_attn_vc_routes_fwd_bshd(
     sparse = sparse_type(full_block_idx=full_idx, full_block_cnt=full_cnt,
                         mask_block_idx=mask_idx, mask_block_cnt=mask_cnt,
                         block_size=(block_size, 128))
-    return _vc_prepared_sparse(p, sparse, physical_sizes, block_size, 128, return_lse)
+    return _vc_prepared_sparse(p, sparse, physical_sizes, block_size, 128, return_lse, alias_guard)
 
 
 def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes, alias_guard=None):
@@ -695,8 +695,15 @@ def block_sparse_attn_cute_fwd(
     v: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Autograd-enabled CuTe block-sparse attention for [B, H, S, D]."""
+    """Autograd-enabled CuTe block-sparse attention for [B, H, S, D].
+
+    ``alias_guard``: FA4 persistent-grid alias-guard hint (keyword-only). None = the provider default; True / False
+    (or a 0-d CPU bool tensor, preferred under torch.compile) force it. H3 callers pass True iff the document has dense
+    prefix tiles (``MiniMaxH3VSAMetadata.alias_guard_hint``). Ignored by providers that predate the hint.
+    """
     if block_map.dim() == 3:
         block_map = block_map.unsqueeze(0)
 
@@ -709,6 +716,7 @@ def block_sparse_attn_cute_fwd(
         v_bshd,
         block_map,
         variable_block_sizes,
+        alias_guard=alias_guard,
     )
     out = out_bshd.transpose(1, 2).contiguous()
     # FA4 already returns lse as [B, H, S], matching the Triton path's aux
@@ -726,9 +734,14 @@ def block_sparse_attn_cute_fwd_bshd(
     *,
     pack_tails: bool | None = None,
     qkv: torch.Tensor | None = None,
-    alias_guard: bool | None = None,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Autograd-enabled CuTe block-sparse attention for [B, S, H, D]."""
+    """Autograd-enabled CuTe block-sparse attention for [B, S, H, D].
+
+    ``alias_guard``: FA4 persistent-grid alias-guard hint (keyword-only). None = the provider default; True / False
+    (or a 0-d CPU bool tensor, preferred under torch.compile) force it. H3 callers pass True iff the document has dense
+    prefix tiles (``MiniMaxH3VSAMetadata.alias_guard_hint``). Ignored by providers that predate the hint.
+    """
     if block_map.dim() == 3:
         block_map = block_map.unsqueeze(0)
 
@@ -752,9 +765,12 @@ def block_sparse_attn_vc_fwd_bshd(
     v: torch.Tensor,
     block_map: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    *,
+    alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Explicit inference-only VC entrypoint, independent of backend environment flags."""
+    """Explicit inference-only VC entrypoint, independent of backend environment flags (``alias_guard`` as
+    block_sparse_attn_cute_fwd_bshd)."""
     if block_map.dim() == 3:
         block_map = block_map.unsqueeze(0)
-    out, lse = _vc_sparse_attention(q, k, v, block_map, variable_block_sizes)
+    out, lse = _vc_sparse_attention(q, k, v, block_map, variable_block_sizes, alias_guard)
     return out, lse.detach()
