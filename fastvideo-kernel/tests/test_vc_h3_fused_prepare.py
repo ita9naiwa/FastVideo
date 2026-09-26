@@ -106,6 +106,34 @@ def test_fused_route_shuffled_untile_and_dense_layer(monkeypatch):
     assert rel3 < 1e-3, rel3
 
 
+
+@torch.inference_mode()
+def test_fused_prepare_pad_slots_are_masked(monkeypatch):
+    """Pad slots of the prepared K/V hold nonzero centered bytes and sizes alone do not mask loads: poisoning them with
+    the largest finite E4M3 code must leave every valid output row bitwise unchanged (the attention masks exclude them)."""
+    h3, meta, impl = _setup(monkeypatch)
+    from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
+    from fastvideo_kernel.block_sparse_attn_cute_fwd import (block_sparse_attn_vc_prepared_fwd_bshd,
+                                                             prepare_vsa_vc_fwd_bshd)
+    torch.manual_seed(5)
+    n = meta.total_seq_length
+    q, k, v = (torch.randn(1, n, 4, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    padded = meta.variable_block_sizes.numel() * 256
+    p2o = torch.full((padded, ), -1, dtype=torch.int64, device="cuda")
+    p2o[meta.untile_combined_index] = torch.arange(n, device="cuda")
+    p, pools = prepare_vsa_vc_fwd_bshd(q, k, v, p2o, meta.variable_block_sizes, 256, torch.arange(padded, device="cuda"),
+                                       padded, 0)
+    scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / math.sqrt(128)
+    mask = h3._build_block_mask(scores, meta.num_prefix_tiles, meta.num_video_tiles, meta.VSA_sparsity, meta.exempt)
+    mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(mask, meta.variable_block_sizes)
+    clean = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128)[0][:, meta.untile_combined_index]
+    pad = p2o < 0
+    assert pad.any()
+    for name in ("k", "v"):
+        p[name].view(torch.uint8)[:, pad] = 0x7E  # E4M3 448
+    poisoned = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128)[0][:, meta.untile_combined_index]
+    assert torch.equal(clean, poisoned)
+
 def test_fused_route_fallbacks(monkeypatch):
     h3, meta, impl = _setup(monkeypatch)
     x = torch.randn(3, meta.total_seq_length, 4, 128, device="cuda", dtype=torch.bfloat16)
