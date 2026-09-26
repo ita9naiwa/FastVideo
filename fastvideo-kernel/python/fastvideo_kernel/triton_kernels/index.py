@@ -280,16 +280,17 @@ def invert_indices(
     return k2q_idx, k2q_num
 
 
-@triton.jit
+# Shapes and strides are runtime values (and not specialized on divisibility), so every H3 document reuses one
+# compiled kernel per (KV_BLOCK, BLOCK) bucket instead of recompiling for each (H, Q, N, strides).
+@triton.jit(do_not_specialize=["stride_b", "stride_h", "stride_q", "stride_k", "stride_size", "H", "Q", "N"])
 def _classified_map_to_index_kernel(
     map_ptr, size_ptr, full_ptr, full_count_ptr, mask_ptr, mask_count_ptr,
-    stride_b: tl.constexpr, stride_h: tl.constexpr,
-    stride_q: tl.constexpr, stride_k: tl.constexpr, stride_size: tl.constexpr,
-    H: tl.constexpr, Q: tl.constexpr, N: tl.constexpr,
+    stride_b, stride_h, stride_q, stride_k, stride_size,
+    H, Q, N,
     KV_BLOCK: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    b, h, q = row // (H * Q), row // Q % H, row % Q
+    q, h, b = tl.program_id(0), tl.program_id(1), tl.program_id(2)  # 3D grid: no runtime div/mod by H and Q
+    row = (b * H + h) * Q + q
     col = tl.arange(0, BLOCK)
     chosen = tl.load(map_ptr + b * stride_b + h * stride_h + q * stride_q + col * stride_k,
                      col < N, other=False)
@@ -313,9 +314,9 @@ def map_to_classified_indices(block_map, sizes, kv_block_size):
     full_count = torch.empty((b, h, q), dtype=torch.int32, device=block_map.device)
     mask_count = torch.empty_like(full_count)
     if b * h * q:
-        _classified_map_to_index_kernel[(b * h * q,)](
+        _classified_map_to_index_kernel[(q, h, b)](
             block_map, sizes, full, full_count, masked, mask_count,
             *block_map.stride(), sizes.stride(0), h, q, n, kv_block_size,
-            triton.next_power_of_2(max(1, n)),
+            max(256, triton.next_power_of_2(n)),  # BLOCK buckets: 256 covers every real H3 doc at KV 256
         )
     return full, full_count, masked, mask_count

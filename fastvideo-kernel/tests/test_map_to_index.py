@@ -49,3 +49,32 @@ def test_changed_graph_contents():
         graph.replay()
         for actual, expected in zip(captured, reference(mask)):
             assert torch.equal(actual, expected)
+
+
+def _classified_reference(mask, sizes, kv_block):
+    full = mask.bool() & (sizes == kv_block)
+    part = mask.bool() & (sizes > 0) & (sizes < kv_block)
+    return (*reference(full), *reference(part))
+
+
+@pytest.mark.parametrize('kv_block', [128, 256])
+def test_classified_indices_one_compile_per_bucket(kv_block):
+    """Outputs match the reference for any (H, Q, N, strides), and shapes never force a recompile."""
+    from fastvideo_kernel.triton_kernels import index
+    kernel = index._classified_map_to_index_kernel
+    shapes = [(1, 1, 1, 1), (1, 2, 5, 17), (2, 3, 7, 100), (1, 56, 9, 128), (1, 4, 11, 129), (2, 8, 3, 200),
+              (1, 56, 13, 256), (1, 5, 2, 300)]
+    for b, h, q, n in shapes:
+        mask = torch.rand(b, h, q, n, device='cuda') > .6
+        for transposed in (False, True):
+            m = mask.transpose(-1, -2).contiguous().transpose(-1, -2) if transposed else mask
+            sizes = torch.randint(0, kv_block + 1, (n,), device='cuda', dtype=torch.int32)
+            got = index.map_to_classified_indices(m, sizes, kv_block)
+            for g, r in zip(got, _classified_reference(m, sizes, kv_block), strict=True):
+                assert torch.equal(g, r), (b, h, q, n, transposed)
+    cache = getattr(kernel, 'device_caches', None)
+    if cache is not None:
+        # BLOCK buckets 256 / 512 (n = 300) for this KV_BLOCK; no per-(H, Q, N, stride) variants.
+        compiled = cache[torch.cuda.current_device()][0]
+        per_block = [k for k in compiled if f"('constexpr', {kv_block}), ('constexpr'" in str(k)]  # this KV_BLOCK
+        assert len(per_block) <= 2, len(per_block)
