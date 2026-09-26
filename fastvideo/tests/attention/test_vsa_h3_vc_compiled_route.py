@@ -139,3 +139,14 @@ def test_vc_ops_cuda_graph(h3, monkeypatch):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, block(qkv_a, meta_a)), seed
+
+
+def test_vc_ops_tile128_not_implemented():
+    from fastvideo_kernel import block_sparse_attn_cute_fwd  # noqa: F401 (registers the vc_h3_* ops)
+    x = torch.zeros(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16)
+    sizes = torch.full((1, ), 128, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="ruling-84"):
+        torch.ops.fastvideo_kernel.vc_h3_prepare_fused(x, x, x, torch.arange(128, device="cuda"), sizes, 128)
+    mask = torch.ones(1, 1, 1, 1, dtype=torch.bool, device="cuda")
+    with pytest.raises(NotImplementedError, match="ruling-84"):
+        torch.ops.fastvideo_kernel.vc_h3_attn_prepared(x, x, x, x, x, x, mask, sizes, 128)

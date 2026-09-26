@@ -799,7 +799,8 @@ def block_sparse_attn_vc_fwd_bshd(
 
 # Compiled no-grad VC route (H3 fused producer): opaque ops whose bodies are the eager route's calls, used in eager AND
 # compiled mode, so eager == compiled by construction. The ctypes/NVRTC producer and the CuTe JIT stay behind the op
-# boundary; fakes derive every output shape from input shapes (no int arguments to specialize on).
+# boundary; fakes derive every output shape from input shapes and ``tile`` (the metadata's tile size, a trace-time
+# constant). Only tile 256 is implemented; tile 128 raises until the ruling-84 H3 API (one entry, tile=128|256) lands.
 # JIT placement. What compiles inside the op bodies on first use (census over the 46 s085k32 docs x 2 layouts):
 #  - the NVRTC producer module: once per device;
 #  - the FA4 CuTe forward: one compile_cache key for every doc (fixed Q256/KV128 block sparsity, FP8, D, vector mask);
@@ -815,6 +816,13 @@ _VC_WARMED_ATTN: set = set()  # attention JIT keys run outside capture
 
 def _vc_warm_key(x: torch.Tensor) -> str:
     return str(x.device)
+
+
+def _vc_require_tile(tile: int) -> None:
+    if tile == 128:
+        raise NotImplementedError("VC compiled route: tile 128 lands with the ruling-84 API")
+    if tile != 256:
+        raise ValueError(f"VC compiled route: tile must be 128 or 256, got {tile}")
 
 
 def _vc_attn_key(q8: torch.Tensor, block_map: torch.Tensor, alias_guard) -> tuple:
@@ -842,15 +850,17 @@ def vc_h3_prepare_fused(
     v: torch.Tensor,
     untile: torch.Tensor,
     sizes: torch.Tensor,
+    tile: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor]:
-    """Packed rows -> padded FP8 Q/K/V, descales, FP32 tile pools (cold producer, 256-token tiles, query offset 0)."""
+    """Packed rows -> padded FP8 Q/K/V, descales, FP32 tile pools (cold producer, ``tile``-token tiles, query offset 0)."""
+    _vc_require_tile(tile)
     _vc_require_warm(q, torch.cuda.is_current_stream_capturing())
-    padded = sizes.numel() * 256
+    padded = sizes.numel() * tile
     padded_to_original = torch.full((padded, ), -1, dtype=torch.int64, device=q.device)
     padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=q.device)
     padded_to_query = torch.arange(padded, dtype=torch.int64, device=q.device)
-    p, pools = prepare_vsa_vc_fwd_bshd(q.contiguous(), k.contiguous(), v.contiguous(), padded_to_original, sizes, 256,
+    p, pools = prepare_vsa_vc_fwd_bshd(q.contiguous(), k.contiguous(), v.contiguous(), padded_to_original, sizes, tile,
                                        padded_to_query, padded, 0)
     if not torch.cuda.is_current_stream_capturing():
         _VC_WARMED.add(_vc_warm_key(q))
@@ -858,11 +868,12 @@ def vc_h3_prepare_fused(
 
 
 @vc_h3_prepare_fused.register_fake
-def _vc_h3_prepare_fused_fake(q, k, v, untile, sizes):
+def _vc_h3_prepare_fused_fake(q, k, v, untile, sizes, tile):
+    _vc_require_tile(tile)
     _vc_require_warm(q, True)
     b, _, h, d = q.shape
     n = sizes.shape[0]
-    fp8 = [q.new_empty((b, n * 256, h, d), dtype=torch.float8_e4m3fn) for _ in range(3)]
+    fp8 = [q.new_empty((b, n * tile, h, d), dtype=torch.float8_e4m3fn) for _ in range(3)]
     scales = [q.new_empty(shape, dtype=torch.float32) for shape in ((b, h), (b, h), (b, h, d))]
     pools = [q.new_empty((b, h, n, d), dtype=torch.float32) for _ in range(3)]
     return (*fp8, *scales, *pools)
@@ -870,13 +881,14 @@ def _vc_h3_prepare_fused_fake(q, k, v, untile, sizes):
 
 @torch.library.custom_op("fastvideo_kernel::vc_h3_attn_prepared", mutates_args=())
 def vc_h3_attn_prepared(q8: torch.Tensor, k8: torch.Tensor, v8: torch.Tensor, qs: torch.Tensor, ks: torch.Tensor,
-                        vs: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor,
+                        vs: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor, tile: int,
                         alias_guard: torch.Tensor | None = None) -> torch.Tensor:
-    """VC attention on prepared FP8 Q/K/V with a [B, H, n, n] 256-tile map -> BF16 [B, n*256, H, D] (padded tile layout).
+    """VC attention on prepared FP8 Q/K/V with a [B, H, n, n] tile map -> BF16 [B, n*tile, H, D] (padded tile layout).
 
     ``alias_guard``: FA4 alias-guard hint as a 0-d CPU bool tensor (H3 ``alias_guard_hint``), a graph input like
     vsa256_fwd's, so a per-document value never specializes the compiled graph.
     """
+    _vc_require_tile(tile)
     from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
     key = _vc_attn_key(q8, block_map, alias_guard)
     capturing = torch.cuda.is_current_stream_capturing()
@@ -891,6 +903,7 @@ def vc_h3_attn_prepared(q8: torch.Tensor, k8: torch.Tensor, v8: torch.Tensor, qs
 
 
 @vc_h3_attn_prepared.register_fake
-def _vc_h3_attn_prepared_fake(q8, k8, v8, qs, ks, vs, block_map, sizes, alias_guard=None):
+def _vc_h3_attn_prepared_fake(q8, k8, v8, qs, ks, vs, block_map, sizes, tile, alias_guard=None):
+    _vc_require_tile(tile)
     _vc_require_warm(qs, True)
     return q8.new_empty(q8.shape, dtype=torch.bfloat16)

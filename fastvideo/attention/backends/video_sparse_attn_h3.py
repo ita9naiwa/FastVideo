@@ -802,6 +802,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if _resolve_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
             return None
         vc = os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"
+        # "vc" still means tile 256 only: _vc_fused_applies gates on tile_elems == 256 and the vc_h3_* ops raise for
+        # tile 128 until the ruling-84 H3 API (tile=128|256) lands.
         if vc and (self.head_size != 128 or probe_enabled() is not None):
             return None
         try:
@@ -945,7 +947,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         import fastvideo_kernel.block_sparse_attn_cute_fwd  # noqa: F401 (registers the vc_h3_* ops)
         sizes = attn_metadata.variable_block_sizes
         n_tiles = sizes.numel()
-        padded = n_tiles * 256
+        tile = attn_metadata.tile_elems
+        padded = n_tiles * tile
         for name, tensor in (("query", query), ("key", key), ("value", value)):
             if tensor.shape[1] != attn_metadata.total_seq_length:
                 raise ValueError(f"VSA-H3 fused VC {name} has length {tensor.shape[1]}, expected the packed length "
@@ -953,7 +956,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         # The padded-row maps are rebuilt per call inside the producer op from the authoritative untile index.
         untile = attn_metadata.untile_combined_index
         q8, k8, v8, qs, ks, vs, *pools = torch.ops.fastvideo_kernel.vc_h3_prepare_fused(
-            query, key, value, untile, sizes)
+            query, key, value, untile, sizes, tile)
         # Dense-layer decision: tensor-valued under capture (one graph for every layer), as in forward().
         force_dense = None
         if torch.compiler.is_compiling() and self._compile_layer_idx is not None:
@@ -970,16 +973,16 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
         if force_dense is not None:
             mask = mask | force_dense
-        out = torch.ops.fastvideo_kernel.vc_h3_attn_prepared(q8, k8, v8, qs, ks, vs, mask, sizes,
-                                                               attn_metadata.alias_guard_hint)
+        out = torch.ops.fastvideo_kernel.vc_h3_attn_prepared(q8, k8, v8, qs, ks, vs, mask, sizes, tile,
+                                                             attn_metadata.alias_guard_hint)
         if gate_compress is not None:
             scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
             out_c = torch.matmul(torch.softmax(scores, dim=-1), pools[2]).permute(0, 2, 1, 3).to(out.dtype)
             batch, _, heads, dim = out.shape
             gate = gate_compress.new_zeros(batch, padded, heads, dim)
             gate[:, untile] = gate_compress
-            out = (out.view(batch, n_tiles, 256, heads, dim)
-                   + out_c.unsqueeze(2) * gate.view(batch, n_tiles, 256, heads, dim)).view(batch, padded, heads, dim)
+            out = (out.view(batch, n_tiles, tile, heads, dim) +
+                   out_c.unsqueeze(2) * gate.view(batch, n_tiles, tile, heads, dim)).view(batch, padded, heads, dim)
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
