@@ -74,7 +74,7 @@ def test_classified_indices_one_compile_per_bucket(kv_block):
                 assert torch.equal(g, r), (b, h, q, n, transposed)
     cache = getattr(kernel, 'device_caches', None)
     if cache is not None:
-        # BLOCK buckets 256 / 512 (n = 300) for this KV_BLOCK; no per-(H, Q, N, stride) variants.
+        # BLOCK buckets 128 / 256 / 512 (n = 300) for this KV_BLOCK; no per-(H, Q, N, stride) variants.
         compiled = cache[torch.cuda.current_device()][0]
         per_block = [k for k in compiled if f"('constexpr', {kv_block}), ('constexpr'" in str(k)]  # this KV_BLOCK
-        assert len(per_block) <= 2, len(per_block)
+        assert len(per_block) <= 3, len(per_block)

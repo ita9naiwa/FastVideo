@@ -317,6 +317,6 @@ def map_to_classified_indices(block_map, sizes, kv_block_size):
         _classified_map_to_index_kernel[(q, h, b)](
             block_map, sizes, full, full_count, masked, mask_count,
             *block_map.stride(), sizes.stride(0), h, q, n, kv_block_size,
-            max(256, triton.next_power_of_2(n)),  # BLOCK buckets: 256 covers every real H3 doc at KV 256
+            max(128, triton.next_power_of_2(n)),  # BLOCK buckets 128 / 256 / 512: a fixed set, independent of doc length
         )
     return full, full_count, masked, mask_count
