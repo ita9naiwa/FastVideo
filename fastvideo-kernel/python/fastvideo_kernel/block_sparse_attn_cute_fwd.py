@@ -230,7 +230,7 @@ def _build_sparse_tensors(
     summed); and a 128-row Q block keeps its own sparse list instead of being doubled to 256 rows, which would give
     each Q tile its neighbour's KV selection.
     """
-    if kv_block_size < _FA4_Q_BLOCK_SIZE:
+    if kv_block_size < _FA4_Q_BLOCK_SIZE <= q_block_size:  # tile-64 callers keep their own 64-token lists
         factor = _FA4_Q_BLOCK_SIZE // kv_block_size
         if _FA4_Q_BLOCK_SIZE % kv_block_size or block_map.shape[-1] % factor or variable_block_sizes.numel() % factor:
             raise ValueError(f"kv_block_size={kv_block_size} must tile {_FA4_Q_BLOCK_SIZE} and the KV block count")
