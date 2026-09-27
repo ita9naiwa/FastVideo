@@ -706,6 +706,10 @@ def _vc_sparse_attention(q, k, v, block_map, variable_block_sizes, alias_guard=N
         q, (0, 0, 0, 0, 0, k.shape[1] - q.shape[1]))
     p = vc_preprocess.prepare(q_padded.contiguous(), k.contiguous(), v.contiguous(), smooth=False, bshd=True)
     p["q"] = p["q"][:, :q.shape[1]]
+    # The H3 builder's sizes are int64 (the 256 wrapper's 256->128 expansion already yields int32); the validator
+    # below keeps rejecting every other dtype, shape or device.
+    if variable_block_sizes.dtype == torch.int64:
+        variable_block_sizes = variable_block_sizes.to(torch.int32)
     out, lse = block_sparse_attn_vc_prepared_fwd_bshd(p, block_map, variable_block_sizes, alias_guard=alias_guard)
     return out.to(q.dtype), lse
 
