@@ -296,6 +296,21 @@ def test_train_op_tile256_is_the_vsa256_default_route(cute):
 
 
 @_requires_sm100
+@pytest.mark.parametrize("tile", [64, 512])
+def test_train_ops_reject_unsupported_tile(cute, tile):
+    """vsa_train_fwd and vsa_train_bwd both reject tiles other than 128/256 (no silent fall-through to the 128 path)."""
+    q = torch.zeros(1, 256, 1, _DIM, device="cuda", dtype=torch.bfloat16)
+    sizes = torch.tensor([128, 128], device="cuda")
+    block_map = torch.ones(1, 1, 2, 2, device="cuda", dtype=torch.bool)
+    lse = torch.zeros(1, 1, 256, device="cuda")
+    ops = torch.ops.fastvideo_kernel
+    with pytest.raises(ValueError, match="vsa_train_fwd supports tile 128 or 256"):
+        ops.vsa_train_fwd(q, q, q, block_map, sizes, tile)
+    with pytest.raises(ValueError, match="vsa_train_bwd supports tile 128 or 256"):
+        ops.vsa_train_bwd(q, q, q, q, q, lse, block_map, sizes, tile)
+
+
+@_requires_sm100
 def test_tile128_h3mh_compile_contract(cute, monkeypatch):
     """h3mh block compile (inductor, dynamic, fullgraph, fail_on_recompile_limit_hit, use_duck_shape=False, SAC in-region
     MUST_SAVE {vsa256_fwd, vsa_train_fwd, vsa_h3_block_map}): one graph over several doc shapes, no breaks, no recompiles,

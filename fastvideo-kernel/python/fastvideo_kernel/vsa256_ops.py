@@ -220,6 +220,8 @@ def vsa_train_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch
                   lse: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor, tile: int) -> list[torch.Tensor]:
     if tile == 256:
         return vsa256_bwd(dout, q, k, v, out, lse, block_map, sizes, None, None, 0, 0, False, None)
+    if tile != 128:
+        raise ValueError(f"vsa_train_bwd supports tile 128 or 256, got {tile}")
     sizes = sizes.to(torch.int32)
     _, backward_sparse = adapter._build_sparse_tensors(block_map, sizes, q_len=q.shape[1], q_block_size=128,
                                                        kv_block_size=128, need_backward=True, need_forward=False,
