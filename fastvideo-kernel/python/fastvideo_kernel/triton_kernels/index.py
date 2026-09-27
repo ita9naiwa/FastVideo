@@ -306,6 +306,12 @@ def _classified_map_to_index_kernel(
         tl.store(count_ptr + row, count)
 
 
+def classified_index_block(n):
+    """The kernel's BLOCK for an n-column map: buckets 128 / 256 / 512 (a fixed set, independent of doc length); with
+    KV_BLOCK it is the whole compile key (callers that must know whether a launch compiles use this)."""
+    return max(128, triton.next_power_of_2(n))
+
+
 def map_to_classified_indices(block_map, sizes, kv_block_size):
     """Fuse full/partial classification for a validated bool map and int32 size vector."""
     b, h, q, n = block_map.shape
@@ -317,6 +323,6 @@ def map_to_classified_indices(block_map, sizes, kv_block_size):
         _classified_map_to_index_kernel[(q, h, b)](
             block_map, sizes, full, full_count, masked, mask_count,
             *block_map.stride(), sizes.stride(0), h, q, n, kv_block_size,
-            max(128, triton.next_power_of_2(n)),  # BLOCK buckets 128 / 256 / 512: a fixed set, independent of doc length
+            classified_index_block(n),
         )
     return full, full_count, masked, mask_count

@@ -804,9 +804,9 @@ def block_sparse_attn_vc_fwd_bshd(
 # JIT placement. What compiles inside the op bodies on first use (census over the 46 s085k32 docs x 2 layouts):
 #  - the NVRTC producer module: once per device;
 #  - the FA4 CuTe forward: one compile_cache key for every doc (fixed Q256/KV128 block sparsity, FP8, D, vector mask);
-#  - the Triton _classified_map_to_index_kernel (map_to_classified_indices): shapes/strides are constexpr, so one
-#    compile per (H, n_tiles) of the 256-tile map (strides follow from H and n; batch only sizes the grid).
-# The attention key below covers the last two (conservatively adding D and the device) plus the alias_guard hint,
+#  - the Triton _classified_map_to_index_kernel (map_to_classified_indices): one compile per (KV_BLOCK, BLOCK) bucket
+#    (classified_index_block of the 128-token KV column count; 3 buckets over the spec corpus).
+# The attention key below covers the last two (conservatively adding H, D and the device) plus the alias_guard hint,
 # which is in FA4's compile_key. CUDA-graph capture of a call whose key was never run eagerly raises before any launch,
 # instead of compiling inside the capture. Dynamo tracing sees symbolic shapes, so the fakes can only require the
 # device to be warm.
@@ -827,8 +827,10 @@ def _vc_require_tile(tile: int) -> None:
 
 def _vc_attn_key(q8: torch.Tensor, block_map: torch.Tensor, alias_guard) -> tuple:
     # alias_guard is part of FA4's compile_key, so each hint value (None/False/True) is its own CuTe JIT entry.
+    from fastvideo_kernel.triton_kernels.index import classified_index_block
     hint = None if alias_guard is None else bool(alias_guard)
-    return (str(q8.device), int(q8.shape[2]), int(q8.shape[3]), int(block_map.shape[-1]), hint)
+    # The kernel lists are built on the 128-token KV children: two per 256-token tile.
+    return (str(q8.device), int(q8.shape[2]), int(q8.shape[3]), classified_index_block(2 * int(block_map.shape[-1])), hint)
 
 
 def _vc_cold(what: str) -> RuntimeError:

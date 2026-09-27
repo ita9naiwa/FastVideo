@@ -4,6 +4,7 @@ fused route bitwise, torch.compile(fullgraph=True, dynamic=True) must take the V
 bitwise, and capture before the op JIT is built (Dynamo cold capture, CUDA-graph capture of an unwarmed geometry) must
 raise the op's assertion instead of compiling inside the graph."""
 import os
+from collections import defaultdict
 
 import pytest
 import torch
@@ -139,6 +140,27 @@ def test_vc_ops_cuda_graph(h3, monkeypatch):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, block(qkv_a, meta_a)), seed
+
+
+@torch.no_grad()
+def test_vc_warm_keys_match_index_compiles(h3, monkeypatch):
+    """The attention warm key tracks the real JIT: with empty warm and Triton caches, every document adds exactly as many
+    op keys as classified-index kernel compiles (one per BLOCK bucket), over geometries in different buckets."""
+    h3, adapter, impl, _, _ = h3
+    from fastvideo_kernel.triton_kernels import index
+    kernel = index._classified_map_to_index_kernel
+    monkeypatch.setattr(adapter, "_VC_WARMED_ATTN", set())
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    compiles = []
+    real = type(kernel)._do_compile
+    monkeypatch.setattr(kernel, "_do_compile", lambda *a, **kw: compiles.append(1) or real(kernel, *a, **kw))
+    block = _block(impl)
+    for layout in ("chunk256", "cube"):
+        for i in range(len(DOCS)):
+            keys0, compiles0 = len(adapter._VC_WARMED_ATTN), len(compiles)
+            block(*_doc(h3, i, layout)[::-1])
+            assert len(adapter._VC_WARMED_ATTN) - keys0 == len(compiles) - compiles0, (layout, i)
+    assert len(adapter._VC_WARMED_ATTN) == len(compiles) >= 2
 
 
 def test_vc_ops_tile128_not_implemented():
