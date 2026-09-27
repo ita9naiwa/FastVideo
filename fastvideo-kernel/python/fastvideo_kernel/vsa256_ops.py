@@ -144,25 +144,27 @@ _nograd_warm: set[tuple] = set()
 
 @torch.library.custom_op("fastvideo_kernel::vsa256_nograd_fwd", mutates_args=(), device_types="cuda")
 def vsa256_nograd_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_map: torch.Tensor,
-                      sizes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                      sizes: torch.Tensor, alias_guard: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Inference-only BF16 Q256 forward: exactly the eager no-grad route (256 map expanded to 128-token KV children,
-    then the CuTe forward), behind one opaque boundary so torch.compile(fullgraph=True) can capture it. No autograd."""
+    then the CuTe forward), behind one opaque boundary so torch.compile(fullgraph=True) can capture it. No autograd.
+    ``alias_guard``: the FA4 alias-guard hint as a 0-d CPU bool tensor (a graph input), or None for the FA4 default."""
     if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
         raise RuntimeError("vsa256_nograd_fwd is the BF16 route; FASTVIDEO_VSA_VC=1 must be resolved by the caller")
-    key = (tuple(q.shape), tuple(k.shape), tuple(block_map.shape))
+    # The hint is part of FA4's compile key, so a warmed geometry is warm only for the hint value it ran with.
+    key = (None if alias_guard is None else bool(alias_guard), tuple(q.shape), tuple(k.shape), tuple(block_map.shape))
     if torch.cuda.is_current_stream_capturing() and key not in _nograd_warm:
         raise RuntimeError("vsa256_nograd_fwd: CUDA-graph capture reached an unwarmed geometry (its CuTe JIT would run "
                            "inside the capture); run one eager or compiled forward of this geometry first")
     from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(block_map, sizes)
     with torch.no_grad():
-        out, lse = adapter.block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128)
+        out, lse = adapter.block_sparse_attn_cute_fwd_bshd(q, k, v, mask_128, sizes_128, alias_guard=alias_guard)
     _nograd_warm.add(key)
     return out, lse
 
 
 @torch.library.register_fake("fastvideo_kernel::vsa256_nograd_fwd")
-def _vsa256_nograd_fwd_fake(q, k, v, block_map, sizes):
+def _vsa256_nograd_fwd_fake(q, k, v, block_map, sizes, alias_guard=None):
     return q.new_empty(q.shape), q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
 
 
@@ -171,7 +173,8 @@ def training_eligible(q, k, v, block_map, block=256):
     outside it (e.g. strided views that are not 16-byte aligned, shape mismatches, FASTVIDEO_VSA_VC=1) always takes the
     caller's fallback and never reaches an op whose fake would not describe it. Under torch.compile the data_ptr()
     alignment read of a non-contiguous input is not traceable (fullgraph raises; disclosed limitation)."""
-    return torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)) and _native_domain(q, k, v, block_map)
+    return (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+            and _native_domain(q, k, v, block_map, block))
 
 
 def nograd_eligible(q, k, v, block_map):
@@ -180,7 +183,7 @@ def nograd_eligible(q, k, v, block_map):
             and _native_domain(q, k, v, block_map))
 
 
-def _native_domain(q, k, v, block_map):
+def _native_domain(q, k, v, block_map, block=256):
     return (q.is_cuda and q.dtype == k.dtype == v.dtype == torch.bfloat16
             and q.ndim == k.ndim == v.ndim == 4
             and q.shape[-1] == k.shape[-1] == v.shape[-1] and q.shape[-1] in (64, 128)

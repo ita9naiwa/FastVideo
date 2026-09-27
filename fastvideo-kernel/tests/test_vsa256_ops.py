@@ -400,3 +400,25 @@ def test_h3_nograd_block_fullgraph(monkeypatch):
         assert sum(counters["graph_break"].values()) == breaks0
         assert counters["stats"]["unique_graphs"] - graphs0 == 1, layout
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("warm,capture", [(w, c) for w in (None, False, True) for c in (None, False, True) if w != c])
+def test_vsa256_nograd_op_warm_key_includes_hint(warm, capture):
+    """The alias-guard hint is part of FA4's compile key: a geometry warmed with one hint value (None/False/True) is not
+    warm for another, so a CUDA-graph capture with a different hint raises before any launch (all 6 unequal pairs,
+    including warm True / capture False); after one launch with the capture hint the capture replays bitwise."""
+    from fastvideo_kernel import vsa256_ops
+    vsa256_ops._nograd_warm.clear()
+    q, k, v, block_map, sizes = _inputs(n_tiles=11, requires_grad=False)
+    op = torch.ops.fastvideo_kernel.vsa256_nograd_fwd
+    as_args = lambda h: () if h is None else (torch.tensor(h, device="cpu"), )
+    op(q, k, v, block_map, sizes, *as_args(warm))
+    with pytest.raises(RuntimeError, match="unwarmed geometry"), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        op(q, k, v, block_map, sizes, *as_args(capture))
+    ref = op(q, k, v, block_map, sizes, *as_args(capture))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(q, k, v, block_map, sizes, *as_args(capture))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out[0], ref[0])

@@ -162,6 +162,37 @@ def test_compiled_custom_op_carries_hint(monkeypatch, hinted):
     assert torch.ops.fastvideo_kernel.vsa256_fwd.default.name() == "fastvideo_kernel::vsa256_fwd"  # SAC op key
 
 
+def test_compiled_nograd_op_carries_hint(monkeypatch, hinted):
+    """The compiled no-grad op (vsa256_nograd_fwd) takes the hint as a CPU tensor input: one fullgraph graph, no
+    recompile between prefix and prefix-0 documents, and the kernel receives True / False."""
+    from torch._dynamo.testing import CompileCounter
+
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    calls = _spy(monkeypatch, hinted)
+    torch.manual_seed(2)
+    n = 4
+    q, k, v = (torch.randn(1, n * 256, _HEADS, _DIM, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    block_map = torch.rand(1, _HEADS, n, n, device="cuda") > 0.3
+    block_map[..., 0] = True
+    sizes = torch.full((n, ), 256, device="cuda", dtype=torch.int32)
+
+    def attend(q, k, v, block_map, sizes, hint):
+        return block_sparse_attn_256_bshd(q, k, v, block_map, sizes, alias_guard=hint)[0]
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(attend, backend=counter, fullgraph=True, dynamic=True)
+    outs = {}
+    with torch.no_grad():
+        for prefix_doc in (True, False, True, False):
+            calls.clear()
+            out = compiled(q, k, v, block_map, sizes, torch.tensor(prefix_doc, device="cpu"))
+            assert set(calls) == {prefix_doc}, (prefix_doc, calls)
+            outs.setdefault(prefix_doc, out)
+    assert counter.frame_count == 1, counter.frame_count  # one graph, zero recompiles across hint values
+    assert torch.equal(outs[True], outs[False])  # the hint never changes values
+
+
 def test_metadata_hint_is_host_tensor():
     for prefix, expected in (((64, 32, 16), True), ((), False)):
         hint = _meta(prefix).alias_guard_hint
