@@ -1217,7 +1217,13 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             # route. Both forward launches get the same alias-guard hint as the tile-256 route.
             if _resolve_backend() == "cutedsl" and vsa256_ops.training_eligible(
                     logical_query, logical_key, logical_value, mask, block=128):
-                out, _ = torch.ops.fastvideo_kernel.vsa_train_fwd(logical_query, logical_key, logical_value, mask,
+                # Stacked route (forward_qkv with fused_qkv_grad), as at tile 256: the contiguous [3B, S, H, D] stack is
+                # the single op input and the backward writes one fused dQ/dK/dV allocation (no chunk-backward concat).
+                stacked = (qkv is not None and gate_compress is None and query.shape[1] == logical_seq_len
+                           and qkv.is_contiguous() and qkv.shape == (3 * query.shape[0], *query.shape[1:]))
+                out, _ = torch.ops.fastvideo_kernel.vsa_train_fwd(qkv if stacked else logical_query,
+                                                                  None if stacked else logical_key,
+                                                                  None if stacked else logical_value, mask,
                                                                   attn_metadata.variable_block_sizes, tile_elems,
                                                                   attn_metadata.alias_guard_hint)
             else:
