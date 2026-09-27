@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """preprocess_q_k_v tiles separate q, k, v without a stacked copy: byte-identical to preprocess_qkv(cat([q, k, v]))."""
 
+import os
+import re
 import types
 
 import pytest
@@ -8,10 +10,13 @@ import torch
 
 from fastvideo.attention import layer
 from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
+from fastvideo.tests.attention.test_vsa_h3_metadata import _S085K32_DOCS
+from fastvideo.tests.attention.test_vsa_h3_vc_compiled_route import h3  # noqa: F401 (VC route fixture)
 
 # token grid (37, 24, 42) + text/audio prefix: 38,010 rows; 3 x [1, S, 4, 128] is >= 2**25 elements (eligible eager).
 _SPEC = dict(raw_latent_shape=(37, 48, 84), patch_size=(1, 2, 2), prefix_segments=(300, 0, 414))
 _LAYOUTS = [dict(), dict(tile_layout="chunk256", merge_prefix=True)]
+_CAT = re.compile(r"_cat_|_cat\b|aten\.cat|torch\.cat")  # a cat kernel or call in Inductor output (not "allocate")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -68,12 +73,99 @@ def test_untrusted_index_falls_back_exactly():
     assert torch.equal(actual, reference) and all(torch.equal(a, b) for a, b in zip(grads, ref_grads, strict=True))
 
 
-def test_no_grad_and_ineligible_calls_take_the_stacked_route():
+def _holder_path(impl, md, x):
+    """Today's no-grad route: preprocess_qkv into the builder-owned holder (trusted index state dropped), cloned."""
+    state = md.__dict__.pop("_tile_index_state")
+    try:
+        md.tile_buf_holder.buffer = None
+        out = impl.preprocess_qkv(x, md)
+        assert out is md.tile_buf_holder.buffer
+        return out.clone()
+    finally:
+        md._tile_index_state = state
+
+
+def _real_doc(doc, tile):
+    (t, h, w), prefix = doc
+    return MiniMaxH3VSAMetadataBuilder().build(current_timestep=0,
+                                               VSA_sparsity=0.85,
+                                               device=torch.device("cuda"),
+                                               raw_latent_shape=(t, 2 * h, 2 * w),
+                                               patch_size=(1, 2, 2),
+                                               prefix_segments=prefix,
+                                               tile_size=tile,
+                                               tile_layout=f"chunk{tile}",
+                                               merge_prefix=True)
+
+
+@pytest.mark.parametrize("tile", [256, 128])
+@pytest.mark.parametrize("doc", _S085K32_DOCS[:2], ids=lambda d: "x".join(map(str, d[0])))
+def test_nograd_matches_holder_path_real_docs(doc, tile):
+    """s085k32 real-shape docs: no-grad preprocess_q_k_v and preprocess_qkv/tile (eager and compiled) equal today's
+    cat + holder route bitwise, never return the holder, and build no autograd state (inputs require grad)."""
+    impl, md = _impl(), _real_doc(doc, tile)
+    q, k, v = _qkv(md, seed=21)
+    qkv = torch.cat([q, k, v], dim=0).detach()
+    expected = _holder_path(impl, md, qkv)
+    with torch.no_grad():
+        routes = {
+            "separate": lambda a, b, c: torch.cat(impl.preprocess_q_k_v(a, b, c, md), dim=0),
+            "stacked": lambda a, b, c: impl.preprocess_qkv(torch.cat([a, b, c], dim=0), md),
+        }
+        for name, fn in routes.items():
+            torch._dynamo.reset()
+            for mode, run in (("eager", fn), ("compiled", torch.compile(fn, fullgraph=True, dynamic=True))):
+                out = run(q, k, v)
+                assert torch.equal(out, expected), (name, mode)
+                assert not out.requires_grad and out.grad_fn is None, (name, mode)
+                holder = md.tile_buf_holder.buffer  # compiled tile-128 tile() owns its output since op-family-v2
+                assert holder is None or out.data_ptr() != holder.data_ptr(), (name, mode)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("tile", [256, 128])
+def test_nograd_outputs_are_invocation_owned(tile):
+    """Two consecutive no-grad calls: the second never overwrites the first result (preprocess_q_k_v and tile)."""
+    impl, md = _impl(), _real_doc(_S085K32_DOCS[0], tile)
+    a, b = ([t.detach() for t in _qkv(md, seed=s)] for s in (31, 32))
+    with torch.no_grad():
+        first = impl.preprocess_q_k_v(*a, md)
+        snapshot = [t.clone() for t in first]
+        second = impl.preprocess_q_k_v(*b, md)
+        assert all(torch.equal(x, y) for x, y in zip(first, snapshot, strict=True))
+        assert not any(torch.equal(x, y) for x, y in zip(first, second, strict=True))
+        t1 = impl.tile(a[0], md)
+        s1 = t1.clone()
+        impl.tile(b[0], md)
+        assert torch.equal(t1, s1)
+
+
+def test_nograd_ineligible_calls_take_the_stacked_route():
+    """Untrusted metadata and non-BF16 no-grad calls keep cat + preprocess_qkv (the holder)."""
     impl, md = _impl(), _metadata()
     q, k, v = (t.detach() for t in _qkv(md, seed=5))
     with torch.no_grad():
-        expected = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md).clone()
-        assert torch.equal(torch.cat(impl.preprocess_q_k_v(q, k, v, md), dim=0), expected)
+        state = md.__dict__.pop("_tile_index_state")
+        try:
+            out = impl.preprocess_q_k_v(q, k, v, md)
+            assert out[0].data_ptr() == md.tile_buf_holder.buffer.data_ptr()
+        finally:
+            md._tile_index_state = state
+        out = impl.preprocess_q_k_v(q.float(), k.float(), v.float(), md)
+        assert out[0].data_ptr() == md.tile_buf_holder.buffer.data_ptr()
+
+
+def test_permute_ops_opcheck():
+    """Schema / fake / autograd-registration / AOT checks of the tile gather ops the no-grad routes now call."""
+    md = _real_doc(_S085K32_DOCS[0], 256)
+    partition, _, nonpad, _ = md._tile_index_state
+    padded = md.variable_block_sizes.numel() * 256
+    q, k, v = (t.detach()[:, :, :1] for t in _qkv(md, seed=41))
+    idx = (partition, nonpad, md.untile_combined_index, padded, 0, 0)
+    for grad in (False, True):
+        args = [x.clone().requires_grad_(grad) for x in (q, k, v)]
+        torch.library.opcheck(torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd, (*args, *idx))
+        torch.library.opcheck(torch.ops.fastvideo_kernel.vsa_tile_permute_fwd, (args[0], *idx))
 
 
 def test_compiled_fullgraph_single_graph():
@@ -129,3 +221,125 @@ def test_route_selection(monkeypatch, vsa, sp, gate):
     assert ("preprocess_q_k_v" in impl.calls) == separate
     assert ("preprocess_qkv" in impl.calls) != separate
     assert ("forward_qkv" in impl.calls) == (vsa and not separate and not gate)  # VSA stacked no-gate: fused-QKV input
+
+
+@pytest.mark.parametrize("layout",
+                         [*_LAYOUTS, dict(tile_size=128, tile_layout="chunk128", merge_prefix=True)],
+                         ids=["cube", "chunk256", "chunk128"])
+def test_compiled_nograd_separate_route_has_no_cat(monkeypatch, layout):
+    """Compiled tile-256/128 inference (h3mh-style regional-compile no-grad route, from worker-3's form-(c) test):
+    preprocess_q_k_v gathers q, k, v separately inside the compiled region, so the captured graph has no cat and
+    Inductor emits no pointwise cat kernel; one graph, no recompile, output bitwise equal to the eager stacked block.
+    Tile 128 feeds the separate gather to the op-family tile-parameterised no-grad op (vsa_nograd_fwd, tile 128)."""
+    import torch.fx.experimental._config as fx_config
+    from torch._dynamo.testing import CompileCounterWithBackend
+    from torch._inductor.utils import run_and_get_code
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.delenv("FASTVIDEO_VSA_VC", raising=False)
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    impl, md = _impl(), _metadata(**layout)
+    assert impl.prepare_for_regional_compile(torch.device("cuda")) is None
+    assert impl._regional_compile_nograd_route == "bf16"
+
+    def separate(q, k, v):
+        tq, tk, tv = impl.preprocess_q_k_v(q, k, v, md)
+        return impl.postprocess_output(impl.forward(tq, tk, tv, None, md), md)
+
+    def stacked(q, k, v):
+        tq, tk, tv = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), md).chunk(3, dim=0)
+        return impl.postprocess_output(impl.forward(tq, tk, tv, None, md), md)
+
+    def inductor_code(fn, *x):
+        # Generated wrapper + kernel source, compiled fresh (no FX-graph cache replay). The CUDA profiler is not used:
+        # after earlier suite tests it can record no kernels at all, which made worker-3's kernel-name checks vacuous.
+        torch._dynamo.reset()
+        with torch._inductor.config.patch(fx_graph_cache=False):
+            out, code = run_and_get_code(fn, *x)
+        return out, "\n".join(code)
+
+    def has_cat(gm):
+        return any(n.target in (torch.cat, torch.ops.aten.cat.default) for n in gm.graph.nodes)
+
+    q, k, v = (t.detach() for t in _qkv(md, seed=11))
+    q2, k2, v2 = (t.detach() for t in _qkv(md, seed=12))
+    with torch.no_grad():
+        eager = stacked(q, k, v)
+        eager2 = stacked(q2, k2, v2)
+        # Control: the stacked block concatenates in the captured graph and in Inductor's generated code.
+        control = CompileCounterWithBackend("inductor")
+        out, code = inductor_code(torch.compile(stacked, backend=control, dynamic=True, fullgraph=True), q, k, v)
+        assert torch.equal(out, eager) and has_cat([gm for gm in control.graphs if len(gm.graph.nodes)][0])
+        assert _CAT.search(code), "control: the stacked compiled no-grad block lowers the q/k/v cat"
+
+        counters = torch._dynamo.utils.counters
+        counters.clear()
+        cnt = CompileCounterWithBackend("inductor")
+        sep = torch.compile(separate, backend=cnt, dynamic=True, fullgraph=True)
+        out, code = inductor_code(sep, q, k, v)
+        assert torch.equal(out, eager)
+        assert "vsa_tile_permute_qkv_fwd" in code and not _CAT.search(code)
+        assert md.tile_elems == 256 or "vsa_nograd_fwd" in code
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            assert torch.equal(sep(q2, k2, v2), eager2)
+        graphs = [gm for gm in cnt.graphs if len(gm.graph.nodes)]  # Dynamo may also hand the backend an empty graph
+        assert counters["stats"]["unique_graphs"] == 1 and len(graphs) == 1 and not counters["graph_break"]
+        assert not has_cat(graphs[0])
+    torch._dynamo.reset()
+
+
+# E2 witness (init/nograd-separate-gather-audit-explorer-2/prequeue/compiled-vc-rebase): full-valid latent (4, 8, 16),
+# cube tile (4, 8, 8), no prefix, N = Np = 512 rows and a non-identity permutation P, so a tiled gather reaching the VC
+# producer would be mapped twice (P(P(x))) without any length error. The padded s085k32 doc (47x7x12) would instead
+# lose the fused producer (tiled length != packed length). Tile 128 (fused VC route since VC-128): the same latent with
+# cube tile (4, 4, 8) is 4 full tiles, N = Np = 512, again non-identity; the padded doc runs as cube and chunk128.
+_VC_CASES = [("witness", (4, 8, 16), (), "cube", 256), ("padded", (47, 7, 12), (87, 1, 84, 514), "cube", 256),
+             ("padded", (47, 7, 12), (87, 1, 84, 514), "chunk", 256), ("witness", (4, 8, 16), (), "cube", 128),
+             ("padded", (47, 7, 12), (87, 1, 84, 514), "cube", 128),
+             ("padded", (47, 7, 12), (87, 1, 84, 514), "chunk", 128)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10
+                    or not os.environ.get("FASTVIDEO_VSA_VC_ROOT"),
+                    reason="needs SM10x and FASTVIDEO_VSA_VC_ROOT")
+@pytest.mark.parametrize("case", _VC_CASES, ids=lambda c: f"{c[0]}-{c[3]}-t{c[4]}")
+@torch.no_grad()
+def test_vc_route_separate_qkv_feeds_packed_rows(request, monkeypatch, case):
+    """FASTVIDEO_VSA_VC=1, prepared route "vc": preprocess_q_k_v never gathers (eager or compiled fullgraph); the fused
+    producer runs once per call on the packed q, k, v rows, and the separate block equals the stacked block bitwise."""
+    _, adapter, impl, calls, _ = request.getfixturevalue("h3")
+    _, (t, hh, w), prefix, layout, tile = case
+    layout_kw = dict(tile_layout=f"chunk{tile}", merge_prefix=True) if layout == "chunk" else {}
+    md = MiniMaxH3VSAMetadataBuilder().build(current_timestep=0,
+                                             raw_latent_shape=(t, 2 * hh, 2 * w),
+                                             patch_size=(1, 2, 2),
+                                             VSA_sparsity=0.85,
+                                             prefix_segments=prefix,
+                                             device=torch.device("cuda"),
+                                             topk_cap=32 if tile == 256 else 64,
+                                             tile_size=tile,
+                                             **layout_kw)
+    assert md.tile_elems == tile
+    if not prefix:
+        assert md.total_seq_length == md.variable_block_sizes.numel() * tile == 512
+        assert not torch.equal(md.tile_partition_indices.cpu(), torch.arange(512))
+    seen = []
+    counted = adapter.prepare_vsa_vc_fwd_bshd
+    monkeypatch.setattr(adapter, "prepare_vsa_vc_fwd_bshd",
+                        lambda *a: seen.append([x.clone() for x in a[:3]]) or counted(*a))
+    for name in ("vsa_tile_permute_qkv_fwd", "vsa_tile_permute_fwd"):
+        monkeypatch.setattr(torch.ops.fastvideo_kernel, name, None)  # any gather on this route raises
+    g = torch.Generator(device="cuda").manual_seed(5)
+    q, k, v = (torch.randn(1, md.total_seq_length, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+               for _ in range(3))
+
+    def separate(a, b, c):
+        return impl.postprocess_output(impl.forward(*impl.preprocess_q_k_v(a, b, c, md), None, md), md)
+
+    stacked = impl.postprocess_output(impl.forward_qkv(impl.preprocess_qkv(torch.cat([q, k, v]), md), md), md)
+    for mode, fn in (("eager", separate), ("compiled", torch.compile(separate, dynamic=True, fullgraph=True))):
+        seen.clear()
+        calls.clear()
+        assert torch.equal(fn(q, k, v), stacked), mode
+        assert len(calls) == len(seen) == 1, mode
+        assert all(torch.equal(x, y) for x, y in zip(seen[0], (q, k, v), strict=True)), mode

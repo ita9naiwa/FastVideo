@@ -69,7 +69,7 @@ def test_fallbacks_keep_holder_path():
     # Own geometry: the in-place write below bumps the version of cached index tensors.
     impl, md = _impl(), _metadata(dict(_SPEC, prefix_segments=(301, 0, 414)))
     x = _qkvg(md)
-    assert impl.tile(x, md) is md.tile_buf_holder.buffer  # no grad
+    assert impl.tile(x.float(), md) is md.tile_buf_holder.buffer  # no grad, not BF16 (BF16 no-grad takes the op)
     small = torch.randn(4, md.total_seq_length, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     assert impl.tile(small, md) is md.tile_buf_holder.buffer  # below the 2**25-element threshold
     md.non_pad_index.add_(0)  # in-place write: cached proof no longer trusted

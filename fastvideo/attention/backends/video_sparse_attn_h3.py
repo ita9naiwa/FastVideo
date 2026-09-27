@@ -823,10 +823,13 @@ class MiniMaxH3VSAImpl(AttentionImpl):
     def tile(self, x: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Scatter rows into the padded tile buffer (pad positions stay zero).
 
-        No-grad calls return the builder-owned buffer; callers must consume it
-        before the next ``tile()`` (both call sites in ``forward()`` read it
-        immediately). Eligible training calls return an invocation-owned
-        tensor from ``_TilePermutation`` instead, since autograd retains it. Odd tile-64 no-grad sm100a
+        Calls on builder-trusted index state (``_tile_index_state``) with BF16
+        CUDA rows return an invocation-owned tensor from the opaque
+        ``vsa_tile_permute_fwd`` op: eligible training calls (autograd retains
+        it), eager no-grad calls and compiled tile-128/256 no-grad calls. Other
+        eager no-grad calls (untrusted metadata, non-BF16, non-CUDA, the tile-64
+        sm100a pair) return the builder-owned buffer; callers must consume it
+        before the next ``tile()``. Odd tile-64 no-grad sm100a
         requests carry one additional all-zero tile internally; metadata and
         all observable outputs retain the logical geometry.
         """
@@ -849,11 +852,13 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         kernel_tiles = n_tiles + int(needs_sm100a_pair)
         target_shape = (x.shape[0], kernel_tiles * attn_metadata.tile_elems, x.shape[-2], x.shape[-1])
 
-        # Training: gather into an invocation-owned buffer (autograd saves it; never the shared holder).
+        # Training and eager no-grad: gather into an invocation-owned buffer (autograd saves it in training; never the
+        # shared holder). The size threshold applies to eager training only; no-grad runs the op without autograd state.
         state = getattr(attn_metadata, "_tile_index_state", None)
-        if (state is not None and grad_mode and not needs_sm100a_pair and x.ndim == 4 and x.is_cuda
+        if (state is not None and (grad_mode or not compiling) and not needs_sm100a_pair and x.ndim == 4 and x.is_cuda
                 and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
-                and state[0].device == x.device and state[2].device == x.device and (compiling or x.numel() >= 2**25)
+                and state[0].device == x.device and state[2].device == x.device
+                and (not grad_mode or compiling or x.numel() >= 2**25)
                 and x.shape[1] == state[0].numel() == state[2].numel()
                 and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
             # Opaque custom op (same key eager and compiled) around the shared _TilePermutation body; it re-checks the
@@ -922,18 +927,27 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                          attn_metadata: MiniMaxH3VSAMetadata) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """preprocess_qkv for callers holding separate q, k, v: equals preprocess_qkv(torch.cat([q, k, v])).chunk(3).
 
-        Training calls on trusted cube/chunk metadata gather each operand straight into the stacked tiled layout
-        (vsa_tile_permute_qkv_fwd), so neither the concatenated [3B, S, H, D] input nor a concatenated gradient is ever
-        materialized; every other call concatenates and takes preprocess_qkv unchanged.
+        Training calls and no-grad calls (eager and compiled) on trusted cube/chunk metadata gather each operand straight
+        into the stacked tiled layout (vsa_tile_permute_qkv_fwd, invocation-owned outputs, no autograd state in no-grad),
+        so neither the concatenated [3B, S, H, D] input nor a concatenated gradient is ever materialized (in a compiled
+        region that cat lowers to an Inductor pointwise kernel). The size threshold applies to eager training only. Every
+        other call (untrusted metadata, the tile-64 sm100a pair, the fused VC route in eager or compiled mode, whose
+        producer must see packed rows) concatenates and takes preprocess_qkv unchanged.
         """
         state = getattr(attn_metadata, "_tile_index_state", None)
         n = attn_metadata.total_seq_length
         grad_mode = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
-        if (state is not None and grad_mode and q.ndim == 4 and q.is_cuda and q.dtype == torch.bfloat16
+        compiling = torch.compiler.is_compiling()
+        # No-grad exclusions: the odd tile-64 sm100a pair needs tile()'s extra zero tile; the fused VC route (eager, and
+        # compiled since the prepared "vc" route) reads packed rows, so a tiled gather there would be mapped twice.
+        nograd = (not grad_mode
+                  and not (attn_metadata.tile_elems == 64 and attn_metadata.variable_block_sizes.numel() % 2 != 0)
+                  and not self._vc_fused_route(q, attn_metadata))
+        if (state is not None and (grad_mode or nograd) and q.ndim == 4 and q.is_cuda and q.dtype == torch.bfloat16
                 and all(x.shape == q.shape and x.dtype == q.dtype and x.device == q.device and
                         (x.is_contiguous() or _tile_row_layout(x)) for x in (q, k, v))
                 and q.shape[1] == n == state[0].numel() == state[2].numel() and state[0].device == q.device
-                and state[2].device == q.device and (torch.compiler.is_compiling() or 3 * q.numel() >= 2**25)
+                and state[2].device == q.device and (not grad_mode or compiling or 3 * q.numel() >= 2**25)
                 and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
             padded = attn_metadata.variable_block_sizes.numel() * attn_metadata.tile_elems
             return torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd(q, k, v, state[0], state[2],
