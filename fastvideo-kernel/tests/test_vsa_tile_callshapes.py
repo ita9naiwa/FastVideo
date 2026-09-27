@@ -81,3 +81,54 @@ def test_fine_kv_blocks_merge_to_fa4_tile():
     for a, b in zip(fine[:4], coarse[:4], strict=True):
         assert torch.equal(a, b)
     assert tuple(fine.block_size) == tuple(coarse.block_size) == (128, 128)
+
+
+def test_fine_kv_merge_adds_no_host_sync():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pytest.importorskip("flash_attn.cute.interface")
+    import warnings
+    nb = 6
+    sizes = torch.full((nb, ), 128, device="cuda", dtype=torch.int32)
+    bmap = torch.rand(1, 2, nb, nb, device="cuda") > 0.5
+    child = torch.full((2 * nb, ), 64, device="cuda", dtype=torch.int32)
+
+    def syncs(*args, **kw):
+        torch.cuda.synchronize()
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                K._build_sparse_tensors(*args, q_len=128 * nb, q_block_size=128, need_backward=True,
+                                        need_forward=False, **kw)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        return sum("called a synchronizing" in str(w.message) for w in seen)
+
+    K._build_sparse_tensors(bmap, sizes, q_len=128 * nb, q_block_size=128, kv_block_size=128, need_backward=True,
+                            need_forward=False)  # warm up lazy imports
+    assert syncs(bmap.repeat_interleave(2, -1), child, kv_block_size=64,
+                 force_q_sparse_block_size=128) == syncs(bmap, sizes, kv_block_size=128)
+
+
+@pytest.mark.parametrize("sizes", [(64, 64), (1, 1)], ids=["full", "partial"])
+def test_fine_kv_merge_rejects_unequal_siblings(sizes):
+    """Children of one 128 KV block with different keep bits cannot be OR-merged: the merged block would admit the
+    unselected child's tokens (the mask mod checks validity, not selection). The device assert poisons the CUDA
+    context, so the call runs in a subprocess."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pytest.importorskip("flash_attn.cute.interface")
+    import subprocess
+    import sys
+    code = f"""
+import torch
+from fastvideo_kernel import block_sparse_attn_cute_fwd as K
+bmap = torch.tensor([True, False], device="cuda").view(1, 1, 1, 2)
+child = torch.tensor({list(sizes)}, device="cuda", dtype=torch.int32)
+K._build_sparse_tensors(bmap, child, q_len=128, q_block_size=128, kv_block_size=64, need_backward=True,
+                        need_forward=False, force_q_sparse_block_size=128)
+torch.cuda.synchronize()
+"""
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
+    assert run.returncode != 0 and "equal keep bits" in run.stderr, run.stderr[-2000:]

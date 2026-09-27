@@ -225,16 +225,21 @@ def _build_sparse_tensors(
 
     Tile-parametric callers pass ``(q_block_size, kv_block_size) = (TILE, TILE)`` for the forward and
     ``(TILE, TILE // 2, force_q_sparse_block_size=TILE)`` for the backward. Two normalizations keep that valid at
-    TILE = 128: a KV block finer than FA4's 128-token tile is merged back to 128 (its children's map columns are OR-ed,
-    exact when the children of a 128 block are selected together, as a ``repeat_interleave``-d map is; sizes are
-    summed); and a 128-row Q block keeps its own sparse list instead of being doubled to 256 rows, which would give
-    each Q tile its neighbour's KV selection.
+    TILE = 128: a KV block finer than FA4's 128-token tile is merged back to 128 (sizes are summed, map columns OR-ed;
+    the children of a 128 block must share one keep bit, as in a ``repeat_interleave``-d map, else a device-side assert
+    fires); and a 128-row Q block keeps its own sparse list instead of being doubled to 256 rows, which would give each
+    Q tile its neighbour's KV selection.
     """
     if kv_block_size < _FA4_Q_BLOCK_SIZE <= q_block_size:  # tile-64 callers keep their own 64-token lists
         factor = _FA4_Q_BLOCK_SIZE // kv_block_size
         if _FA4_Q_BLOCK_SIZE % kv_block_size or block_map.shape[-1] % factor or variable_block_sizes.numel() % factor:
             raise ValueError(f"kv_block_size={kv_block_size} must tile {_FA4_Q_BLOCK_SIZE} and the KV block count")
-        block_map = block_map.unflatten(-1, (-1, factor)).any(-1)
+        children = block_map.unflatten(-1, (-1, factor))
+        block_map = children.any(-1)
+        # OR-merging is exact only when every child of a 128 block has the same keep bit; the mask mod checks token
+        # validity, not selection. Device-side check: no host sync per call.
+        torch._assert_async((block_map == children.all(-1)).all(),
+                            "kv_block_size < 128 needs equal keep bits within each 128-token KV block")
         variable_block_sizes = variable_block_sizes.view(-1, factor).sum(-1, dtype=variable_block_sizes.dtype)
         kv_block_size = _FA4_Q_BLOCK_SIZE
     if force_q_sparse_block_size is None and q_block_size == _FA4_Q_BLOCK_SIZE:
