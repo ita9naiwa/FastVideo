@@ -7,8 +7,8 @@ backend differs from the Wan-tuned ``video_sparse_attn``:
 
 - Tiles are ``[segment-pure prefix chunks] + [3D video tiles]``; prefix
   tiles never straddle segment boundaries. The tile size is selectable at
-  metadata build time: 256 tokens ``(4,8,8)`` (default) or 64 tokens
-  ``(4,4,4)`` (see ``VSA_H3_TILE_SHAPES``).
+  metadata build time: 256 tokens ``(4,8,8)`` (default), 128 tokens
+  ``(4,4,8)`` or 64 tokens ``(4,4,4)`` (see ``VSA_H3_TILE_SHAPES``).
 - Selection is pure Python on pooled tile scores; the block-sparse kernel
   consumes an explicit bool mask, so no kernel changes are needed.
 - The compression branch is gated by ``to_gate_compress``, which the base
@@ -26,7 +26,9 @@ backend differs from the Wan-tuned ``video_sparse_attn``:
 
 At tile 256 this targets sm10.x through the FA4 CuTe 256-tile path
 (``FASTVIDEO_VSA_CUTEDSL=1``); the Triton 256→64 expansion is the
-fallback and keeps identical mask semantics. At tile 64 the block map is
+fallback and keeps identical mask semantics. At tile 128 grad-tracking
+CuTe calls run the FA4 Q128/KV128 training op pair (``vsa_train_fwd/bwd``, tile=128);
+everything else takes ``block_sparse_attn_128_bshd``. At tile 64 the block map is
 already at the kernels' native 64-token granularity, so both forward and
 backward run the Triton block-sparse kernels directly (no expansion,
 ``FASTVIDEO_VSA_CUTEDSL`` does not apply). A third, opt-in route exists
@@ -54,10 +56,13 @@ import torch
 
 try:
     from fastvideo_kernel.block_sparse_attn import block_sparse_attn as block_sparse_attn_64_bhsd
-    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256_bshd
+    from fastvideo_kernel import vsa256_ops
+    from fastvideo_kernel.block_sparse_attn_256 import (_resolve_backend, block_sparse_attn_128_bshd,
+                                                        block_sparse_attn_256_bshd)
     from fastvideo_kernel.triton_kernels.index import map_to_index
 except ImportError:
     block_sparse_attn_64_bhsd = None
+    block_sparse_attn_128_bshd = None
     block_sparse_attn_256_bshd = None
     map_to_index = None
 
@@ -91,8 +96,14 @@ _TILE_ELEMS = math.prod(VSA_H3_TILE_SIZE)
 # 256->64 mask expansion is involved and FASTVIDEO_VSA_CUTEDSL does not apply.
 VSA_H3_TILE_SHAPES: dict[int, tuple[int, int, int]] = {
     _TILE_ELEMS: VSA_H3_TILE_SIZE,
+    # the 256 cube halved along h (conductor ruling 85a); a refinement of the 256 partition
+    128: (4, 4, 8),
     64: (4, 4, 4),
 }
+# Consecutive-chunk layouts and the tile size each one is defined for (see _h3_tile_geometry). Builder layout names (so
+# tile-parameterised callers need no string switch): "cube" | "cube128" | "cube256" and "chunk" | "chunk128" | "chunk256",
+# the chunk names optionally suffixed "-merged-prefix" (= merge_prefix=True). A size in the name must match tile_size.
+_H3_CHUNK_LAYOUTS = {"chunk256": 256, "chunk128": 128}
 
 
 @torch.library.custom_op(
@@ -229,26 +240,28 @@ def _h3_tile_geometry(
     cube-ordered video tokens cut into consecutive full tiles (only the last
     video tile is partial). ``"chunk256-merged-prefix"``: additionally chunk
     the concatenated prefix as one sequence instead of per segment.
+    ``"chunk128"`` / ``"chunk128-merged-prefix"``: the same at 128 tokens.
 
     Returns (tile_partition_indices, variable_block_sizes,
     untile_combined_index, num_prefix_tiles, num_video_tiles).
     """
-    if tile_layout not in ("cube", "chunk256", "chunk256-merged-prefix"):
-        raise ValueError(f"unknown VSA-H3 tile_layout {tile_layout!r}")
     tile_elems = math.prod(tile_shape)
+    chunk_layout = tile_layout.removesuffix("-merged-prefix")
+    if tile_layout != "cube" and _H3_CHUNK_LAYOUTS.get(chunk_layout) != tile_elems:
+        raise ValueError(f"unknown VSA-H3 tile_layout {tile_layout!r} for {tile_elems}-token tiles")
     prefix_len = sum(prefix_segments)
 
     def chunks(n: int) -> list[int]:
         full, rem = divmod(n, tile_elems)
         return [tile_elems] * full + ([rem] if rem else [])
 
-    if tile_layout == "chunk256-merged-prefix":
+    if tile_layout.endswith("-merged-prefix"):
         prefix_sizes = chunks(prefix_len)
     else:
         prefix_sizes = [size for segment in prefix_segments for size in chunks(segment)]
     num_prefix_tiles = len(prefix_sizes)
 
-    if tile_layout in ("chunk256", "chunk256-merged-prefix"):
+    if tile_layout != "cube":
         video_sizes = torch.tensor(chunks(math.prod(dit_seq_shape)), dtype=torch.long, device=device)
     else:
         ts_t, ts_h, ts_w = tile_shape
@@ -347,8 +360,8 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # this tensor with each implementation's tensor-valued layer index so the
     # shared block code does not specialize once per Python ``layer_idx``.
     dense_layers_tensor: torch.Tensor
-    # tokens per tile (256 or 64); selects the tile geometry AND the kernel
-    # route in forward() (256 -> VSA-256 CuTe/Triton, 64 -> native Triton)
+    # tokens per tile (256, 128 or 64); selects the tile geometry AND the kernel
+    # route in forward() (256 -> VSA-256 CuTe/Triton, 128 -> VSA-128 CuTe/Triton, 64 -> native Triton)
     tile_elems: int = _TILE_ELEMS
     # layers forced dense regardless of sparsity (probe-guided opt-outs)
     dense_layers: tuple[int, ...] = ()
@@ -356,8 +369,8 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # populated the allocation so a same-shaped geometry change can clear
     # stale pad rows once while steady-state denoising reuses the buffer.
     tile_buf_holder: _MiniMaxH3VSATileBufferHolder | None = None
-    # "cube" (one tile per 4x8x8 video cube) or "chunk256" (consecutive
-    # 256-token chunks of the same cube-ordered tokens); see _h3_tile_geometry
+    # "cube" (one tile per tile-shape video cube) or "chunk256"/"chunk128" (consecutive
+    # tile-size chunks of the same cube-ordered tokens); see _h3_tile_geometry
     tile_layout: str = "cube"
     # Row permutation of the same geometry (partition order + padded non-pad slots). Training tiles
     # through the shared _TilePermutation (gather + inverse-gather backward, invocation-owned output)
@@ -398,6 +411,32 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         env = os.environ.get("FASTVIDEO_VSA_PACK_TAILS")
         return env == "1" if env is not None else _pack_tails_policy(sizes, tile_elems, min_partial)
 
+    @staticmethod
+    def _layout(name: str, merge_prefix: bool | None, tile_size: int, exempt: bool) -> tuple[str, bool]:
+        """Canonical (tile_layout, merge_prefix) for a builder layout name: "cube" or "chunk<tile_size>"."""
+        base = name.removesuffix("-merged-prefix")
+        if base in ("cube", "cube128", "cube256") and base == name:
+            kind, size = "cube", base[4:]
+        elif base in ("chunk", *_H3_CHUNK_LAYOUTS):
+            kind, size = "chunk", base[5:]
+        else:
+            raise ValueError(
+                "VSA-H3 tile_layout must be 'cube', 'cube128', 'cube256', 'chunk', 'chunk128' or 'chunk256' "
+                f"(chunk names optionally with '-merged-prefix'), got {name!r}")
+        if size and int(size) != tile_size:
+            raise ValueError(f"VSA-H3 tile_layout={name!r} requires tile_size={size}")
+        if kind == "chunk" and f"chunk{tile_size}" not in _H3_CHUNK_LAYOUTS:
+            raise ValueError(f"VSA-H3 tile_layout={name!r}: 'chunk' supports tile_size 128 or 256, got {tile_size!r}")
+        if base != name:
+            if merge_prefix is False:
+                raise ValueError(f"VSA-H3 tile_layout={name!r} implies merge_prefix=True, got merge_prefix=False")
+            merge_prefix = True
+        # Merged prefix tiles mix modalities; only exempt mode (prefix always
+        # selected) keeps them selection-neutral.
+        if merge_prefix and (kind == "cube" or not exempt):
+            raise ValueError("VSA-H3 merge_prefix requires a chunk tile_layout and exempt=True")
+        return ("cube" if kind == "cube" else f"chunk{tile_size}"), bool(merge_prefix)
+
     def build(  # type: ignore
         self,
         current_timestep: int,
@@ -410,7 +449,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         dense_layers: tuple[int, ...] = (),
         tile_size: int = _TILE_ELEMS,
         tile_layout: str = "cube",
-        merge_prefix: bool = False,
+        merge_prefix: bool | None = None,
         topk_cap: int | None = None,
         query_pad_pruning: bool = True,
         fused_qkv_grad: bool = True,
@@ -421,14 +460,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
         tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
         if tile_shape is None:
             raise ValueError(f"VSA-H3 tile_size must be one of {sorted(VSA_H3_TILE_SHAPES)}, got {tile_size!r}")
-        if tile_layout not in ("cube", "chunk256"):
-            raise ValueError(f"VSA-H3 tile_layout must be 'cube' or 'chunk256', got {tile_layout!r}")
-        if tile_layout == "chunk256" and int(tile_size) != 256:
-            raise ValueError("VSA-H3 tile_layout='chunk256' requires tile_size=256")
-        # Merged prefix tiles mix modalities; only exempt mode (prefix always
-        # selected) keeps them selection-neutral.
-        if merge_prefix and (tile_layout != "chunk256" or not exempt):
-            raise ValueError("VSA-H3 merge_prefix requires tile_layout='chunk256' and exempt=True")
+        tile_layout, merge_prefix = self._layout(tile_layout, merge_prefix, int(tile_size), exempt)
         dit_seq_shape = (raw_latent_shape[0] // patch_size[0], raw_latent_shape[1] // patch_size[1],
                          raw_latent_shape[2] // patch_size[2])
         prefix_segments = tuple(int(s) for s in prefix_segments if s > 0)
@@ -436,7 +468,7 @@ class MiniMaxH3VSAMetadataBuilder(AttentionMetadataBuilder):
 
         (tile_partition_indices, variable_block_sizes, untile_combined_index, num_prefix_tiles,
          num_video_tiles) = _h3_tile_geometry(prefix_segments, dit_seq_shape, device, tile_shape,
-                                              "chunk256-merged-prefix" if merge_prefix else tile_layout)
+                                              f"{tile_layout}-merged-prefix" if merge_prefix else tile_layout)
 
         dense_layers = tuple(int(layer) for layer in dense_layers)
         metadata = MiniMaxH3VSAMetadata(
@@ -926,7 +958,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if tile_elems == 64:
             if block_sparse_attn_64_bhsd is None:
                 raise NotImplementedError("fastvideo_kernel.block_sparse_attn is not installed")
-        elif block_sparse_attn_256_bshd is None:
+        elif block_sparse_attn_256_bshd is None:  # the 128 route lives in the same module
             raise NotImplementedError("fastvideo_kernel.block_sparse_attn_256 is not installed")
 
         # Probe recording performs filesystem writes and host synchronizations,
@@ -1100,6 +1132,22 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             if has_sm100a_pair and use_sm100a:
                 out_bhsd = out_bhsd[:, :, :logical_seq_len]
             out = out_bhsd.transpose(1, 2).contiguous()
+        elif tile_elems == 128:
+            # FA4 Q128/KV128: grad-tracking CuTe calls go through the opaque tile-parameterized training op pair (same
+            # op key eager and compiled, fullgraph-safe, SAC-visible); every other call keeps the library's VSA-128
+            # route. Both forward launches get the same alias-guard hint as the tile-256 route.
+            if _resolve_backend() == "cutedsl" and vsa256_ops.training_eligible(
+                    logical_query, logical_key, logical_value, mask, block=128):
+                out, _ = torch.ops.fastvideo_kernel.vsa_train_fwd(logical_query, logical_key, logical_value, mask,
+                                                                  attn_metadata.variable_block_sizes, tile_elems,
+                                                                  attn_metadata.alias_guard_hint)
+            else:
+                out, _ = block_sparse_attn_128_bshd(logical_query,
+                                                    logical_key,
+                                                    logical_value,
+                                                    mask,
+                                                    attn_metadata.variable_block_sizes,
+                                                    alias_guard=attn_metadata.alias_guard_hint)
         else:
             # Padded query rows get zero dO through postprocess_output's untile gather, which lets
             # the CuTe backward skip wholly padded Q128 children (the LSE output is discarded; the

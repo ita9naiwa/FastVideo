@@ -20,6 +20,10 @@ is then the single autograd input; the backward allocates ONE fresh ``[3B, S, H,
 dQ/dK/dV into its three B-sized views (both pack policies), checks they did, and returns it whole, so no concat follows.
 (A mutation-free custom op cannot return three outputs that share storage, hence one output.)
 
+Tile-parameterized family (ruling 84): ``vsa_train_fwd`` / ``vsa_train_bwd`` take ``tile`` (128 or 256). Tile 128 wraps the FA4
+Q128/KV128 training kernels (H3 tile 128); tile 256 delegates to vsa256_fwd/bwd with default options, which remain the
+full-option tile-256 ops (stacked QKV, query-padding proof, packed tails).
+
 Integration note (history): a prefix-split q_split argument was considered and DROPPED (conductor 33852: not adopted
 for chunk256), see candidate h3-training-stack-integration.
 """
@@ -135,8 +139,8 @@ def _backward(ctx, dout, dlse):
 vsa256_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
-def training_eligible(q, k, v, block_map):
-    """The validated domain of the op pair (native BF16 Q256 training on SM10x), shared by every caller so an input
+def training_eligible(q, k, v, block_map, block=256):
+    """The validated domain of the op pair (native BF16 Q256 training on SM10x; ``block=128``: vsa_train_fwd at tile 128), shared by every caller so an input
     outside it (e.g. strided views that are not 16-byte aligned, shape mismatches, FASTVIDEO_VSA_VC=1) always takes the
     caller's fallback and never reaches an op whose fake would not describe it. Under torch.compile the data_ptr()
     alignment read of a non-contiguous input is not traceable (fullgraph raises; disclosed limitation)."""
@@ -150,8 +154,8 @@ def training_eligible(q, k, v, block_map):
             and all(t.is_contiguous() or (t.stride(-1) == 1 and t.data_ptr() % 16 == 0
                                          and all(s > 0 and s % 8 == 0 for s in t.stride()[:-1]))
                     for t in (q, k, v))
-            and q.shape[1] == block_map.shape[2] * 256
-            and k.shape[1] == block_map.shape[3] * 256
+            and q.shape[1] == block_map.shape[2] * block
+            and k.shape[1] == block_map.shape[3] * block
             and block_map.shape[:2] == (q.shape[0], q.shape[2])
             and torch.cuda.get_device_capability(q.device)[0] == 10
             and os.environ.get("FASTVIDEO_VSA_VC", "0") != "1")
@@ -187,3 +191,61 @@ def training_attention(q, k, v, block_map, sizes, *, pack_tails=None, query_size
         return vsa256_fwd(qkv, None, None, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails,
                           *hint)
     return vsa256_fwd(q, k, v, block_map, sizes, query_sizes, query_untile, *query_versions, pack_tails, *hint)
+
+
+# Tile-parameterized training pair (ruling 84: one op family, tile a parameter). ``tile`` 128: the FA4 Q128/KV128 forward and
+# backward of ``block_sparse_attn_cute_fwd._CuteAttentionQ128`` (identical kernel arguments; the backward lists are built in the
+# backward body instead of being stashed on ctx). ``tile`` 256: the vsa256 pair above with its defaults (plain 128-child
+# backward, no query-padding proof, no packed tails), so vsa256_fwd/bwd stay the full-option tile-256 member of the family.
+# ``alias_guard``: the FA4 alias-guard hint (0-d CPU bool tensor or None) reaches the forward launch at either tile.
+@torch.library.custom_op("fastvideo_kernel::vsa_train_fwd", mutates_args=(), device_types="cuda")
+def vsa_train_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor,
+                  tile: int, alias_guard: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    if tile == 256:
+        return vsa256_fwd(q, k, v, block_map, sizes, None, None, 0, 0, False, alias_guard)
+    if tile != 128:
+        raise ValueError(f"vsa_train_fwd supports tile 128 or 256, got {tile}")
+    out, lse, _ = adapter._cute_attention_q128_forward(q, k, v, block_map, sizes.to(torch.int32), need_backward=False,
+                                                       alias_guard=alias_guard)
+    return out, lse
+
+
+@torch.library.register_fake("fastvideo_kernel::vsa_train_fwd")
+def _vsa_train_fwd_fake(q, k, v, block_map, sizes, tile, alias_guard=None):
+    return torch.empty_like(q), q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
+
+
+@torch.library.custom_op("fastvideo_kernel::vsa_train_bwd", mutates_args=(), device_types="cuda")
+def vsa_train_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor,
+                  lse: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor, tile: int) -> list[torch.Tensor]:
+    if tile == 256:
+        return vsa256_bwd(dout, q, k, v, out, lse, block_map, sizes, None, None, 0, 0, False, None)
+    sizes = sizes.to(torch.int32)
+    _, backward_sparse = adapter._build_sparse_tensors(block_map, sizes, q_len=q.shape[1], q_block_size=128,
+                                                       kv_block_size=128, need_backward=True, need_forward=False,
+                                                       force_q_sparse_block_size=128)
+    _, _, _, flash_attn_bwd = adapter._load_fa4_cute()
+    return list(flash_attn_bwd(q, k, v, out, dout.contiguous(), lse, softmax_scale=q.shape[-1]**-0.5,
+                               mask_mod=adapter._build_vbs_mask_mod(128), aux_tensors=[sizes],
+                               block_sparse_tensors=backward_sparse)[:3])
+
+
+@torch.library.register_fake("fastvideo_kernel::vsa_train_bwd")
+def _vsa_train_bwd_fake(dout, q, k, v, out, lse, block_map, sizes, tile):
+    return [torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)]
+
+
+def _setup_context_train(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:3], *output, *inputs[3:5])
+    ctx.tile = inputs[5]  # inputs[6]: alias_guard (forward-only hint)
+    ctx.set_materialize_grads(False)
+
+
+def _backward_train(ctx, dout, dlse):  # lse is auxiliary (callers detach it), as in _CuteAttentionQ128
+    q, k, v, out, lse, block_map, sizes = ctx.saved_tensors
+    if dout is None:
+        dout = torch.zeros_like(out)
+    return *vsa_train_bwd(dout, q, k, v, out, lse, block_map, sizes, ctx.tile), None, None, None, None
+
+
+vsa_train_fwd.register_autograd(_backward_train, setup_context=_setup_context_train)
