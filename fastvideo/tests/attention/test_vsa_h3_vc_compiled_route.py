@@ -1,8 +1,8 @@
 """H3 VSA backend, compiled no-grad VC route: the fused VC route runs as three opaque ops (vc_h3_prepare_fused,
 vsa_h3_block_map_from_pools, vc_h3_attn_prepared) in eager and compiled mode. Eager output must equal the previous inline
 fused route bitwise, torch.compile(fullgraph=True, dynamic=True) must take the VC route with one graph and equal eager
-bitwise, and capture before the op JIT is built (Dynamo cold capture, CUDA-graph capture of an unwarmed geometry) must
-raise the op's assertion instead of compiling inside the graph."""
+bitwise, a cold Dynamo compile (no eager warmup, as the loader's regional compile) must work, and CUDA-graph capture of a
+geometry whose JIT is not built must raise the op's assertion instead of compiling inside the capture."""
 import os
 from collections import defaultdict
 
@@ -106,16 +106,21 @@ def test_compiled_vc_route_bitwise(h3, layout):
     assert sum(counters["graph_break"].values()) == breaks0
 
 
+@pytest.mark.parametrize("layout", ["chunk256", "cube"])
 @torch.no_grad()
-def test_cold_capture_raises(h3, monkeypatch):
-    """A Dynamo capture before any eager VC forward on the device raises the op's assertion (no JIT in the graph)."""
+def test_cold_compile_matches_eager(h3, monkeypatch, layout):
+    """A cold process (no eager VC forward yet) compiles with fullgraph: the fakes never check warmth, the first compiled
+    call builds the JITs inside the op bodies, and the output equals eager bitwise (loader regional compile, no warmup)."""
     h3, adapter, impl, calls, _ = h3
     monkeypatch.setattr(adapter, "_VC_WARMED", set())
-    meta, qkv = _doc(h3, 0, "chunk256")
-    compiled = torch.compile(_block(impl), backend="inductor", dynamic=True, fullgraph=True)
-    with pytest.raises(Exception, match=COLD):
-        compiled(qkv, meta)
-    assert not calls
+    monkeypatch.setattr(adapter, "_VC_WARMED_ATTN", set())
+    block = _block(impl)
+    compiled = torch.compile(block, backend="inductor", dynamic=True, fullgraph=True)
+    meta, qkv = _doc(h3, 0, layout)
+    out = compiled(qkv, meta)
+    assert len(calls) == 1, "cold compiled call must take the fused VC route"
+    assert adapter._VC_WARMED and adapter._VC_WARMED_ATTN
+    assert torch.equal(out, block(qkv, meta))
 
 
 @torch.no_grad()
@@ -172,3 +177,15 @@ def test_vc_ops_tile128_not_implemented():
     mask = torch.ones(1, 1, 1, 1, dtype=torch.bool, device="cuda")
     with pytest.raises(NotImplementedError, match="ruling-84"):
         torch.ops.fastvideo_kernel.vc_h3_attn_prepared(x, x, x, x, x, x, mask, sizes, 128)
+
+
+def test_vc_route_unavailable_reason(monkeypatch):
+    """VC=1 without a usable compiled VC route (here head 64) stays eager with a VC-specific reason, not the sm_100a text."""
+    monkeypatch.setenv("FASTVIDEO_VSA_VC", "1")
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo.attention.backends import video_sparse_attn_h3 as h3
+    impl = h3.MiniMaxH3VSAImpl(num_heads=HEADS, head_size=64, causal=False, softmax_scale=64**-0.5)
+    impl.layer_idx = 0
+    reason = impl.prepare_for_regional_compile(torch.device("cuda"))
+    assert impl._regional_compile_nograd_route is None
+    assert reason is not None and reason.startswith("FASTVIDEO_VSA_VC=1"), reason

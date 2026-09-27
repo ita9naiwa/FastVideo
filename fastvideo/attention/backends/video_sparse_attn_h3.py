@@ -784,6 +784,11 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         self._regional_compile_nograd_route = self._resolve_cute256_route(device)
         if not enabled and self._regional_compile_nograd_route is not None:
             reason = None  # tile-256 CuTe runs compile; the loader pairs FASTVIDEO_VSA_SM100A=1 with tile 64
+        elif not enabled and os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
+            requested = True
+            reason = (
+                "FASTVIDEO_VSA_VC=1 but the compiled VC route is unavailable: it needs head size 128, probe recording "
+                "off, the CuTe backend on SM10x and the VC modules importable from FASTVIDEO_VSA_VC_ROOT")
         if enabled:
             route = ("native fastvideo-kernel mask entry" if callable(
                 getattr(_sm100a, "block_sparse_attn_sm100a_from_mask", None)) else

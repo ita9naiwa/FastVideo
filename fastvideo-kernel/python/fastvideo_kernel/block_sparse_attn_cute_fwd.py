@@ -808,8 +808,8 @@ def block_sparse_attn_vc_fwd_bshd(
 #    (classified_index_block of the 128-token KV column count; 3 buckets over the spec corpus).
 # The attention key below covers the last two (conservatively adding H, D and the device) plus the alias_guard hint,
 # which is in FA4's compile_key. CUDA-graph capture of a call whose key was never run eagerly raises before any launch,
-# instead of compiling inside the capture. Dynamo tracing sees symbolic shapes, so the fakes can only require the
-# device to be warm.
+# instead of compiling inside the capture. The fakes never check warmth (as vsa256_nograd_fwd): a cold Dynamo trace
+# compiles, and the first compiled call builds the JITs inside the op bodies, outside any stream capture.
 _VC_WARMED: set = set()  # devices whose producer module is loaded
 _VC_WARMED_ATTN: set = set()  # attention JIT keys run outside capture
 
@@ -872,7 +872,6 @@ def vc_h3_prepare_fused(
 @vc_h3_prepare_fused.register_fake
 def _vc_h3_prepare_fused_fake(q, k, v, untile, sizes, tile):
     _vc_require_tile(tile)
-    _vc_require_warm(q, True)
     b, _, h, d = q.shape
     n = sizes.shape[0]
     fp8 = [q.new_empty((b, n * tile, h, d), dtype=torch.float8_e4m3fn) for _ in range(3)]
@@ -907,5 +906,4 @@ def vc_h3_attn_prepared(q8: torch.Tensor, k8: torch.Tensor, v8: torch.Tensor, qs
 @vc_h3_attn_prepared.register_fake
 def _vc_h3_attn_prepared_fake(q8, k8, v8, qs, ks, vs, block_map, sizes, tile, alias_guard=None):
     _vc_require_tile(tile)
-    _vc_require_warm(qs, True)
     return q8.new_empty(q8.shape, dtype=torch.bfloat16)
