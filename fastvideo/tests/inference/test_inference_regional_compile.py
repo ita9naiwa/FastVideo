@@ -116,6 +116,27 @@ def test_h3_vsa_cute_tile256_compile_route(vc, vc_root, allowed, monkeypatch) ->
         assert "eager" in reason
 
 
+@pytest.mark.parametrize(("cutedsl", "vc", "allowed"), [(True, False, True), (True, True, False),
+                                                        (False, False, False)])
+def test_h3_vsa_cute_tile128_compile_route(cutedsl, vc, allowed, monkeypatch) -> None:
+    """Tile 128 compiles through the opaque CuTe no-grad op on the CuTe backend; VC at 128 and Triton stay eager."""
+    monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
+    monkeypatch.delenv("FASTVIDEO_H3_VSA_PROBE", raising=False)
+    monkeypatch.delenv("FASTVIDEO_VSA_SM100A", raising=False)
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1" if cutedsl else "0")
+    monkeypatch.setenv("FASTVIDEO_VSA_VC", "1" if vc else "0")
+    monkeypatch.setenv("FASTVIDEO_VSA_VC_ROOT", "/nonexistent")
+
+    reason = _regional_compile_unsupported_reason(
+        _init_params_for("VIDEO_SPARSE_ATTN_H3"),
+        vsa_tile_size=128,
+    )
+
+    assert (reason is None) == allowed
+    if not allowed:
+        assert "eager" in reason
+
+
 def test_h3_vsa_probe_degrades_regional_compile_to_eager(monkeypatch) -> None:
     monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
     monkeypatch.setenv("FASTVIDEO_H3_VSA_PROBE", "/tmp/h3-vsa-probe")
