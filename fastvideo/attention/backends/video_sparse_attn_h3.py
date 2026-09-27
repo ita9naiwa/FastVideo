@@ -800,7 +800,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
 
     def _resolve_cute256_route(self, device: torch.device) -> str | None:
         """"bf16" when tile-128/256 no-grad calls reach the opaque CuTe ops (vsa_nograd_fwd / vsa256_nograd_fwd): CuTe
-        backend, SM10x, VC off. "vc" (tile 256 only for now) with
+        backend, SM10x, VC off. "vc" (tiles 128 and 256) with
         FASTVIDEO_VSA_VC=1 when the fused VC ops can run: head 128, probe off, VC-enabled FA4 checkout importable."""
         if block_sparse_attn_256_bshd is None or device.type != "cuda":
             return None
@@ -808,8 +808,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if _resolve_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
             return None
         vc = os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"
-        # "vc" still means tile 256 only: _vc_fused_applies gates on tile_elems == 256 and the vc_h3_* ops raise for
-        # tile 128 until the ruling-84 H3 API (tile=128|256) lands.
+        # "vc" covers tiles 128 and 256 (_vc_fused_route; the vc_h3_* ops take the tile as a parameter).
         if vc and (self.head_size != 128 or probe_enabled() is not None):
             return None
         try:
@@ -897,11 +896,11 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         """True when the no-grad VC (FP8) route applies and Q/K/V can skip the BF16 tile copy.
 
         Exactly the calls that the generic path would send to VC attention (FASTVIDEO_VSA_VC=1 on the CuTe
-        backend, tile 256, no grad, BF16 head 128 on SM10x), minus probe recording, which keeps the tiled path.
+        backend, tile 128 or 256, no grad, BF16 head 128 on SM10x), minus probe recording, which keeps the tiled path.
         preprocess_qkv and forward both use this predicate, so they always agree. Capture reads only the route
         resolved before compile (no env or device query inside the graph).
         """
-        if (attn_metadata.tile_elems != 256 or x.ndim != 4 or not x.is_cuda or x.dtype != torch.bfloat16
+        if (attn_metadata.tile_elems not in (128, 256) or x.ndim != 4 or not x.is_cuda or x.dtype != torch.bfloat16
                 or x.shape[-1] != 128 or (torch.is_grad_enabled() and x.requires_grad)):
             return False
         if torch.compiler.is_compiling():
@@ -947,7 +946,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         """Fused VC route: one producer pass from packed rows to padded FP8 Q/K/V plus FP32 tile pools.
 
         Replaces tile() + _pool_tiles + vc_preprocess.prepare of the generic route. Scores, the block mask and
-        the VC attention call (on the 128-granularity map, as block_sparse_attn_256_bshd sends no-grad calls)
+        the VC attention call (on the 128-granularity map, as block_sparse_attn_256_bshd / _128_bshd send no-grad calls)
         are unchanged; the output is in the padded tile layout that postprocess_output expects.
         """
         import fastvideo_kernel.block_sparse_attn_cute_fwd  # noqa: F401 (registers the vc_h3_* ops)

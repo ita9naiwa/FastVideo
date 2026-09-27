@@ -116,10 +116,10 @@ def test_h3_vsa_cute_tile256_compile_route(vc, vc_root, allowed, monkeypatch) ->
         assert "eager" in reason
 
 
-@pytest.mark.parametrize(("cutedsl", "vc", "allowed"), [(True, False, True), (True, True, False),
-                                                        (False, False, False)])
+@pytest.mark.parametrize(("cutedsl", "vc", "allowed"), [(True, False, True), (True, True, True), (False, False, False)])
 def test_h3_vsa_cute_tile128_compile_route(cutedsl, vc, allowed, monkeypatch) -> None:
-    """Tile 128 compiles through the opaque CuTe no-grad op on the CuTe backend; VC at 128 and Triton stay eager."""
+    """Tile 128 compiles on the CuTe backend: through the opaque CuTe no-grad op, or with FASTVIDEO_VSA_VC=1 (and
+    FASTVIDEO_VSA_VC_ROOT set) through the fused VC ops (vc-h3-compiled-route-tile128); Triton stays eager."""
     monkeypatch.delenv("FASTVIDEO_DISABLE_ATTENTION_COMPILE", raising=False)
     monkeypatch.delenv("FASTVIDEO_H3_VSA_PROBE", raising=False)
     monkeypatch.delenv("FASTVIDEO_VSA_SM100A", raising=False)

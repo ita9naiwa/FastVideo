@@ -800,16 +800,17 @@ def block_sparse_attn_vc_fwd_bshd(
 # Compiled no-grad VC route (H3 fused producer): opaque ops whose bodies are the eager route's calls, used in eager AND
 # compiled mode, so eager == compiled by construction. The ctypes/NVRTC producer and the CuTe JIT stay behind the op
 # boundary; fakes derive every output shape from input shapes and ``tile`` (the metadata's tile size, a trace-time
-# constant). Only tile 256 is implemented; tile 128 raises until the ruling-84 H3 API (one entry, tile=128|256) lands.
+# constant, 128 or 256; ruling 84: one op family, tile a parameter).
 # JIT placement. What compiles inside the op bodies on first use (census over the 46 s085k32 docs x 2 layouts):
 #  - the NVRTC producer module: once per device;
 #  - the FA4 CuTe forward: one compile_cache key for every doc (fixed Q256/KV128 block sparsity, FP8, D, vector mask);
 #  - the Triton _classified_map_to_index_kernel (map_to_classified_indices): one compile per (KV_BLOCK, BLOCK) bucket
 #    (classified_index_block of the 128-token KV column count; 3 buckets over the spec corpus).
-# The attention key below covers the last two (conservatively adding H, D and the device) plus the alias_guard hint,
-# which is in FA4's compile_key. CUDA-graph capture of a call whose key was never run eagerly raises before any launch,
-# instead of compiling inside the capture. The fakes never check warmth (as vsa256_nograd_fwd): a cold Dynamo trace
-# compiles, and the first compiled call builds the JITs inside the op bodies, outside any stream capture.
+# The attention key below covers the last two (conservatively adding H, D, the device and the tile, which selects the
+# Q256/KV128 or the Q128/KV128 kernel) plus the alias_guard hint, which is in FA4's compile_key. CUDA-graph capture of
+# a call whose key was never run eagerly raises before any launch, instead of compiling inside the capture. The fakes
+# never check warmth (as vsa256_nograd_fwd): a cold Dynamo trace compiles, and the first compiled call builds the JITs
+# inside the op bodies, outside any stream capture.
 _VC_WARMED: set = set()  # devices whose producer module is loaded
 _VC_WARMED_ATTN: set = set()  # attention JIT keys run outside capture
 
@@ -819,18 +820,17 @@ def _vc_warm_key(x: torch.Tensor) -> str:
 
 
 def _vc_require_tile(tile: int) -> None:
-    if tile == 128:
-        raise NotImplementedError("VC compiled route: tile 128 lands with the ruling-84 API")
-    if tile != 256:
+    if tile not in (128, 256):
         raise ValueError(f"VC compiled route: tile must be 128 or 256, got {tile}")
 
 
-def _vc_attn_key(q8: torch.Tensor, block_map: torch.Tensor, alias_guard) -> tuple:
+def _vc_attn_key(q8: torch.Tensor, block_map: torch.Tensor, tile: int, alias_guard) -> tuple:
     # alias_guard is part of FA4's compile_key, so each hint value (None/False/True) is its own CuTe JIT entry.
     from fastvideo_kernel.triton_kernels.index import classified_index_block
     hint = None if alias_guard is None else bool(alias_guard)
-    # The kernel lists are built on the 128-token KV children: two per 256-token tile.
-    return (str(q8.device), int(q8.shape[2]), int(q8.shape[3]), classified_index_block(2 * int(block_map.shape[-1])), hint)
+    # The kernel lists are built on 128-token KV children: two per 256-token tile, one per 128-token tile.
+    kv_cols = int(block_map.shape[-1]) * (tile // 128)
+    return (str(q8.device), int(q8.shape[2]), int(q8.shape[3]), classified_index_block(kv_cols), tile, hint)
 
 
 def _vc_cold(what: str) -> RuntimeError:
@@ -891,11 +891,15 @@ def vc_h3_attn_prepared(q8: torch.Tensor, k8: torch.Tensor, v8: torch.Tensor, qs
     """
     _vc_require_tile(tile)
     from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
-    key = _vc_attn_key(q8, block_map, alias_guard)
+    key = _vc_attn_key(q8, block_map, tile, alias_guard)
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and key not in _VC_WARMED_ATTN:
         raise _vc_cold(f"attention key {key}")
-    mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(block_map, sizes)
+    # Tile 256 sends the 128-granularity map, as block_sparse_attn_256_bshd does; a tile-128 map already is one.
+    if tile == 256:
+        mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(block_map, sizes)
+    else:
+        mask_128, sizes_128 = block_map, sizes.to(torch.int32)
     p = {"q": q8, "k": k8, "v": v8, "qs": qs, "ks": ks, "vs": vs}
     out = block_sparse_attn_vc_prepared_fwd_bshd(p, mask_128, sizes_128, alias_guard=alias_guard)[0].to(torch.bfloat16)
     if not capturing:
