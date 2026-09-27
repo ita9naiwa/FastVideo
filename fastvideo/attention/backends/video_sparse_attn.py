@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import functools
 import math
-import os
 from dataclasses import dataclass
 
 import torch
@@ -219,15 +218,6 @@ def _gather_tile_rows(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return x.index_select(1, index)
 
 
-@functools.lru_cache(maxsize=1)
-def _compiled_tile_copy() -> Any:
-    # One callable shared across layers, with shape/layout specializations.
-    def copy(x: torch.Tensor, source: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
-        return x.index_select(1, source).masked_fill(padding[None, :, None, None], 0)
-
-    return torch.compile(copy, fullgraph=True, dynamic=False)
-
-
 class _TilePermutation(torch.autograd.Function):
     """Invert builder-bijective rows with distinct nonpad destinations.
 
@@ -255,13 +245,6 @@ def _tile_permute_rows(x: torch.Tensor, partition: torch.Tensor, nonpad: torch.T
     source.index_copy_(0, nonpad, partition)
     padding = torch.ones(padded_length, device=x.device, dtype=torch.bool)
     padding.index_fill_(0, nonpad, False)
-    # Optional cold compilation must be warmed before CUDA Graph capture.
-    # Keep inspected 32-bit index extents and native fallback for other layouts.
-    if (os.environ.get("FASTVIDEO_VSA_COMPILE_TILE") == "1" and x.is_cuda and x.dtype == torch.bfloat16
-            and _tile_row_layout(x) and x.shape[-1] in (64, 128) and max(
-                (x.shape[0] - 1) * x.stride(0) + x.shape[1] * x.stride(1),
-                x.shape[0] * padded_length * x.shape[2] * x.shape[3]) < 2**31):
-        return _compiled_tile_copy()(x, source, padding)
     out = _gather_tile_rows(x, source)
     # Zero only the pad rows: the bijective partition fixes their count from shapes, so a fixed-size compaction
     # (no device-dependent output size, no host sync) replaces a masked fill over every element.
