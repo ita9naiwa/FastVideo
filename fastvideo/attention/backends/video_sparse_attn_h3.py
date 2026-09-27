@@ -799,7 +799,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         return reason
 
     def _resolve_cute256_route(self, device: torch.device) -> str | None:
-        """"bf16" when tile-256 no-grad calls reach the opaque CuTe op: CuTe backend, SM10x, VC off. "vc" with
+        """"bf16" when tile-128/256 no-grad calls reach the opaque CuTe ops (vsa_nograd_fwd / vsa256_nograd_fwd): CuTe
+        backend, SM10x, VC off. "vc" (tile 256 only for now) with
         FASTVIDEO_VSA_VC=1 when the fused VC ops can run: head 128, probe off, VC-enabled FA4 checkout importable."""
         if block_sparse_attn_256_bshd is None or device.type != "cuda":
             return None
@@ -862,7 +863,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                                                                     attn_metadata.untile_combined_index,
                                                                     target_shape[1], state[1], state[3])
 
-        if compiling and not grad_mode and attn_metadata.tile_elems == 256:
+        if compiling and not grad_mode and attn_metadata.tile_elems in (128, 256):
             # Compiled tile-256 inference: a fresh tensor the graph owns (the holder's identity/version bookkeeping
             # below is eager-only Python state). With builder-certified indices, the opaque permutation op (row gather,
             # pad rows zeroed by index) beats Inductor's generated gather; otherwise a fresh zero-padded scatter.

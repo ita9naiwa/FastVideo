@@ -394,12 +394,16 @@ def _regional_compile_unsupported_reason(
         if os.environ.get("FASTVIDEO_H3_VSA_PROBE"):
             return ("FASTVIDEO_H3_VSA_PROBE records tensors and files from the VSA-H3 attention body, which "
                     "regional fullgraph compile cannot capture; this model stays eager")
-        if vsa_tile_size == 256:
-            # Tile 256 compiles through the opaque CuTe no-grad op (vsa256_nograd_fwd), or with FASTVIDEO_VSA_VC=1 through
-            # the fused VC ops (the impl hook resolves the rest of the VC route); Triton stays eager.
+        if vsa_tile_size in (128, 256):
+            # Tiles 128/256 compile through the opaque CuTe no-grad ops (vsa_nograd_fwd / vsa256_nograd_fwd); at tile 256
+            # FASTVIDEO_VSA_VC=1 compiles through the fused VC ops (the impl hook resolves the rest of the VC route);
+            # Triton stays eager.
             if os.environ.get("FASTVIDEO_VSA_CUTEDSL", "0") != "1":
-                return ("VIDEO_SPARSE_ATTN_H3 tile-256 regional compile requires the CuTe backend "
+                return (f"VIDEO_SPARSE_ATTN_H3 tile-{vsa_tile_size} regional compile requires the CuTe backend "
                         "(FASTVIDEO_VSA_CUTEDSL=1); Triton VSA stays eager")
+            if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1" and vsa_tile_size != 256:
+                return ("VIDEO_SPARSE_ATTN_H3 tile-128 VC regional compile lands with vc-h3-compiled-route-tile128 "
+                        "(FASTVIDEO_VSA_VC=1); this model stays eager")
             if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1" and not os.environ.get("FASTVIDEO_VSA_VC_ROOT"):
                 return ("VIDEO_SPARSE_ATTN_H3 tile-256 VC regional compile requires FASTVIDEO_VSA_VC_ROOT "
                         "(FASTVIDEO_VSA_VC=1); this model stays eager")
@@ -407,7 +411,7 @@ def _regional_compile_unsupported_reason(
             return ("VIDEO_SPARSE_ATTN_H3 regional compile requires the compile-safe sm_100a route "
                     "(FASTVIDEO_VSA_SM100A=1); Triton/CuTe VSA stays eager")
         elif vsa_tile_size != 64:
-            return ("VIDEO_SPARSE_ATTN_H3 regional compile requires VSA_tile_size=64 or 256; "
+            return ("VIDEO_SPARSE_ATTN_H3 regional compile requires VSA_tile_size=64, 128 or 256; "
                     f"got {vsa_tile_size!r}, so VSA stays eager")
     if resolved_name == "VIDEO_SPARSE_ATTN":
         return (f"attention backend resolved to {resolved_name}, whose Triton "

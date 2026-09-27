@@ -196,6 +196,14 @@ def block_sparse_attn_128_bshd(
         )
         return out_bhsd.transpose(1, 2).contiguous(), aux
 
+    # Native BF16 Q128: the tile-parameterized opaque ops (same op in eager and compiled mode, fullgraph-safe).
+    hint = () if alias_guard is None else (
+        alias_guard if isinstance(alias_guard, torch.Tensor) else torch.tensor(bool(alias_guard), device="cpu"), )
+    if vsa256_ops.training_eligible(q, k, v, logical_block_map_128, block=128):
+        out, lse = vsa256_ops.vsa_train_fwd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128, 128, *hint)
+        return out, lse.detach()
+    if vsa256_ops.nograd_eligible(q, k, v, logical_block_map_128, block=128):
+        return vsa256_ops.vsa_nograd_fwd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128, 128, *hint)
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
     return block_sparse_attn_cute_fwd_bshd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128,
                                            **_hint_kwargs(alias_guard))

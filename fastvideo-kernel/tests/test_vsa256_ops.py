@@ -422,3 +422,184 @@ def test_vsa256_nograd_op_warm_key_includes_hint(warm, capture):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out[0], ref[0])
+
+
+def _inputs128(b=1, n_tiles=24, heads=4, seed=0, requires_grad=True):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    sizes = torch.tensor([128 if i % 3 else 67 for i in range(n_tiles)], device="cuda", dtype=torch.int64)
+    sizes[-1] = 19
+    scores = torch.rand(b, heads, n_tiles, n_tiles, device="cuda", generator=g)
+    block_map = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, scores.topk(6, -1).indices, True)
+    q, k, v = (torch.randn(b, n_tiles * 128, heads, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+               .requires_grad_(requires_grad) for _ in range(3))
+    return q, k, v, block_map, sizes
+
+
+def test_vsa_nograd_fwd_tile128_matches_previous_route(monkeypatch):
+    """Tile-parameterized inference op at tile 128: schema/fake check; eager output (out, LSE) bitwise equal to the previous
+    no-grad Q128 route; tile 256 equals vsa256_nograd_fwd; block_sparse_attn_128_bshd no-grad takes the op."""
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo_kernel import vsa256_ops
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_128_bshd
+    from fastvideo_kernel.block_sparse_attn_cute_fwd import _cute_attention_q128_forward
+    q, k, v, block_map, sizes = _inputs128(requires_grad=False)
+    torch.library.opcheck(torch.ops.fastvideo_kernel.vsa_nograd_fwd.default, (q, k, v, block_map, sizes, 128),
+                          test_utils=("test_schema", "test_faketensor"))
+    out, lse = vsa256_ops.vsa_nograd_fwd(q, k, v, block_map, sizes, 128)
+    with torch.no_grad():
+        ref_out, ref_lse, _ = _cute_attention_q128_forward(q, k, v, block_map, sizes, need_backward=False)
+    assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
+    got = block_sparse_attn_128_bshd(q, k, v, block_map, sizes)
+    assert torch.equal(got[0], ref_out) and torch.equal(got[1], ref_lse)
+    q2, k2, v2, map2, sizes2 = _inputs(requires_grad=False)
+    a = vsa256_ops.vsa_nograd_fwd(q2, k2, v2, map2, sizes2, 256)
+    b = vsa256_ops.vsa256_nograd_fwd(q2, k2, v2, map2, sizes2)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    with pytest.raises(ValueError, match="tile 128 or 256"):
+        vsa256_ops.vsa_nograd_fwd(q, k, v, block_map, sizes, 64)
+
+
+def test_block_sparse_attn_128_bshd_training_through_train_op(monkeypatch):
+    """The public tile-128 entry sends native BF16 training through worker-1's vsa_train_fwd(tile=128): O/LSE/dK/dV equal
+    to calling that op directly (bitwise), dQ within the op's own repeat spread."""
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo_kernel import vsa256_ops
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_128_bshd
+    q, k, v, block_map, sizes = _inputs128()
+    dout = torch.randn_like(q)
+
+    def grads(fn):
+        out, lse = fn()
+        return (out.detach(), lse.detach(), *torch.autograd.grad(out, (q, k, v), dout))
+
+    new = grads(lambda: block_sparse_attn_128_bshd(q, k, v, block_map, sizes))
+    ref1 = grads(lambda: vsa256_ops.vsa_train_fwd(q, k, v, block_map, sizes, 128))
+    ref2 = grads(lambda: vsa256_ops.vsa_train_fwd(q, k, v, block_map, sizes, 128))
+    for i, name in ((0, "out"), (1, "lse"), (3, "dk"), (4, "dv")):
+        assert torch.equal(new[i], ref1[i]), name
+    spread = (ref2[2].float() - ref1[2].float()).abs().max()
+    assert (new[2].float() - ref1[2].float()).abs().max() <= max(2 * spread, 1e-3)
+
+
+def test_block_sparse_attn_128_bshd_fullgraph(monkeypatch):
+    """torch.compile(fullgraph=True, dynamic=True) of the public tile-128 entry, no-grad and training (fwd+bwd), over three
+    tile counts: one graph per mode, 0 recompiles, output (and dK/dV) bitwise equal to eager."""
+    import torch.fx.experimental._config as fx_config
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_128_bshd
+    counters = torch._dynamo.utils.counters
+    for grad in (False, True):
+        torch._dynamo.reset()
+        compiled = torch.compile(lambda *a: block_sparse_attn_128_bshd(*a)[0], fullgraph=True, dynamic=True)
+        graphs0, breaks0 = counters["stats"]["unique_graphs"], sum(counters["graph_break"].values())
+        for i, n in enumerate((20, 28, 44)):
+            q, k, v, block_map, sizes = _inputs128(n_tiles=n, seed=i, requires_grad=grad)
+            with torch.set_grad_enabled(grad):
+                eager, got = block_sparse_attn_128_bshd(q, k, v, block_map, sizes)[0], compiled(q, k, v, block_map, sizes)
+                assert torch.equal(got, eager), (grad, n)
+                if grad:
+                    dout = torch.randn_like(q)
+                    ge, gc = torch.autograd.grad(eager, (k, v), dout), torch.autograd.grad(got, (k, v), dout)
+                    assert torch.equal(ge[0], gc[0]) and torch.equal(ge[1], gc[1]), n
+        assert sum(counters["graph_break"].values()) == breaks0, grad
+        assert counters["stats"]["unique_graphs"] - graphs0 == 1, grad
+    torch._dynamo.reset()
+
+
+def test_h3_tile128_nograd_block_fullgraph(monkeypatch):
+    """Compiled tile-128 H3 inference: fullgraph dynamic capture of the no-grad block (tile -> block map -> attention ->
+    untile) over chunk128-merged and cube128 geometries: one graph per layout, 0 recompiles, bitwise equal to eager, and the
+    CuTe forward runs inside vsa_nograd_fwd in both modes."""
+    import types
+    import torch.fx.experimental._config as fx_config
+    from fastvideo_kernel import vsa256_ops
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    monkeypatch.delenv("FASTVIDEO_VSA_VC", raising=False)
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAImpl, MiniMaxH3VSAMetadataBuilder
+    calls = []
+    real = vsa256_ops.adapter
+    proxy = types.SimpleNamespace(**{n: getattr(real, n) for n in dir(real) if not n.startswith("__")})
+    proxy._cute_attention_q128_forward = lambda *a, **kw: calls.append(1) or real._cute_attention_q128_forward(*a, **kw)
+    monkeypatch.setattr(vsa256_ops, "adapter", proxy)
+    impl = MiniMaxH3VSAImpl(num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5)
+    impl.layer_idx = 0
+    assert impl.prepare_for_regional_compile(torch.device("cuda")) is None
+
+    def block(q, k, v, meta):
+        x = impl.preprocess_qkv(torch.cat([q, k, v], dim=0), meta)
+        q2, k2, v2 = x.chunk(3, dim=0)
+        return impl.postprocess_output(impl.forward(q2, k2, v2, None, meta), meta)
+
+    geometries = [((42, 14, 24), (175, 1, 170, 402)), ((37, 16, 56), (250, 1, 0, 300)), ((62, 26, 24), (175, 1, 170, 0))]
+    counters = torch._dynamo.utils.counters
+    for layout in ("chunk128", "cube"):
+        torch._dynamo.reset()
+        compiled = torch.compile(block, backend="inductor", dynamic=True, fullgraph=True)
+        graphs0, breaks0 = counters["stats"]["unique_graphs"], sum(counters["graph_break"].values())
+        for i, (raw, prefix) in enumerate(geometries):
+            meta = MiniMaxH3VSAMetadataBuilder().build(
+                current_timestep=0, raw_latent_shape=raw, patch_size=(1, 2, 2), VSA_sparsity=0.85, prefix_segments=prefix,
+                device=torch.device("cuda"), tile_size=128, topk_cap=64,
+                **({"tile_layout": "chunk128", "merge_prefix": True} if layout == "chunk128" else {}))
+            torch.manual_seed(i)
+            q, k, v = (torch.randn(1, meta.total_seq_length, 4, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+            with torch.no_grad():
+                calls.clear()
+                eager = block(q, k, v, meta)
+                assert len(calls) == 1, (layout, i, "eager")
+                before = counters["stats"]["unique_graphs"]
+                out = compiled(q, k, v, meta)
+                assert len(calls) == 2, (layout, i, "compiled")
+            assert i == 0 or counters["stats"]["unique_graphs"] == before, f"recompiled at {layout} geometry {i}"
+            assert torch.equal(out, eager), (layout, i)
+        assert sum(counters["graph_break"].values()) == breaks0
+        assert counters["stats"]["unique_graphs"] - graphs0 == 1, layout
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("warm,capture", [(w, c) for w in (None, False, True) for c in (None, False, True) if w != c])
+def test_vsa_nograd_fwd_tile128_warm_key_includes_hint(warm, capture):
+    """Tile 128: a geometry warmed with one hint value is not warm for another; the capture raises before any launch and a
+    same-hint capture replays bitwise."""
+    from fastvideo_kernel import vsa256_ops
+    vsa256_ops._nograd_warm.clear()
+    q, k, v, block_map, sizes = _inputs128(n_tiles=22, requires_grad=False)
+    op = torch.ops.fastvideo_kernel.vsa_nograd_fwd
+    as_args = lambda h: () if h is None else (torch.tensor(h, device="cpu"), )
+    op(q, k, v, block_map, sizes, 128, *as_args(warm))
+    with pytest.raises(RuntimeError, match="unwarmed geometry"), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        op(q, k, v, block_map, sizes, 128, *as_args(capture))
+    ref = op(q, k, v, block_map, sizes, 128, *as_args(capture))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(q, k, v, block_map, sizes, 128, *as_args(capture))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out[0], ref[0])
+
+
+def test_mixed_q128_kv256_generic_fallback_matches_reference(monkeypatch):
+    """Generic CuTe fallback with 128-token Q blocks and 256-token KV blocks (outside the op family: mixed tiles) equals a
+    dense masked FP32 reference built from the same block map and KV sizes, within the campaign gate's VSA out tolerance."""
+    monkeypatch.setenv("FASTVIDEO_VSA_CUTEDSL", "1")
+    from fastvideo_kernel.block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
+    torch.manual_seed(0)
+    nq, nk, heads, dim = 16, 8, 2, 128
+    q = torch.randn(1, 128 * nq, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (torch.randn(1, 256 * nk, heads, dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    block_map = torch.rand(1, heads, nq, nk, device="cuda") > 0.5
+    block_map[..., 0] = True
+    sizes = torch.full((nk, ), 256, device="cuda", dtype=torch.int32)
+    sizes[-1] = 100
+    with torch.no_grad():
+        out = block_sparse_attn_cute_fwd_bshd(q, k, v, block_map, sizes)[0]
+    valid = torch.arange(256, device="cuda").view(1, -1) < sizes.view(-1, 1)
+    allowed = block_map.repeat_interleave(128, 2).repeat_interleave(256, 3) & valid.flatten().view(1, 1, 1, -1)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) / dim**0.5
+    ref = torch.einsum("bhqk,bkhd->bqhd", scores.masked_fill(~allowed, float("-inf")).softmax(-1), v.float())
+    diff = (out.float() - ref).abs()
+    assert diff.mean() < 1.5e-3 and diff.max() / (ref.abs().mean() + 1e-6) < 0.3, (diff.mean().item(), diff.max().item())

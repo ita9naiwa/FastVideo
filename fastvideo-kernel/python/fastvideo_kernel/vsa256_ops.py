@@ -177,10 +177,11 @@ def training_eligible(q, k, v, block_map, block=256):
             and _native_domain(q, k, v, block_map, block))
 
 
-def nograd_eligible(q, k, v, block_map):
-    """Domain of ``vsa256_nograd_fwd``: the same native BF16 Q256 inputs, with no gradient requested."""
+def nograd_eligible(q, k, v, block_map, block=256):
+    """Domain of the no-grad ops (``vsa256_nograd_fwd``; ``block=128``: ``vsa_nograd_fwd`` at tile 128): the same native BF16
+    inputs, with no gradient requested."""
     return (not (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)))
-            and _native_domain(q, k, v, block_map))
+            and _native_domain(q, k, v, block_map, block))
 
 
 def _native_domain(q, k, v, block_map, block=256):
@@ -290,3 +291,31 @@ def _backward_train(ctx, dout, dlse):  # lse is auxiliary (callers detach it), a
 
 
 vsa_train_fwd.register_autograd(_backward_train, setup_context=_setup_context_train)
+
+
+# Tile-parameterized inference op (ruling 84: one op family, tile a parameter; mirrors vsa_train_fwd). ``tile`` 256: the
+# vsa256_nograd_fwd body (that op stays the tile-256 member for SAC/tests); ``tile`` 128: the eager no-grad Q128 forward
+# (_cute_attention_q128_forward, need_backward=False). Same CUDA-graph warm guard as vsa256_nograd_fwd, keyed by tile too.
+@torch.library.custom_op("fastvideo_kernel::vsa_nograd_fwd", mutates_args=(), device_types="cuda")
+def vsa_nograd_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_map: torch.Tensor, sizes: torch.Tensor,
+                   tile: int, alias_guard: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    if tile == 256:
+        return vsa256_nograd_fwd(q, k, v, block_map, sizes, alias_guard)
+    if tile != 128:
+        raise ValueError(f"vsa_nograd_fwd supports tile 128 or 256, got {tile}")
+    if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
+        raise RuntimeError("vsa_nograd_fwd is the BF16 route; FASTVIDEO_VSA_VC=1 must be resolved by the caller")
+    key = (128, None if alias_guard is None else bool(alias_guard), tuple(q.shape), tuple(k.shape), tuple(block_map.shape))
+    if torch.cuda.is_current_stream_capturing() and key not in _nograd_warm:
+        raise RuntimeError("vsa_nograd_fwd: CUDA-graph capture reached an unwarmed geometry (its CuTe JIT would run "
+                           "inside the capture); run one eager or compiled forward of this geometry first")
+    with torch.no_grad():
+        out, lse, _ = adapter._cute_attention_q128_forward(q, k, v, block_map, sizes, need_backward=False,
+                                                           alias_guard=alias_guard)
+    _nograd_warm.add(key)
+    return out, lse
+
+
+@torch.library.register_fake("fastvideo_kernel::vsa_nograd_fwd")
+def _vsa_nograd_fwd_fake(q, k, v, block_map, sizes, tile, alias_guard=None):
+    return q.new_empty(q.shape), q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
