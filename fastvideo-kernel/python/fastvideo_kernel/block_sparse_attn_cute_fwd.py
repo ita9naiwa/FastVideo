@@ -222,7 +222,23 @@ def _build_sparse_tensors(
     retains a dense ``[B, H, kv_blocks, q_blocks]`` int32 index tensor shared
     by the full and partial lists until backward runs. Building it when
     nothing requires grad is pure overhead.
+
+    Tile-parametric callers pass ``(q_block_size, kv_block_size) = (TILE, TILE)`` for the forward and
+    ``(TILE, TILE // 2, force_q_sparse_block_size=TILE)`` for the backward. Two normalizations keep that valid at
+    TILE = 128: a KV block finer than FA4's 128-token tile is merged back to 128 (its children's map columns are OR-ed,
+    exact when the children of a 128 block are selected together, as a ``repeat_interleave``-d map is; sizes are
+    summed); and a 128-row Q block keeps its own sparse list instead of being doubled to 256 rows, which would give
+    each Q tile its neighbour's KV selection.
     """
+    if kv_block_size < _FA4_Q_BLOCK_SIZE:
+        factor = _FA4_Q_BLOCK_SIZE // kv_block_size
+        if _FA4_Q_BLOCK_SIZE % kv_block_size or block_map.shape[-1] % factor or variable_block_sizes.numel() % factor:
+            raise ValueError(f"kv_block_size={kv_block_size} must tile {_FA4_Q_BLOCK_SIZE} and the KV block count")
+        block_map = block_map.unflatten(-1, (-1, factor)).any(-1)
+        variable_block_sizes = variable_block_sizes.view(-1, factor).sum(-1, dtype=variable_block_sizes.dtype)
+        kv_block_size = _FA4_Q_BLOCK_SIZE
+    if force_q_sparse_block_size is None and q_block_size == _FA4_Q_BLOCK_SIZE:
+        force_q_sparse_block_size = _FA4_Q_BLOCK_SIZE
     BlockSparseTensorsTorch, _, _, _ = _load_fa4_cute()
     if force_q_sparse_block_size is None:
         q_sparse_candidate = _choose_q_sparse_block_size(q_len)
