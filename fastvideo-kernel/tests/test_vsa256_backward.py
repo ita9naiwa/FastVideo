@@ -199,6 +199,27 @@ def test_vsa256_cute_backward_cross_q_kv(layout: str) -> None:
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("kv_blocks,tails", [(8, False), (12, False), (12, True)], ids=["qk-equal", "cross", "cross-tails"])
+def test_vsa256_nograd_forward_vs_torch_ref(monkeypatch, backend: str, layout: str, kv_blocks: int, tails: bool) -> None:
+    """Inference route (no grad) of the public BHSD/BSHD entries vs the torch reference, heads 8, 8 Q blocks, topk 2:
+    Q == KV, Q != KV and random tail KV sizes, on the CuTe and the Triton (route-A 256->64) backends."""
+    if backend == "triton":
+        monkeypatch.setenv("FASTVIDEO_VSA_TRITON", "1")
+    torch.manual_seed(0)
+    kv_var = (torch.randint(16, _BLOCK + 1, (kv_blocks, ), dtype=torch.int32, device="cuda") if tails else torch.full(
+        (kv_blocks, ), _BLOCK, dtype=torch.int32, device="cuda"))
+    q_var = torch.full((8, ), _BLOCK, dtype=torch.int32, device="cuda")
+    q, k, v, _ = _make_inputs(8, kv_blocks, kv_var, q_var, heads=8, seed=0)
+    runner = _run_bhsd if layout == "bhsd" else _run_bshd
+    with torch.no_grad():
+        out, _ = runner(q, k, v, kv_var, q_var, 2)
+        ref = _torch_vsa256_reference(q, k, v, q_var, kv_var, 2)
+    _check(f"nograd-{backend}-{layout}", ref, out, _OUT_TOL)
+
+
+@pytest.mark.cuda
 def test_vsa256_cute_inference_matches_training_forward() -> None:
     """Training may use native256 while inference retains expanded128.
     Both implement the same operator, with the existing output tolerance."""
