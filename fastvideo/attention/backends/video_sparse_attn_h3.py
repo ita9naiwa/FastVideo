@@ -1123,10 +1123,12 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             if k_vid is None or (not compiling and k_vid != _video_topk(
                     layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)):
                 k_vid = _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
-            if (tile_sums is not None and attn_metadata.num_video_tiles == n_tiles - attn_metadata.num_prefix_tiles and
+            if (tile_sums is not None and not compiling and
+                    attn_metadata.num_video_tiles == n_tiles - attn_metadata.num_prefix_tiles and
                     k_vid == _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)):
                 # The gather's sums are _pool_tiles's bitwise: the same block means, scores and map, without
-                # re-reading the tiled q/k.
+                # re-reading the tiled q/k. Eager only: _video_topk cannot trace a symbolic sparsity, and compiled
+                # graphs keep the cached k_vid map below.
                 pools = tile_sums[:2].detach() / attn_metadata.variable_block_sizes.view(1, 1, -1, 1)
                 mask = torch.ops.fastvideo_kernel.vsa_h3_block_map_from_pools(pools[0], pools[1],
                                                                               attn_metadata.num_prefix_tiles,

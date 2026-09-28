@@ -377,3 +377,53 @@ def test_tile_sums_gather_matches_pooling(tile, untrusted):
     assert all(torch.equal(a, b) for a, b in zip(actual, tiled, strict=True))
     assert actual_sums.shape == sums.shape and torch.equal(actual_sums, sums)
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, grads, strict=True))
+
+
+def test_gated_layer_path_h3mh_compile(monkeypatch):
+    """The SP=1 gated layer path (tile sums from the gather) under h3mh's compile config: inductor, dynamic, fullgraph,
+    fail_on_recompile_limit_hit, use_duck_shape=False, SAC MUST_SAVE {vsa256_fwd, vsa_train_fwd, vsa_h3_block_map}.
+    One graph over two calls, no breaks, compiled close to eager (BF16 coarse chain)."""
+    import functools
+
+    import torch.fx.experimental._config as fx_config
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    ops = torch.ops.fastvideo_kernel
+    must_save = {ops.vsa256_fwd.default, ops.vsa_train_fwd.default, ops.vsa_h3_block_map.default}
+    policy = lambda ctx, op, *a, **k: CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE
+    impl, md = _impl(), _metadata(tile_size=128, tile_layout="chunk128", merge_prefix=True)
+    n = md.total_seq_length
+
+    def block(q, k, v, g):
+        return layer._forward_separate_qkv(impl, q, k, v, n, None, md, g)[0]
+
+    def checkpointed(*x):
+        return checkpoint(block,
+                          *x,
+                          use_reentrant=False,
+                          context_fn=functools.partial(create_selective_checkpoint_contexts, policy))
+
+    compiled = torch.compile(checkpointed, backend="inductor", mode="default", dynamic=True, fullgraph=True)
+
+    def run(fn, seed):
+        q, k, v = _qkv(md, seed=seed)
+        gen = torch.Generator(device="cuda").manual_seed(seed + 100)
+        g, up = (torch.randn(q.shape, device="cuda", dtype=q.dtype, generator=gen) for _ in range(2))
+        leaves = [x.detach().requires_grad_(True) for x in (q, k, v, g)]
+        out = fn(*leaves)
+        return (out, *torch.autograd.grad(out, leaves, up))
+
+    counters = torch._dynamo.utils.counters
+    torch._dynamo.reset()
+    try:
+        eager = [run(block, seed) for seed in (1, 2)]  # the eager coarse region compiles its own graph: count after it
+        counters.clear()
+        for seed, e_all in zip((1, 2), eager, strict=True):
+            for name, e, c in zip(("out", "dq", "dk", "dv", "dgate"), e_all, run(compiled, seed), strict=True):
+                rel = ((c.float() - e.float()).norm() / e.float().norm()).item()
+                assert rel < 2e-2, (seed, name, rel)
+        assert counters["stats"]["unique_graphs"] == 1
+        assert sum(counters["graph_break"].values()) == 0
+    finally:
+        torch._dynamo.reset()
