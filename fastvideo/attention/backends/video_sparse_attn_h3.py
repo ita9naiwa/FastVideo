@@ -474,6 +474,17 @@ def _pool_tiles(x: torch.Tensor, variable_block_sizes: torch.Tensor, tile_elems:
     return pooled.permute(0, 2, 1, 3)
 
 
+def _tile_means(pooled: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """The original VSA block means (ruling 117c): the fp32 tile mean rounded to the input dtype, [B, H, n, D] contiguous.
+    Coarse scores, the coarse softmax/attention and the fine top-k all run on these (in the input dtype)."""
+    return pooled.to(dtype).contiguous()
+
+
+def _coarse_scores(q_means: torch.Tensor, k_means: torch.Tensor) -> torch.Tensor:
+    """q_c k_c^T / sqrt(D) on the block means (input dtype): the scores of both the coarse branch and the fine top-k."""
+    return torch.matmul(q_means, k_means.transpose(-2, -1)) / (q_means.shape[-1]**0.5)
+
+
 def _video_topk(sparsity: float, num_video_tiles: int, cap: int | None) -> int:
     """The single host-int video top-k: ceil((1 - sparsity) * n) in exact integer arithmetic on the decimal sparsity
     (0.85 -> (3n + 19) // 20; float ceil overshoots at n = 20m), clamped to [1, n], optionally capped (ruling 71:
@@ -519,8 +530,8 @@ def _build_block_mask(
 @torch.library.custom_op("fastvideo_kernel::vsa_h3_block_map", mutates_args=())
 def vsa_h3_block_map(query: torch.Tensor, key: torch.Tensor, variable_block_sizes: torch.Tensor, tile_elems: int,
                      num_prefix_tiles: int, num_video_tiles: int, k_vid: int, exempt: bool) -> torch.Tensor:
-    scores = torch.matmul(_pool_tiles(query, variable_block_sizes, tile_elems),
-                          _pool_tiles(key, variable_block_sizes, tile_elems).transpose(-2, -1)) / (query.shape[-1]**0.5)
+    scores = _coarse_scores(_tile_means(_pool_tiles(query, variable_block_sizes, tile_elems), query.dtype),
+                            _tile_means(_pool_tiles(key, variable_block_sizes, tile_elems), key.dtype))
     return _build_block_mask(scores, num_prefix_tiles, num_video_tiles, 1.0, exempt, k_vid)
 
 
@@ -537,7 +548,8 @@ def _vsa_h3_block_map_fake(query, key, variable_block_sizes, tile_elems, num_pre
 def vsa_h3_block_map_from_pools(pool_q: torch.Tensor, pool_k: torch.Tensor, num_prefix_tiles: int, sparsity: float,
                                 topk_cap: int | None, exempt: bool) -> torch.Tensor:
     num_video_tiles = pool_q.shape[2] - num_prefix_tiles
-    scores = torch.matmul(pool_q, pool_k.transpose(-2, -1)) / (pool_q.shape[-1]**0.5)
+    # The fused VC route is BF16-only: its FP32 producer pools round to the BF16 block means, as on the tiled route.
+    scores = _coarse_scores(_tile_means(pool_q, torch.bfloat16), _tile_means(pool_k, torch.bfloat16))
     return _build_block_mask(scores, num_prefix_tiles, num_video_tiles, sparsity, exempt,
                              _video_topk(sparsity, num_video_tiles, topk_cap))
 
@@ -647,11 +659,10 @@ def _add_compress(out: torch.Tensor, scores: torch.Tensor, v_pooled: torch.Tenso
 
 def _coarse_branch(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor,
                    variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
-    """The gated compression branch from the tiled operands: pooled scores, then _add_compress."""
-    scores = torch.matmul(_pool_tiles(query, variable_block_sizes, tile),
-                          _pool_tiles(key, variable_block_sizes, tile).transpose(-2, -1)) / (query.shape[-1]**0.5)
-    return _add_compress(out, scores, _pool_tiles(value, variable_block_sizes, tile), gate, variable_block_sizes.shape[0],
-                         tile)
+    """The gated compression branch from the tiled operands (original VSA chain, ruling 117c): block means in the input
+    dtype, scores, then _add_compress."""
+    q_c, k_c, v_c = (_tile_means(_pool_tiles(x, variable_block_sizes, tile), x.dtype) for x in (query, key, value))
+    return _add_compress(out, _coarse_scores(q_c, k_c), v_c, gate, variable_block_sizes.shape[0], tile)
 
 
 @functools.cache
@@ -981,11 +992,11 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         out = torch.ops.fastvideo_kernel.vc_h3_attn_prepared(q8, k8, v8, qs, ks, vs, mask, sizes, tile,
                                                              attn_metadata.alias_guard_hint)
         if gate_compress is not None:
-            scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
+            q_c, k_c, v_c = (_tile_means(x, query.dtype) for x in pools)
             batch, _, heads, dim = out.shape
             gate = gate_compress.new_zeros(batch, padded, heads, dim)
             gate[:, untile] = gate_compress
-            out = _add_compress(out, scores, pools[2], gate, n_tiles, tile)
+            out = _add_compress(out, _coarse_scores(q_c, k_c), v_c, gate, n_tiles, tile)
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
@@ -1059,9 +1070,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
 
         scores = None
         if probe_dir is not None:
-            q_pooled = _pool_tiles(logical_query, attn_metadata.variable_block_sizes, tile_elems)
-            k_pooled = _pool_tiles(logical_key, attn_metadata.variable_block_sizes, tile_elems)
-            scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) / (query.shape[-1]**0.5)
+            scores = _coarse_scores(
+                _tile_means(_pool_tiles(logical_query, attn_metadata.variable_block_sizes, tile_elems), query.dtype),
+                _tile_means(_pool_tiles(logical_key, attn_metadata.variable_block_sizes, tile_elems), key.dtype))
             record_probe(probe_dir, self.layer_idx, logical_query, logical_key, scores, attn_metadata)
 
         if layer_sparsity > 0.0:
@@ -1232,8 +1243,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if logical_gate is not None:
             # The gate is zero-initialized for H3 (no contribution until finetuned; the model layer skips all-zero gates).
             if scores is not None:  # probe run (eager): reuse the recorded scores
-                v_pooled = _pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems)
-                out = _add_compress(out, scores, v_pooled, logical_gate, n_tiles, tile_elems)
+                v_c = _tile_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems), value.dtype)
+                out = _add_compress(out, scores, v_c, logical_gate, n_tiles, tile_elems)
             else:
                 coarse = _coarse_branch if compiling or not query.is_cuda else _coarse_branch_eager_caller
                 out = coarse(out, logical_query, logical_key, logical_value, logical_gate,
