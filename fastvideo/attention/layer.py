@@ -70,7 +70,11 @@ def _forward_separate_qkv(attn_impl, q: torch.Tensor, k: torch.Tensor, v: torch.
         q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
         k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
     q, k, v = attn_impl.preprocess_q_k_v(q, k, v, attn_metadata)
-    output = attn_impl.postprocess_output(attn_impl.forward(q, k, v, *gate, attn_metadata), attn_metadata)
+    output = attn_impl.forward(q, k, v, *gate, attn_metadata)
+    # Release the tiled q/k/v before postprocess_output allocates the untiled output: eager inference frees them here;
+    # training keeps what autograd saved. Only after forward: the fused VC route reads the packed rows inside it.
+    del q, k, v
+    output = attn_impl.postprocess_output(output, attn_metadata)
     return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None
 
 
@@ -292,6 +296,7 @@ class DistributedAttention_VSA(DistributedAttention):
 
         # Redistribute back if using sequence parallelism
         replicated_output = None
+        del qkvg, q, k, v, gate_compress  # release the tiled stack before untiling, as in _forward_separate_qkv
 
         # Apply backend-specific postprocess_output
         output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
