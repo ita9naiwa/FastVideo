@@ -645,6 +645,35 @@ def _add_compress(out: torch.Tensor, scores: torch.Tensor, v_pooled: torch.Tenso
             out_c.unsqueeze(2) * gate.view(batch, n_tiles, tile, heads, dim)).view(batch, seq_len, heads, dim)
 
 
+def _coarse_branch(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor,
+                   variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
+    """The gated compression branch from the tiled operands: pooled scores, then _add_compress."""
+    scores = torch.matmul(_pool_tiles(query, variable_block_sizes, tile),
+                          _pool_tiles(key, variable_block_sizes, tile).transpose(-2, -1)) / (query.shape[-1]**0.5)
+    return _add_compress(out, scores, _pool_tiles(value, variable_block_sizes, tile), gate, variable_block_sizes.shape[0],
+                         tile)
+
+
+@functools.cache
+def _coarse_branch_region():
+    """_coarse_branch as one Inductor region for eager callers: the eager pool/softmax/broadcast chain and its backward
+    materialize full-size temporaries (fwd+bwd at 38.4k tokens: 11.6 ms eager, 4.2 ms here). Static compile with only
+    the sequence dims marked dynamic: one graph per tile size for every document length (a fully dynamic graph also
+    makes tile and heads symbolic and runs slower than eager). emulate_precision_casts keeps eager's BF16 rounding
+    points, so results differ from eager only in the fp32 reduction order."""
+    return torch.compile(_coarse_branch, dynamic=False, fullgraph=True, options={"emulate_precision_casts": True})
+
+
+def _coarse_branch_eager_caller(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                                gate: torch.Tensor, variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
+    tensors = (out, query, key, value, gate)
+    for x in tensors:
+        torch._dynamo.mark_dynamic(x, 1)
+    sizes = variable_block_sizes.view(-1)  # mark a fresh view, not the metadata tensor
+    torch._dynamo.mark_dynamic(sizes, 0)
+    return _coarse_branch_region()(*tensors, sizes, tile)
+
+
 def _cute_backend() -> str:
     """fastvideo_kernel's tile-128/256 backend; imported at call time (fastvideo_kernel is optional)."""
     from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend as resolve_backend
@@ -1029,12 +1058,11 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         probe_dir = None if compiling else probe_enabled()
 
         scores = None
-        if gate_compress is not None or probe_dir is not None:
+        if probe_dir is not None:
             q_pooled = _pool_tiles(logical_query, attn_metadata.variable_block_sizes, tile_elems)
             k_pooled = _pool_tiles(logical_key, attn_metadata.variable_block_sizes, tile_elems)
             scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) / (query.shape[-1]**0.5)
-            if probe_dir is not None:
-                record_probe(probe_dir, self.layer_idx, logical_query, logical_key, scores, attn_metadata)
+            record_probe(probe_dir, self.layer_idx, logical_query, logical_key, scores, attn_metadata)
 
         if layer_sparsity > 0.0:
             # video_topk is cached at build (metadata must be rebuilt when VSA_sparsity changes): eager recomputes
@@ -1203,8 +1231,13 @@ class MiniMaxH3VSAImpl(AttentionImpl):
 
         if logical_gate is not None:
             # The gate is zero-initialized for H3 (no contribution until finetuned; the model layer skips all-zero gates).
-            v_pooled = _pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems)
-            out = _add_compress(out, scores, v_pooled, logical_gate, n_tiles, tile_elems)
+            if scores is not None:  # probe run (eager): reuse the recorded scores
+                v_pooled = _pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems)
+                out = _add_compress(out, scores, v_pooled, logical_gate, n_tiles, tile_elems)
+            else:
+                coarse = _coarse_branch if compiling or not query.is_cuda else _coarse_branch_eager_caller
+                out = coarse(out, logical_query, logical_key, logical_value, logical_gate,
+                             attn_metadata.variable_block_sizes, tile_elems)
         if query_sizes is not None:
             # Pin the trusted map (and its builder-recorded version) for postprocess_output. The pin is set in
             # traced caller code on a view: Dynamo rejects setattr on a custom op's tuple output element.
