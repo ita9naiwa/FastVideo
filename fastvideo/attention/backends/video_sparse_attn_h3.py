@@ -480,6 +480,29 @@ def _tile_means(pooled: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return pooled.to(dtype).contiguous()
 
 
+@torch.library.custom_op("fastvideo_kernel::vsa_h3_block_means", mutates_args=())
+def vsa_h3_block_means(pooled: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """_tile_means for the gated compression branch, as its own op so a selective-checkpoint policy can MUST_SAVE the
+    small block means ([B, H, n, D] in the input dtype). Without a saved input, the early recompute of the gated
+    attention output (for the residual/FFN backward) re-runs the pooling and the q/k/v projections and holds them until
+    attention backward. A policy on the coarse bmm/softmax does not work under compile: Inductor's SDPA rewrite replaces
+    those nodes and drops their tag."""
+    return torch.empty(pooled.shape, dtype=dtype, device=pooled.device).copy_(pooled)
+
+
+@vsa_h3_block_means.register_fake
+def _vsa_h3_block_means_fake(pooled, dtype):
+    return pooled.new_empty(pooled.shape, dtype=dtype)
+
+
+def _block_means_setup_context(ctx, inputs, output):
+    ctx.pooled_dtype = inputs[0].dtype
+
+
+vsa_h3_block_means.register_autograd(lambda ctx, grad: (grad.to(ctx.pooled_dtype), None),
+                                     setup_context=_block_means_setup_context)
+
+
 def _coarse_scores(q_means: torch.Tensor, k_means: torch.Tensor) -> torch.Tensor:
     """q_c k_c^T / sqrt(D) on the block means (input dtype): the scores of both the coarse branch and the fine top-k."""
     return torch.matmul(q_means, k_means.transpose(-2, -1)) / (q_means.shape[-1]**0.5)
@@ -661,7 +684,8 @@ def _coarse_branch(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, va
                    variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
     """The gated compression branch from the tiled operands (original VSA chain, ruling 117c): block means in the input
     dtype, scores, then _add_compress."""
-    q_c, k_c, v_c = (_tile_means(_pool_tiles(x, variable_block_sizes, tile), x.dtype) for x in (query, key, value))
+    q_c, k_c, v_c = (vsa_h3_block_means(_pool_tiles(x, variable_block_sizes, tile), x.dtype)
+                     for x in (query, key, value))
     return _add_compress(out, _coarse_scores(q_c, k_c), v_c, gate, variable_block_sizes.shape[0], tile)
 
 
@@ -690,7 +714,7 @@ def _coarse_branch_eager_caller(out: torch.Tensor, query: torch.Tensor, key: tor
 def _coarse_branch_sums(out: torch.Tensor, tile_sums: torch.Tensor, gate: torch.Tensor,
                         variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
     """_coarse_branch from the gather's fp32 tile sums [3, B, H, n, D] (bitwise _pool_tiles's sums of the tiled q/k/v)."""
-    q_c, k_c, v_c = (_tile_means(s / variable_block_sizes.view(1, 1, -1, 1), out.dtype) for s in tile_sums)
+    q_c, k_c, v_c = (vsa_h3_block_means(s / variable_block_sizes.view(1, 1, -1, 1), out.dtype) for s in tile_sums)
     return _add_compress(out, _coarse_scores(q_c, k_c), v_c, gate, variable_block_sizes.shape[0], tile)
 
 
@@ -1032,7 +1056,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         out = torch.ops.fastvideo_kernel.vc_h3_attn_prepared(q8, k8, v8, qs, ks, vs, mask, sizes, tile,
                                                              attn_metadata.alias_guard_hint)
         if gate_compress is not None:
-            q_c, k_c, v_c = (_tile_means(x, query.dtype) for x in pools)
+            q_c, k_c, v_c = (vsa_h3_block_means(x, query.dtype) for x in pools)
             batch, _, heads, dim = out.shape
             gate = gate_compress.new_zeros(batch, padded, heads, dim)
             gate[:, untile] = gate_compress
@@ -1299,8 +1323,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if logical_gate is not None:
             # The gate is zero-initialized for H3 (no contribution until finetuned; the model layer skips all-zero gates).
             if scores is not None:  # probe run (eager): reuse the recorded scores
-                v_c = _tile_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems),
-                                  value.dtype)
+                v_c = vsa_h3_block_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems),
+                                         value.dtype)
                 out = _add_compress(out, scores, v_c, logical_gate, n_tiles, tile_elems)
             elif tile_sums is not None:
                 coarse_sums = _coarse_branch_sums if compiling else _coarse_branch_sums_eager_caller

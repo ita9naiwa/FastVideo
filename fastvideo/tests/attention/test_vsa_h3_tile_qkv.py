@@ -427,3 +427,77 @@ def test_gated_layer_path_h3mh_compile(monkeypatch):
         assert sum(counters["graph_break"].values()) == 0
     finally:
         torch._dynamo.reset()
+
+
+def _hint(dim):
+    return dim if isinstance(dim, int) else dim.node.hint
+
+
+@pytest.mark.parametrize("save_means", [True, False], ids=["means-saved", "control"])
+def test_gated_sac_block_means_keep_projections_out_of_ffn_backward(monkeypatch, save_means):
+    """h3mh's SAC policy plus MUST_SAVE vsa_h3_block_means on a gated block (LN, q/k/v/gate projections, SP=1 gated
+    attention, to_out, residual, LN, FFN) under their compile config. The residual/FFN backward needs the gated
+    attention output again; with the saved block means it recomputes only the gate projection there, so the q/k/v
+    projections are recomputed for attention backward, after the FFN backward. Counts projection-shaped mms
+    ([S, C] @ [C, H*D]) in the compiled backward graph before the first FFN backward mm ([S, F] @ [F, C]). The control
+    (no saved means) shows the early q/k/v recompute the line removes."""
+    import functools
+
+    import torch.fx.experimental._config as fx_config
+    import torch.nn.functional as F
+    from torch._inductor import config as inductor_config
+    from torch._inductor.custom_graph_pass import CustomGraphPass
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+    monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", True)
+    monkeypatch.setattr(fx_config, "use_duck_shape", False)
+    ops = torch.ops.fastvideo_kernel
+    must_save = {ops.vsa256_fwd.default, ops.vsa_train_fwd.default, ops.vsa_h3_block_map.default}
+    if save_means:
+        must_save.add(ops.vsa_h3_block_means.default)  # the documented policy line
+    policy = lambda ctx, op, *a, **k: CheckpointPolicy.MUST_SAVE if op in must_save else CheckpointPolicy.PREFER_RECOMPUTE
+    impl, md = _impl(), _metadata(tile_size=128, tile_layout="chunk128", merge_prefix=True)
+    n, hd, c, f = md.total_seq_length, 4 * 128, 640, 1280  # c != hd != f keeps the mm shapes apart
+
+    def block(x, wq, wk, wv, wg, wo, w1, w2):
+        xn = F.layer_norm(x, (c, ))
+        q, k, v, g = (F.linear(xn, w).view(1, n, 4, 128) for w in (wq, wk, wv, wg))
+        x = x + F.linear(layer._forward_separate_qkv(impl, q, k, v, n, None, md, g)[0].reshape(1, n, hd), wo)
+        return x + F.linear(F.gelu(F.linear(F.layer_norm(x, (c, )), w1)), w2)
+
+    def checkpointed(*args):
+        return checkpoint(block,
+                          *args,
+                          use_reentrant=False,
+                          context_fn=functools.partial(create_selective_checkpoint_contexts, policy))
+
+    graphs = []
+
+    class Record(CustomGraphPass):
+
+        def __call__(self, graph):
+            graphs.append(graph)
+
+        def uuid(self):
+            return None
+
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    shapes = [(1, n, c)] + [(hd, c)] * 4 + [(c, hd), (f, c), (c, f)]
+    args = [(torch.randn(s, device="cuda", dtype=torch.bfloat16, generator=gen) * s[-1]**-0.5).requires_grad_(True)
+            for s in shapes]
+    torch._dynamo.reset()
+    try:
+        with inductor_config.patch(post_grad_custom_post_pass=Record(), fx_graph_cache=False):
+            out = torch.compile(checkpointed, backend="inductor", mode="default", dynamic=True, fullgraph=True)(*args)
+            out.backward(torch.randn_like(out))
+    finally:
+        torch._dynamo.reset()
+    backward = [g for g in graphs if any("vsa_train_bwd" in str(node.target) for node in g.nodes)]
+    assert len(backward) == 1
+    mms = [[_hint(d) for d in node.args[1].meta["val"].shape] for node in backward[0].nodes
+           if node.target == torch.ops.aten.mm.default]
+    ffn = mms.index([f, c])  # first FFN backward mm: grad of w1's input, [S, F] @ [F, C]
+    early = sum(shape == [c, hd] for shape in mms[:ffn])
+    if save_means:
+        assert early <= 1, mms  # the gate projection only
+    else:
+        assert early >= 3, mms  # q, k, v (and the gate) recomputed for the residual/FFN backward
