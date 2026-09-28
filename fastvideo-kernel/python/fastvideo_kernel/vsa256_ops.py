@@ -40,6 +40,22 @@ def _chunks(q, k, v):
     return q.chunk(3, dim=0) if k is None else (q, k, v)
 
 
+def hint_args(alias_guard):
+    """The alias-guard hint as trailing op arguments: () when unset, else one 0-d CPU bool tensor (a graph input)."""
+    if alias_guard is None:
+        return ()
+    return (alias_guard if isinstance(alias_guard, torch.Tensor) else torch.tensor(bool(alias_guard), device="cpu"), )
+
+
+def _check_nograd_launch(name, key):
+    """BF16 route only; a CUDA-graph capture may only reach a geometry ``key`` already warmed in ``_nograd_warm``."""
+    if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
+        raise RuntimeError(f"{name} is the BF16 route; FASTVIDEO_VSA_VC=1 must be resolved by the caller")
+    if torch.cuda.is_current_stream_capturing() and key not in _nograd_warm:
+        raise RuntimeError(f"{name}: CUDA-graph capture reached an unwarmed geometry (its CuTe JIT would run "
+                           "inside the capture); run one eager or compiled forward of this geometry first")
+
+
 @torch.library.custom_op("fastvideo_kernel::vsa256_fwd", mutates_args=(), device_types="cuda")
 def vsa256_fwd(q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None, block_map: torch.Tensor, sizes: torch.Tensor,
                query_sizes: torch.Tensor | None, query_untile: torch.Tensor | None, query_untile_version: int,
@@ -149,13 +165,9 @@ def vsa256_nograd_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_m
     """Inference-only BF16 Q256 forward: exactly the eager no-grad route (256 map expanded to 128-token KV children,
     then the CuTe forward), behind one opaque boundary so torch.compile(fullgraph=True) can capture it. No autograd.
     ``alias_guard``: the FA4 alias-guard hint as a 0-d CPU bool tensor (a graph input), or None for the FA4 default."""
-    if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
-        raise RuntimeError("vsa256_nograd_fwd is the BF16 route; FASTVIDEO_VSA_VC=1 must be resolved by the caller")
     # The hint is part of FA4's compile key, so a warmed geometry is warm only for the hint value it ran with.
     key = (None if alias_guard is None else bool(alias_guard), tuple(q.shape), tuple(k.shape), tuple(block_map.shape))
-    if torch.cuda.is_current_stream_capturing() and key not in _nograd_warm:
-        raise RuntimeError("vsa256_nograd_fwd: CUDA-graph capture reached an unwarmed geometry (its CuTe JIT would run "
-                           "inside the capture); run one eager or compiled forward of this geometry first")
+    _check_nograd_launch("vsa256_nograd_fwd", key)
     from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(block_map, sizes)
     with torch.no_grad():
@@ -216,9 +228,7 @@ def training_attention(q, k, v, block_map, sizes, *, pack_tails=None, query_size
     ``alias_guard``: FA4 alias-guard hint (None, bool or 0-d CPU bool tensor) for the forward launch of either route; it
     enters the op as a CPU tensor (graph input) and only when set, so hint-less calls keep the previous op arguments.
     """
-    hint = ()
-    if alias_guard is not None:
-        hint = (alias_guard if isinstance(alias_guard, torch.Tensor) else torch.tensor(bool(alias_guard), device="cpu"), )
+    hint = hint_args(alias_guard)
     if pack_tails is None:
         pack_tails = os.environ.get("FASTVIDEO_VSA_PACK_TAILS", "1") == "1"
     pack_tails = bool(pack_tails and q.shape[-1] == k.shape[-1] == v.shape[-1]
@@ -315,12 +325,8 @@ def vsa_nograd_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_map:
         return vsa256_nograd_fwd(q, k, v, block_map, sizes, alias_guard)
     if tile != 128:
         raise ValueError(f"vsa_nograd_fwd supports tile 128 or 256, got {tile}")
-    if os.environ.get("FASTVIDEO_VSA_VC", "0") == "1":
-        raise RuntimeError("vsa_nograd_fwd is the BF16 route; FASTVIDEO_VSA_VC=1 must be resolved by the caller")
     key = (128, None if alias_guard is None else bool(alias_guard), tuple(q.shape), tuple(k.shape), tuple(block_map.shape))
-    if torch.cuda.is_current_stream_capturing() and key not in _nograd_warm:
-        raise RuntimeError("vsa_nograd_fwd: CUDA-graph capture reached an unwarmed geometry (its CuTe JIT would run "
-                           "inside the capture); run one eager or compiled forward of this geometry first")
+    _check_nograd_launch("vsa_nograd_fwd", key)
     with torch.no_grad():
         out, lse, _ = adapter._cute_attention_q128_forward(q, k, v, block_map, sizes, need_backward=False,
                                                            alias_guard=alias_guard)
@@ -330,4 +336,4 @@ def vsa_nograd_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block_map:
 
 @torch.library.register_fake("fastvideo_kernel::vsa_nograd_fwd")
 def _vsa_nograd_fwd_fake(q, k, v, block_map, sizes, tile, alias_guard=None):
-    return q.new_empty(q.shape), q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
+    return _vsa256_nograd_fwd_fake(q, k, v, block_map, sizes)
