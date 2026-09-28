@@ -106,65 +106,6 @@ VSA_H3_TILE_SHAPES: dict[int, tuple[int, int, int]] = {
 _H3_CHUNK_LAYOUTS = {"chunk256": 256, "chunk128": 128}
 
 
-@torch.library.custom_op(
-    "fastvideo::h3_vsa_sm100a_from_mask_compat",
-    mutates_args=(),
-    device_types="cuda",
-)
-def _h3_vsa_sm100a_from_mask_compat(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_map: torch.Tensor,
-    variable_block_sizes: torch.Tensor,
-) -> torch.Tensor:
-    """Compile-safe mask adapter for kernel wheels predating the mask API."""
-    if _sm100a is None or map_to_index is None:
-        raise RuntimeError("The sm100a compatibility route requires the raw kernel and map_to_index")
-    q2k_idx, q2k_num = map_to_index(block_map)
-    out, _ = _sm100a.block_sparse_attn_sm100a(
-        q,
-        k,
-        v,
-        q2k_idx.to(torch.int32).contiguous(),
-        q2k_num.to(torch.int32).contiguous(),
-        variable_block_sizes.to(torch.int32).contiguous(),
-        need_lse=False,
-    )
-    return out
-
-
-@torch.library.register_fake("fastvideo::h3_vsa_sm100a_from_mask_compat")
-def _h3_vsa_sm100a_from_mask_compat_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_map: torch.Tensor,
-    variable_block_sizes: torch.Tensor,
-) -> torch.Tensor:
-    del k, v, block_map, variable_block_sizes
-    return torch.empty_like(q)
-
-
-def _sm100a_has_compile_safe_mask_route(sm100a_mod: Any) -> bool:
-    return (callable(getattr(sm100a_mod, "block_sparse_attn_sm100a_from_mask", None))
-            or (callable(getattr(sm100a_mod, "block_sparse_attn_sm100a", None)) and map_to_index is not None))
-
-
-def _sm100a_from_mask(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_map: torch.Tensor,
-    variable_block_sizes: torch.Tensor,
-) -> tuple[torch.Tensor, None]:
-    """Use the native mask entry when installed, otherwise the local adapter."""
-    native = getattr(_sm100a, "block_sparse_attn_sm100a_from_mask", None)
-    if callable(native):
-        return native(q, k, v, block_map, variable_block_sizes)
-    return _h3_vsa_sm100a_from_mask_compat(q, k, v, block_map, variable_block_sizes), None
-
-
 def token_tile_and_valid(variable_block_sizes: torch.Tensor,
                          tile_elems: int = _TILE_ELEMS) -> tuple[torch.Tensor, torch.Tensor]:
     """Per padded-token tile id and pad-validity mask.
@@ -789,9 +730,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if requested:
             if _sm100a is None:
                 reason = "fastvideo_kernel.block_sparse_attn_sm100a is not installed"
-            elif not _sm100a_has_compile_safe_mask_route(_sm100a):
-                reason = ("neither a native block_sparse_attn_sm100a_from_mask entry nor the raw sm100a "
-                          "kernel plus map_to_index compatibility route is installed")
+            elif not callable(getattr(_sm100a, "block_sparse_attn_sm100a_from_mask", None)):
+                reason = ("the installed fastvideo_kernel.block_sparse_attn_sm100a has no native "
+                          "block_sparse_attn_sm100a_from_mask entry (needs fastvideo_kernel >= f9e3680f, #1748)")
             else:
                 # Two 64-token blocks exercise the exact sm_100a inference
                 # specialization while keeping the one-time probe tiny.  The
@@ -818,10 +759,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 "FASTVIDEO_VSA_VC=1 but the compiled VC route is unavailable: it needs head size 128, probe recording "
                 "off, the CuTe backend on SM10x and the VC modules importable from FASTVIDEO_VSA_VC_ROOT")
         if enabled:
-            route = ("native fastvideo-kernel mask entry" if callable(
-                getattr(_sm100a, "block_sparse_attn_sm100a_from_mask", None)) else
-                     "FastVideo compatibility mask adapter")
-            logger.info_once(f"VSA-H3 regional compile mask route: {route}")
+            logger.info_once("VSA-H3 regional compile mask route: native fastvideo-kernel mask entry")
         if requested and reason is not None:
             logger.warning_once(f"VSA-H3 regional compile is unavailable and will stay eager: {reason}")
         return reason
@@ -1173,10 +1111,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 if not compiling:
                     logger.info_once("MiniMax-H3 VSA tile-64 forward: using the sm100a/sm103a CUDA block-sparse kernel")
                 if regional_compiling:
-                    # The compile-safe wrapper keeps both Triton mask
-                    # compaction and the raw pybind launch behind one
-                    # fake-backed custom-op boundary.
-                    out_bhsd, _ = _sm100a_from_mask(
+                    # The native mask entry keeps both Triton mask compaction and
+                    # the raw pybind launch behind one fake-backed custom-op boundary.
+                    out_bhsd, _ = _sm100a.block_sparse_attn_sm100a_from_mask(
                         q_bhsd,
                         k_bhsd,
                         v_bhsd,

@@ -162,13 +162,19 @@ def test_prepare_for_regional_compile_env_off_skips_probe(monkeypatch):
 
 
 def test_prepare_for_regional_compile_requires_mask_entry(monkeypatch):
+    """A kernel wheel without the native mask entry (before f9e3680f, #1748) keeps the eager route: the raw index entry
+    plus map_to_index no longer enables a compiled route."""
 
-    class _IndexOnlySm100a:
+    class _RawOnlySm100a:
 
         def is_supported(self, q, variable_block_sizes):
             raise AssertionError("missing mask entry must be rejected before the support probe")
 
-    monkeypatch.setattr(vsa_h3, "_sm100a", _IndexOnlySm100a())
+        def block_sparse_attn_sm100a(self, *args, **kwargs):
+            raise AssertionError("the prepare step must not launch the raw entry")
+
+    monkeypatch.setattr(vsa_h3, "_sm100a", _RawOnlySm100a())
+    monkeypatch.setattr(vsa_h3, "map_to_index", _fake_map_to_index)
     monkeypatch.setenv(VSA_SM100A_ENV, "1")
     warnings = []
     monkeypatch.setattr(vsa_h3.logger, "warning_once", warnings.append)
@@ -176,38 +182,11 @@ def test_prepare_for_regional_compile_requires_mask_entry(monkeypatch):
 
     unsupported = impl.prepare_for_regional_compile(torch.device("cpu"))
 
-    assert unsupported is not None
+    assert unsupported is not None and "block_sparse_attn_sm100a_from_mask" in unsupported
     assert impl._compile_layer_idx is not None
     assert impl._regional_compile_sm100a_enabled is False
     assert len(warnings) == 1
-    assert "compatibility route" in warnings[0]
-
-
-def test_mask_dispatch_uses_local_compatibility_route_for_older_kernel_wheel(monkeypatch):
-    class _RawOnlySm100a:
-
-        def block_sparse_attn_sm100a(self, *args, **kwargs):
-            raise AssertionError("raw entry must remain behind the compatibility custom op")
-
-    fake_sm = _RawOnlySm100a()
-    monkeypatch.setattr(vsa_h3, "_sm100a", fake_sm)
-    monkeypatch.setattr(vsa_h3, "map_to_index", lambda mask: (mask, mask))
-    calls = []
-
-    def compat(q, k, v, block_map, variable_block_sizes):
-        calls.append((block_map, variable_block_sizes))
-        return q + 1
-
-    monkeypatch.setattr(vsa_h3, "_h3_vsa_sm100a_from_mask_compat", compat)
-    q = torch.zeros(1, 1, 128, _DIM)
-    mask = torch.ones(1, 1, 2, 2, dtype=torch.bool)
-    vbs = torch.full((2, ), 64, dtype=torch.int32)
-
-    out, lse = vsa_h3._sm100a_from_mask(q, q, q, mask, vbs)
-
-    assert vsa_h3._sm100a_has_compile_safe_mask_route(fake_sm)
-    torch.testing.assert_close(out, q + 1)
-    assert lse is None and calls == [(mask, vbs)]
+    assert "stay eager" in warnings[0] and "f9e3680f" in warnings[0]
 
 
 def test_prepared_route_fullgraph_avoids_eager_dispatch(monkeypatch):
