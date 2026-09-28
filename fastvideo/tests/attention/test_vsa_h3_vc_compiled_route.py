@@ -75,7 +75,8 @@ def _previous_fused_route(h3, adapter, prepare, qkv, meta):
     padded_to_original[untile] = torch.arange(untile.numel(), dtype=torch.int64, device=q.device)
     p, pools = prepare(q.contiguous(), k.contiguous(), v.contiguous(), padded_to_original, sizes, tile,
                        torch.arange(padded, dtype=torch.int64, device=q.device), padded, 0)
-    scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (q.shape[-1]**0.5)
+    q_c, k_c = (x.to(q.dtype) for x in pools[:2])  # the original VSA block means (ruling 117c)
+    scores = torch.matmul(q_c, k_c.transpose(-2, -1)) / (q.shape[-1]**0.5)
     mask = h3._build_block_mask(scores, meta.num_prefix_tiles, meta.num_video_tiles, meta.VSA_sparsity, meta.exempt,
                                 h3._video_topk(meta.VSA_sparsity, meta.num_video_tiles, meta.video_topk_cap))
     kernel_map = _expand_mask_and_sizes_256_to_128(mask, sizes) if tile == 256 else (mask, sizes.to(torch.int32))
@@ -222,6 +223,7 @@ def test_vc_dense_layer_sparsity0_and_gate(h3, tile):
     sizes, untile = sparse.variable_block_sizes, sparse.untile_combined_index
     tiled = impl.forward(q, k, v, None, sparse)
     *_, pq, pk, pv = torch.ops.fastvideo_kernel.vc_h3_prepare_fused(q, k, v, untile, sizes, tile)
+    pq, pk, pv = (x.to(q.dtype) for x in (pq, pk, pv))  # the original VSA block means (ruling 117c)
     out_c = torch.softmax(pq @ pk.transpose(-2, -1) / q.shape[-1]**0.5, dim=-1) @ pv  # [B, H, n_tiles, D]
     gate_tiled = torch.zeros_like(tiled)
     gate_tiled[:, untile] = gate

@@ -669,9 +669,11 @@ def _coarse_branch(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, va
 def _coarse_branch_region():
     """_coarse_branch as one Inductor region for eager callers: the eager pool/softmax/broadcast chain and its backward
     materialize full-size temporaries (fwd+bwd at 38.4k tokens: 11.6 ms eager, 4.2 ms here). Static compile with only
-    the sequence dims marked dynamic: one graph per tile size for every document length (a fully dynamic graph also
-    makes tile and heads symbolic and runs slower than eager). emulate_precision_casts keeps eager's BF16 rounding
-    points, so results differ from eager only in the fp32 reduction order."""
+    the sequence dims marked dynamic, so document length never recompiles (a fully dynamic graph also makes tile and
+    heads symbolic and runs slower than eager). At most 4 graphs per tile: Inductor rewrites the BF16 coarse attention
+    to SDPA, which guards n_tiles % 8, and dynamo specializes storage offset 0 (unpadded documents pass the caller's
+    tensor). Inductor keeps the softmax/attention intermediates in fp32: within BF16 rounding of eager, and no further
+    from an fp64 reference than eager."""
     return torch.compile(_coarse_branch, dynamic=False, fullgraph=True, options={"emulate_precision_casts": True})
 
 
@@ -1243,7 +1245,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if logical_gate is not None:
             # The gate is zero-initialized for H3 (no contribution until finetuned; the model layer skips all-zero gates).
             if scores is not None:  # probe run (eager): reuse the recorded scores
-                v_c = _tile_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems), value.dtype)
+                v_c = _tile_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems),
+                                  value.dtype)
                 out = _add_compress(out, scores, v_c, logical_gate, n_tiles, tile_elems)
             else:
                 coarse = _coarse_branch if compiling or not query.is_cuda else _coarse_branch_eager_caller

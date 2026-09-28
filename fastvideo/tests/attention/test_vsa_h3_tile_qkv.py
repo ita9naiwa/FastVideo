@@ -203,7 +203,7 @@ class _RecordingImpl:
 @pytest.mark.parametrize("vsa", [False, True], ids=["dense", "vsa"])
 @pytest.mark.parametrize("sp,gate", [(1, False), (2, False), (1, True)], ids=["sp1", "sp2", "gate"])
 def test_route_selection(monkeypatch, vsa, sp, gate):
-    """SP=1 without gate/replicated input tiles q, k, v separately; SP>1 or a gate keeps the stacked route."""
+    """SP=1 (with or without a gate) tiles q, k, v (and the gate) separately; SP>1 keeps the stacked route."""
     if gate and not vsa:
         pytest.skip("gate_compress is VSA-only")
     monkeypatch.setattr(layer, "get_sp_world_size", lambda: sp)
@@ -217,9 +217,9 @@ def test_route_selection(monkeypatch, vsa, sp, gate):
         layer.DistributedAttention_VSA.forward(this, q, k, v, 8, gate_compress=torch.randn_like(q) if gate else None)
     else:
         layer.DistributedAttention.forward(this, q, k, v, 8)
-    separate = sp == 1 and not gate
+    separate = sp == 1
     assert ("preprocess_q_k_v" in impl.calls) == separate
-    assert ("preprocess_qkv" in impl.calls) != separate
+    assert ("preprocess_qkv" in impl.calls) == (not separate or gate)  # a separate gate: single-operand tile
     assert ("forward_qkv" in impl.calls) == (vsa and not separate and not gate)  # VSA stacked no-gate: fused-QKV input
 
 

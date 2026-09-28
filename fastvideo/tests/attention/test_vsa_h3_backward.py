@@ -263,3 +263,36 @@ def test_h3_query_pad_compiled_fullgraph_prunes_like_eager(monkeypatch) -> None:
                 torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
             else:
                 torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize("tile", [128, 256])
+def test_coarse_branch_original_chain_and_region(tile: int) -> None:
+    """Eager _coarse_branch is the original VSA chain (ruling 117c: fp32 tile means rounded to bf16, then bf16 scores,
+    softmax and @v) bitwise; the compiled region for eager callers matches it within bf16 rounding, fwd and bwd."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from fastvideo.attention.backends import video_sparse_attn_h3 as h3
+    torch.manual_seed(0)
+    n, heads, dim = 11, 2, _DIM
+    sizes = torch.full((n, ), float(tile), device="cuda")
+    sizes[-1] = tile // 2
+    xs = [torch.randn(1, n * tile, heads, dim, device="cuda", dtype=torch.bfloat16) for _ in range(5)]
+    for x in xs[1:4]:
+        x[:, -(tile // 2):] = 0  # tile buffers keep pad rows zero
+    up = torch.randn_like(xs[0])
+
+    def run(fn):
+        ins = [x.clone().requires_grad_() for x in xs]
+        out = fn(*ins, sizes, tile)
+        return [out.detach(), *torch.autograd.grad(out, ins, up)]
+
+    def original(out, q, k, v, gate, vbs, tile):
+        q_c, k_c, v_c = (h3._pool_tiles(x, vbs, tile).to(x.dtype) for x in (q, k, v))
+        out_c = torch.softmax(q_c @ k_c.transpose(-2, -1) / dim**0.5, dim=-1) @ v_c
+        rows = (1, n, tile, heads, dim)
+        return (out.view(rows) + out_c.permute(0, 2, 1, 3).unsqueeze(2) * gate.view(rows)).view(out.shape)
+
+    eager, ref, region = run(h3._coarse_branch), run(original), run(h3._coarse_branch_eager_caller)
+    for name, e, r, c in zip(("out", "dout", "dq", "dk", "dv", "dgate"), eager, ref, region, strict=True):
+        torch.testing.assert_close(e, r, rtol=0, atol=0, msg=name)
+        torch.testing.assert_close(c, e, rtol=2e-2, atol=2e-3, msg=name)
