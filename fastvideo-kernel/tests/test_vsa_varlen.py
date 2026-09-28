@@ -74,7 +74,6 @@ def _run_varlen_test(
     h: int = 8,
     d: int = 64,
     topk: int = 2,
-    atol: float = 0.05,
     rtol: float = 0.02,
 ):
     """Core test: compare varlen vs per-sequence reference.
@@ -82,14 +81,12 @@ def _run_varlen_test(
     seq_configs: list of (num_q_blocks, num_kv_blocks) per sequence.
     """
     device = "cuda"
-    num_seqs = len(seq_configs)
 
     q_list = []
     k_list = []
     v_list = []
     block_masks = []
     vbs_list = []
-    q_vbs_list = []
     non_pad_q_list = []
     non_pad_kv_list = []
     q_nblocks_list = []
@@ -122,7 +119,6 @@ def _run_varlen_test(
         v_list.append(v)
         block_masks.append(mask)
         vbs_list.append(vbs_kv)
-        q_vbs_list.append(vbs_q)
         non_pad_q_list.append(npq)
         non_pad_kv_list.append(npkv)
         q_nblocks_list.append(nq)

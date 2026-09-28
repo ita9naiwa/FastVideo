@@ -12,7 +12,6 @@ from .test_vsa256_backward import _check, _GRAD_TOL
 def test_tail_backward_graph(monkeypatch, dim):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip('SM100 GPU required')
-    import inspect
     pytest.importorskip("flash_attn.cute.interface")
     if "_workspace" not in inspect.signature(adapter._load_fa4_cute()[3]).parameters:
         pytest.skip("FA4 backward workspace support required")
