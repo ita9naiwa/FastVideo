@@ -373,7 +373,7 @@ class MiniMaxH3VSAMetadata(AttentionMetadata):
     # tile-size chunks of the same cube-ordered tokens); see _h3_tile_geometry
     tile_layout: str = "cube"
     # Row permutation of the same geometry (partition order + padded non-pad slots). Training tiles
-    # through the shared _TilePermutation (gather + inverse-gather backward, invocation-owned output)
+    # through the vsa_tile_permute op pair (gather + inverse-gather backward, invocation-owned output)
     # instead of the index_put scatter into the builder buffer; see MiniMaxH3VSAImpl.tile.
     tile_partition_indices: torch.Tensor | None = None
     non_pad_index: torch.Tensor | None = None
@@ -691,6 +691,15 @@ def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> 
     return output[:, untile]
 
 
+def _trusted_tile_state(attn_metadata: MiniMaxH3VSAMetadata, rows: int) -> tuple | None:
+    """The builder-certified ``_tile_index_state`` if it still names this metadata's index tensors and covers ``rows``."""
+    state = getattr(attn_metadata, "_tile_index_state", None)
+    if (state is not None and state[0] is attn_metadata.tile_partition_indices
+            and state[2] is attn_metadata.non_pad_index and rows == state[0].numel()):
+        return state
+    return None
+
+
 def _sm100a_unavailable_reason(sm100a_mod: Any, query_bhsd: torch.Tensor, variable_block_sizes: torch.Tensor,
                                grad_mode: bool) -> str | None:
     """Why the opt-in data-center Blackwell route cannot run here, or None if it can.
@@ -852,30 +861,21 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         kernel_tiles = n_tiles + int(needs_sm100a_pair)
         target_shape = (x.shape[0], kernel_tiles * attn_metadata.tile_elems, x.shape[-2], x.shape[-1])
 
-        # Training and eager no-grad: gather into an invocation-owned buffer (autograd saves it in training; never the
-        # shared holder). The size threshold applies to eager training only; no-grad runs the op without autograd state.
-        state = getattr(attn_metadata, "_tile_index_state", None)
-        if (state is not None and (grad_mode or not compiling) and not needs_sm100a_pair and x.ndim == 4 and x.is_cuda
-                and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
-                and state[0].device == x.device and state[2].device == x.device
-                and (not grad_mode or compiling or x.numel() >= 2**25)
-                and x.shape[1] == state[0].numel() == state[2].numel()
-                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
-            # Opaque custom op (same key eager and compiled) around the shared _TilePermutation body; it re-checks the
-            # recorded index versions itself and falls back to a fresh untile scatter if they changed.
+        # Builder-certified indices: the opaque vsa_tile_permute_fwd op (re-checks the index versions itself) returns an
+        # invocation-owned buffer for training (size threshold: eager training only), eager no-grad BF16 CUDA rows, and
+        # compiled tile-128/256 inference (beats Inductor's gather). Otherwise compiled 128/256 inference scatters into a
+        # fresh buffer; the holder's identity/version bookkeeping below is eager-only Python state.
+        state = _trusted_tile_state(attn_metadata, x.shape[1])
+        compiled_nograd = compiling and not grad_mode and attn_metadata.tile_elems in (128, 256)
+        eager_eligible = (state is not None and (grad_mode or not compiling) and not needs_sm100a_pair and x.ndim == 4
+                          and x.is_cuda and x.dtype == torch.bfloat16 and (x.is_contiguous() or _tile_row_layout(x))
+                          and state[0].device == x.device and state[2].device == x.device
+                          and (not grad_mode or compiling or x.numel() >= 2**25) and x.shape[1] == state[2].numel())
+        if state is not None and (compiled_nograd or eager_eligible):
             return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, state[0], state[2],
-                                                                    attn_metadata.untile_combined_index,
-                                                                    target_shape[1], state[1], state[3])
-
-        if compiling and not grad_mode and attn_metadata.tile_elems in (128, 256):
-            # Compiled tile-256 inference: a fresh tensor the graph owns (the holder's identity/version bookkeeping
-            # below is eager-only Python state). With builder-certified indices, the opaque permutation op (row gather,
-            # pad rows zeroed by index) beats Inductor's generated gather; otherwise a fresh zero-padded scatter.
-            if (state is not None and state[0] is attn_metadata.tile_partition_indices
-                    and state[2] is attn_metadata.non_pad_index and x.shape[1] == state[0].numel()):
-                return torch.ops.fastvideo_kernel.vsa_tile_permute_fwd(x, state[0], state[2],
-                                                                       attn_metadata.untile_combined_index,
-                                                                       target_shape[1], state[1], state[3])
+                                                                   attn_metadata.untile_combined_index, target_shape[1],
+                                                                   state[1], state[3])
+        if compiled_nograd:
             return scatter_into_tile_buf(x, target_shape, attn_metadata.untile_combined_index, None)
 
         # ``untile_combined_index`` maps each packed row to a logical tile
@@ -934,8 +934,8 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         other call (untrusted metadata, the tile-64 sm100a pair, the fused VC route in eager or compiled mode, whose
         producer must see packed rows) concatenates and takes preprocess_qkv unchanged.
         """
-        state = getattr(attn_metadata, "_tile_index_state", None)
         n = attn_metadata.total_seq_length
+        state = _trusted_tile_state(attn_metadata, n)
         grad_mode = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
         compiling = torch.compiler.is_compiling()
         # No-grad exclusions: the odd tile-64 sm100a pair needs tile()'s extra zero tile; the fused VC route (eager, and
@@ -945,10 +945,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                   and not self._vc_fused_route(q, attn_metadata))
         if (state is not None and (grad_mode or nograd) and q.ndim == 4 and q.is_cuda and q.dtype == torch.bfloat16
                 and all(x.shape == q.shape and x.dtype == q.dtype and x.device == q.device and
-                        (x.is_contiguous() or _tile_row_layout(x)) for x in (q, k, v))
-                and q.shape[1] == n == state[0].numel() == state[2].numel() and state[0].device == q.device
-                and state[2].device == q.device and (not grad_mode or compiling or 3 * q.numel() >= 2**25)
-                and state[0] is attn_metadata.tile_partition_indices and state[2] is attn_metadata.non_pad_index):
+                        (x.is_contiguous() or _tile_row_layout(x))
+                        for x in (q, k, v)) and q.shape[1] == n == state[2].numel() and state[0].device == q.device
+                and state[2].device == q.device and (not grad_mode or compiling or 3 * q.numel() >= 2**25)):
             padded = attn_metadata.variable_block_sizes.numel() * attn_metadata.tile_elems
             return torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd(q, k, v, state[0], state[2],
                                                                        attn_metadata.untile_combined_index, padded,
