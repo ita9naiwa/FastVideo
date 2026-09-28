@@ -191,10 +191,10 @@ class _RecordingImpl:
         if name not in ("preprocess_q_k_v", "preprocess_qkv", "forward", "forward_qkv", "postprocess_output"):
             raise AttributeError(name)
 
-        def record(*args):
+        def record(*args, tile_sums=None):
             self.calls.append(name)
             if name == "preprocess_q_k_v":
-                return args[:3]
+                return (*args[:3], None) if tile_sums else args[:3]
             return args[0][:1] if name == "forward_qkv" else args[0]
 
         return record
@@ -343,3 +343,37 @@ def test_vc_route_separate_qkv_feeds_packed_rows(request, monkeypatch, case):
         assert torch.equal(fn(q, k, v), stacked), mode
         assert len(calls) == len(seen) == 1, mode
         assert all(torch.equal(x, y) for x, y in zip(seen[0], (q, k, v), strict=True)), mode
+
+
+def _pooled_reference(impl, md, q, k, v, up, up_sums):
+    """The tiled q/k/v and their fp32 tile sums as the ungated gather + _pool_tiles's reduction, with their gradients."""
+    tiled = impl.preprocess_q_k_v(q, k, v, md)
+    n = md.variable_block_sizes.numel()
+    sums = torch.stack(
+        [x.view(1, n, md.tile_elems, *x.shape[2:]).sum(2, dtype=torch.float32).permute(0, 2, 1, 3) for x in tiled])
+    return tiled, sums, torch.autograd.grad((*tiled, sums), (q, k, v), (*up, up_sums))
+
+
+@pytest.mark.parametrize("tile", [128, 256])
+@pytest.mark.parametrize("untrusted", [False, True], ids=["trusted", "untrusted"])
+def test_tile_sums_gather_matches_pooling(tile, untrusted):
+    """Gated gather: the tiled outputs equal the ungated gather's, the fp32 sums equal _pool_tiles's sum, and the backward
+    equals autograd over both (bitwise)."""
+    impl, md = _impl(), _metadata(tile_size=tile, tile_layout=f"chunk{tile}", merge_prefix=True)
+    q, k, v = _qkv(md, seed=5)
+    n = md.variable_block_sizes.numel()
+    g = torch.Generator(device="cuda").manual_seed(6)
+    up = [torch.randn(1, n * tile, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g) for _ in range(3)]
+    up_sums = torch.randn(3, 1, 4, n, 128, device="cuda", generator=g) / tile
+    state = md._tile_index_state
+    if untrusted:
+        md._tile_index_state = (state[0], state[1] - 1, state[2], state[3])
+    try:
+        tiled, sums, grads = _pooled_reference(impl, md, q, k, v, up, up_sums)
+        *actual, actual_sums = impl.preprocess_q_k_v(q, k, v, md, tile_sums=True)
+        actual_grads = torch.autograd.grad((*actual, actual_sums), (q, k, v), (*up, up_sums))
+    finally:
+        md._tile_index_state = state
+    assert all(torch.equal(a, b) for a, b in zip(actual, tiled, strict=True))
+    assert actual_sums.shape == sums.shape and torch.equal(actual_sums, sums)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, grads, strict=True))

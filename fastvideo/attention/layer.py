@@ -72,8 +72,13 @@ def _forward_separate_qkv(attn_impl, q: torch.Tensor, k: torch.Tensor, v: torch.
         q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
         k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
     gate = tuple(g if g is None else attn_impl.preprocess_qkv(g[:, :original_seq_len], attn_metadata) for g in gate)
-    q, k, v = attn_impl.preprocess_q_k_v(q, k, v, attn_metadata)
-    output = attn_impl.forward(q, k, v, *gate, attn_metadata)
+    if gate and gate[0] is not None:
+        # The compression branch takes its tile means from the q/k/v gather (tile_sums) instead of re-reading q/k/v.
+        q, k, v, tile_sums = attn_impl.preprocess_q_k_v(q, k, v, attn_metadata, tile_sums=True)
+        output = attn_impl.forward(q, k, v, *gate, attn_metadata, tile_sums=tile_sums)
+    else:
+        q, k, v = attn_impl.preprocess_q_k_v(q, k, v, attn_metadata)
+        output = attn_impl.forward(q, k, v, *gate, attn_metadata)
     # Release the tiled q/k/v before postprocess_output allocates the untiled output: eager inference frees them here;
     # training keeps what autograd saved. Only after forward: the fused VC route reads the packed rows inside it.
     del q, k, v, gate

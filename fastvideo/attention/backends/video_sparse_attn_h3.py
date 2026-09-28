@@ -687,6 +687,29 @@ def _coarse_branch_eager_caller(out: torch.Tensor, query: torch.Tensor, key: tor
     return _coarse_branch_region()(*tensors, sizes, tile)
 
 
+def _coarse_branch_sums(out: torch.Tensor, tile_sums: torch.Tensor, gate: torch.Tensor,
+                        variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
+    """_coarse_branch from the gather's fp32 tile sums [3, B, H, n, D] (bitwise _pool_tiles's sums of the tiled q/k/v)."""
+    q_c, k_c, v_c = (_tile_means(s / variable_block_sizes.view(1, 1, -1, 1), out.dtype) for s in tile_sums)
+    return _add_compress(out, _coarse_scores(q_c, k_c), v_c, gate, variable_block_sizes.shape[0], tile)
+
+
+@functools.cache
+def _coarse_branch_sums_region():
+    """_coarse_branch_region for _coarse_branch_sums."""
+    return torch.compile(_coarse_branch_sums, dynamic=False, fullgraph=True, options={"emulate_precision_casts": True})
+
+
+def _coarse_branch_sums_eager_caller(out: torch.Tensor, tile_sums: torch.Tensor, gate: torch.Tensor,
+                                     variable_block_sizes: torch.Tensor, tile: int) -> torch.Tensor:
+    for x in (out, gate):
+        torch._dynamo.mark_dynamic(x, 1)
+    torch._dynamo.mark_dynamic(tile_sums, 3)
+    sizes = variable_block_sizes.view(-1)  # mark a fresh view, not the metadata tensor
+    torch._dynamo.mark_dynamic(sizes, 0)
+    return _coarse_branch_sums_region()(out, tile_sums, gate, sizes, tile)
+
+
 def _cute_backend() -> str:
     """fastvideo_kernel's tile-128/256 backend; imported at call time (fastvideo_kernel is optional)."""
     from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend as resolve_backend
@@ -920,8 +943,12 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             return qkv
         return self.tile(qkv, attn_metadata)
 
-    def preprocess_q_k_v(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                         attn_metadata: MiniMaxH3VSAMetadata) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def preprocess_q_k_v(self,
+                         q: torch.Tensor,
+                         k: torch.Tensor,
+                         v: torch.Tensor,
+                         attn_metadata: MiniMaxH3VSAMetadata,
+                         tile_sums: bool = False) -> tuple[torch.Tensor, ...]:
         """preprocess_qkv for callers holding separate q, k, v: equals preprocess_qkv(torch.cat([q, k, v])).chunk(3).
 
         Training calls and no-grad calls (eager and compiled) on trusted cube/chunk metadata gather each operand straight
@@ -930,6 +957,10 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         region that cat lowers to an Inductor pointwise kernel). The size threshold applies to eager training only. Every
         other call (untrusted metadata, the tile-64 sm100a pair, the fused VC route in eager or compiled mode, whose
         producer must see packed rows) concatenates and takes preprocess_qkv unchanged.
+
+        ``tile_sums=True`` (the gated caller) appends the fp32 per-tile sums [3, B, H, n_tiles, D] of the tiled q/k/v for
+        the compression branch, or None: training calls on the trusted gather get them from the same pass
+        (vsa_tile_permute_qkv_sums_fwd, whose backward folds their gradient into the row scatter).
         """
         n = attn_metadata.total_seq_length
         state = _trusted_tile_state(attn_metadata, n)
@@ -945,11 +976,18 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                         (x.is_contiguous() or _tile_row_layout(x))
                         for x in (q, k, v)) and q.shape[1] == n == state[2].numel() and state[0].device == q.device
                 and state[2].device == q.device and (not grad_mode or compiling or 3 * q.numel() >= 2**25)):
-            padded = attn_metadata.variable_block_sizes.numel() * attn_metadata.tile_elems
-            return torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd(q, k, v, state[0], state[2],
-                                                                       attn_metadata.untile_combined_index, padded,
-                                                                       state[1], state[3])
-        return self.preprocess_qkv(torch.cat([q, k, v], dim=0), attn_metadata).chunk(3, dim=0)
+            tile = attn_metadata.tile_elems
+            padded = attn_metadata.variable_block_sizes.numel() * tile
+            if tile_sums and grad_mode and tile % 16 == 0 and q.shape[-1] in (64, 128, 256):
+                return torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_sums_fwd(q, k, v, state[0], state[2],
+                                                                                attn_metadata.untile_combined_index,
+                                                                                padded, tile, state[1], state[3])
+            tiled = torch.ops.fastvideo_kernel.vsa_tile_permute_qkv_fwd(q, k, v, state[0], state[2],
+                                                                        attn_metadata.untile_combined_index, padded,
+                                                                        state[1], state[3])
+        else:
+            tiled = self.preprocess_qkv(torch.cat([q, k, v], dim=0), attn_metadata).chunk(3, dim=0)
+        return (*tiled, None) if tile_sums else tiled
 
     def _layer_sparsity(self, attn_metadata: MiniMaxH3VSAMetadata,
                         compiling: bool) -> tuple[float, torch.Tensor | None]:
@@ -1024,6 +1062,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         gate_compress: torch.Tensor | None,
         attn_metadata: MiniMaxH3VSAMetadata,
         qkv: torch.Tensor | None = None,
+        tile_sums: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._vc_fused_route(query, attn_metadata) and query.shape[1] == attn_metadata.total_seq_length:
             return self._vc_fused_forward(query, key, value, gate_compress, attn_metadata)
@@ -1084,9 +1123,22 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             if k_vid is None or (not compiling and k_vid != _video_topk(
                     layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)):
                 k_vid = _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)
-            mask = torch.ops.fastvideo_kernel.vsa_h3_block_map(
-                logical_query.detach(), logical_key.detach(), attn_metadata.variable_block_sizes, tile_elems,
-                attn_metadata.num_prefix_tiles, attn_metadata.num_video_tiles, k_vid, attn_metadata.exempt)
+            if (tile_sums is not None and attn_metadata.num_video_tiles == n_tiles - attn_metadata.num_prefix_tiles and
+                    k_vid == _video_topk(layer_sparsity, attn_metadata.num_video_tiles, attn_metadata.video_topk_cap)):
+                # The gather's sums are _pool_tiles's bitwise: the same block means, scores and map, without
+                # re-reading the tiled q/k.
+                pools = tile_sums[:2].detach() / attn_metadata.variable_block_sizes.view(1, 1, -1, 1)
+                mask = torch.ops.fastvideo_kernel.vsa_h3_block_map_from_pools(pools[0], pools[1],
+                                                                              attn_metadata.num_prefix_tiles,
+                                                                              layer_sparsity,
+                                                                              attn_metadata.video_topk_cap,
+                                                                              attn_metadata.exempt)
+            else:
+                mask = torch.ops.fastvideo_kernel.vsa_h3_block_map(logical_query.detach(), logical_key.detach(),
+                                                                   attn_metadata.variable_block_sizes, tile_elems,
+                                                                   attn_metadata.num_prefix_tiles,
+                                                                   attn_metadata.num_video_tiles, k_vid,
+                                                                   attn_metadata.exempt)
         else:  # dense layer: compute_topk(0, n) == n selects every tile
             mask = torch.ones(query.shape[0], query.shape[2], n_tiles, n_tiles, dtype=torch.bool, device=query.device)
         if force_dense is not None:
@@ -1248,6 +1300,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                 v_c = _tile_means(_pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems),
                                   value.dtype)
                 out = _add_compress(out, scores, v_c, logical_gate, n_tiles, tile_elems)
+            elif tile_sums is not None:
+                coarse_sums = _coarse_branch_sums if compiling else _coarse_branch_sums_eager_caller
+                out = coarse_sums(out, tile_sums, logical_gate, attn_metadata.variable_block_sizes, tile_elems)
             else:
                 coarse = _coarse_branch if compiling or not query.is_cuda else _coarse_branch_eager_caller
                 out = coarse(out, logical_query, logical_key, logical_value, logical_gate,

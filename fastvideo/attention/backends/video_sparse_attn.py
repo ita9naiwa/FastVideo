@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 try:
     from fastvideo_kernel import video_sparse_attn
@@ -370,6 +372,137 @@ def _tile_permute_qkv_backward(ctx, gq, gk, gv):
 
 
 vsa_tile_permute_qkv_fwd.register_autograd(_tile_permute_qkv_backward, setup_context=_tile_permute_qkv_setup_context)
+
+
+# The gated (compression-branch) training form of vsa_tile_permute_qkv_fwd: the same three tiled outputs plus the fp32
+# per-tile row sums [3, B, H, n_tiles, D] of each, from one Triton pass that reads each packed row once. The sums are
+# bitwise x.view(B, n, T, H, D).sum(2, dtype=torch.float32) of the tiled output (ATen's order for that reduction on
+# CUDA: row t goes to partial t % 16, s_y = ((p[y] + p[y+4]) + p[y+8]) + p[y+12], total (s0 + s2) + (s1 + s3)), so the
+# block means and the fine map equal _pool_tiles on the tiled operands. The backward adds each tile's sum gradient
+# (rounded to the input dtype, as the pooling backward is) to the gathered row gradient in the same pass, which is the
+# autograd sum of the two gradients the tiled operand used to receive.
+@triton.jit
+def _tile_gather_sum_kernel(x_ptr, out_ptr, sums_ptr, source_ptr, x_batch_stride, n_tiles, H: tl.constexpr,
+                            D: tl.constexpr, HB: tl.constexpr, T: tl.constexpr):
+    tile, hb, b = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    r = tl.arange(0, 16)
+    c = tl.arange(0, HB * D)
+    col = hb * HB * D + c
+    acc = tl.zeros((16, HB * D), dtype=tl.float32)
+    for t0 in range(0, T, 16):
+        slot = (tile * T + t0 + r).to(tl.int64)
+        src = tl.load(source_ptr + slot)  # packed row, -1 for a pad slot
+        rows = tl.load(x_ptr + b * x_batch_stride + src[:, None] * (H * D) + col[None, :],
+                       mask=src[:, None] >= 0,
+                       other=0.0)
+        tl.store(out_ptr + (b * n_tiles * T + slot)[:, None] * (H * D) + col[None, :], rows)
+        acc += rows.to(tl.float32)
+    # Exact extraction (every other addend is zero), then ATen's combine order.
+    acc = tl.reshape(acc, (4, 4, HB * D))  # [t // 4 % 4, t % 4, :]
+    a = tl.arange(0, 4)[:, None, None]
+    s = tl.sum(tl.where(a == 0, acc, 0.0), 0)
+    s = s + tl.sum(tl.where(a == 1, acc, 0.0), 0)
+    s = s + tl.sum(tl.where(a == 2, acc, 0.0), 0)
+    s = s + tl.sum(tl.where(a == 3, acc, 0.0), 0)
+    y = tl.arange(0, 4)[:, None]
+    total = (tl.sum(tl.where(y == 0, s, 0.0), 0) + tl.sum(tl.where(y == 2, s, 0.0), 0)) + (
+        tl.sum(tl.where(y == 1, s, 0.0), 0) + tl.sum(tl.where(y == 3, s, 0.0), 0))
+    head = hb * HB + c // D
+    tl.store(sums_ptr + ((b * H + head) * n_tiles + tile) * D + c % D, total)
+
+
+@triton.jit
+def _tile_scatter_sum_grad_kernel(g_ptr, gsum_ptr, out_ptr, index_ptr, rows_total, n_tiles, H: tl.constexpr,
+                                  D: tl.constexpr, HB: tl.constexpr, T: tl.constexpr, BR: tl.constexpr):
+    blk, hb, b = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    rows = blk.to(tl.int64) * BR + tl.arange(0, BR)
+    live = rows < rows_total
+    c = tl.arange(0, HB * D)
+    col = hb * HB * D + c
+    slot = tl.load(index_ptr + rows, mask=live, other=0)
+    g = tl.load(g_ptr + (b * n_tiles * T + slot)[:, None] * (H * D) + col[None, :], mask=live[:, None])
+    head = hb * HB + c // D
+    gs = tl.load(gsum_ptr + ((b * H + head[None, :]) * n_tiles + (slot // T)[:, None]) * D + (c % D)[None, :],
+                 mask=live[:, None])
+    grad = (g.to(tl.float32) + gs.to(g.dtype).to(tl.float32)).to(g.dtype)
+    tl.store(out_ptr + (b * rows_total + rows)[:, None] * (H * D) + col[None, :], grad, mask=live[:, None])
+
+
+def _heads_per_program(heads: int) -> int:
+    return 2 if heads % 2 == 0 else 1
+
+
+@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_qkv_sums_fwd", mutates_args=())
+def vsa_tile_permute_qkv_sums_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, partition: torch.Tensor,
+                                  nonpad: torch.Tensor, untile: torch.Tensor, padded_length: int, tile: int,
+                                  partition_version: int,
+                                  nonpad_version: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, _, heads, dim = q.shape
+    n_tiles = padded_length // tile
+    outs = tuple(x.new_empty((batch, padded_length, heads, dim)) for x in (q, k, v))
+    sums = q.new_empty((3, batch, heads, n_tiles, dim), dtype=torch.float32)
+    if partition._version == partition_version and nonpad._version == nonpad_version:
+        source = partition.new_full((padded_length, ), -1).index_copy_(0, nonpad, partition)
+        hb = _heads_per_program(heads)
+        for x, dst, s in zip((q, k, v), outs, sums, strict=True):
+            _tile_gather_sum_kernel[(n_tiles, heads // hb, batch)](x, dst, s, source, x.stride(0), n_tiles, heads, dim,
+                                                                   hb, tile)
+        return (*outs, sums)
+    for x, dst, s in zip((q, k, v), outs, sums, strict=True):
+        dst.zero_()
+        dst[:, untile] = x
+        s.copy_(dst.view(batch, n_tiles, tile, heads, dim).sum(dim=2, dtype=torch.float32).permute(0, 2, 1, 3))
+    return (*outs, sums)
+
+
+@vsa_tile_permute_qkv_sums_fwd.register_fake
+def _vsa_tile_permute_qkv_sums_fwd_fake(q, k, v, partition, nonpad, untile, padded_length, tile, partition_version,
+                                        nonpad_version):
+    outs = tuple(x.new_empty((x.shape[0], padded_length, *x.shape[2:])) for x in (q, k, v))
+    return (*outs, q.new_empty((3, q.shape[0], q.shape[2], padded_length // tile, q.shape[3]), dtype=torch.float32))
+
+
+@torch.library.custom_op("fastvideo_kernel::vsa_tile_permute_qkv_sums_bwd", mutates_args=())
+def vsa_tile_permute_qkv_sums_bwd(gq: torch.Tensor, gk: torch.Tensor, gv: torch.Tensor, gsums: torch.Tensor,
+                                  partition: torch.Tensor, nonpad: torch.Tensor, untile: torch.Tensor, tile: int,
+                                  partition_version: int,
+                                  nonpad_version: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if partition._version == partition_version and nonpad._version == nonpad_version:
+        index = partition.new_empty(partition.numel())
+        index.index_copy_(0, partition, nonpad)
+    else:
+        index = untile
+    batch, padded_length, heads, dim = gq.shape
+    rows = index.numel()
+    hb, br = _heads_per_program(heads), 16
+    outs = tuple(g.new_empty((batch, rows, heads, dim)) for g in (gq, gk, gv))
+    for g, s, dst in zip((gq, gk, gv), gsums, outs, strict=True):
+        _tile_scatter_sum_grad_kernel[(triton.cdiv(rows, br), heads // hb, batch)](g, s, dst, index, rows,
+                                                                                   padded_length // tile, heads, dim,
+                                                                                   hb, tile, br)
+    return outs
+
+
+@vsa_tile_permute_qkv_sums_bwd.register_fake
+def _vsa_tile_permute_qkv_sums_bwd_fake(gq, gk, gv, gsums, partition, nonpad, untile, tile, partition_version,
+                                        nonpad_version):
+    return tuple(g.new_empty((g.shape[0], untile.shape[0], *g.shape[2:])) for g in (gq, gk, gv))
+
+
+def _tile_permute_qkv_sums_setup_context(ctx, inputs, output):
+    ctx.save_for_backward(inputs[3], inputs[4], inputs[5])
+    ctx.tile, ctx.versions = inputs[7], (inputs[8], inputs[9])
+
+
+def _tile_permute_qkv_sums_backward(ctx, gq, gk, gv, gsums):
+    partition, nonpad, untile = ctx.saved_tensors
+    dq, dk, dv = vsa_tile_permute_qkv_sums_bwd(gq.contiguous(), gk.contiguous(), gv.contiguous(), gsums.contiguous(),
+                                               partition, nonpad, untile, ctx.tile, *ctx.versions)
+    return dq, dk, dv, None, None, None, None, None, None, None
+
+
+vsa_tile_permute_qkv_sums_fwd.register_autograd(_tile_permute_qkv_sums_backward,
+                                                setup_context=_tile_permute_qkv_sums_setup_context)
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
