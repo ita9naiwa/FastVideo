@@ -12,6 +12,7 @@ atomics (order may differ), so it is held to the suite-wide _GRAD_TOL.
 """
 import functools
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -800,7 +801,8 @@ def test_f5_vc_env_bypasses_training_op(monkeypatch):
 # F4 (conductor 31941): h3mh's exact per-block compile mode on the real H3 block across real-shape documents
 # ---------------------------------------------------------------------------------------------------------------------
 
-_SPEC_DIR = Path("/mnt/home/hyunsungl/space/vsa-vc-kernel-0926/init/h3-real-shape")
+# Directory holding the frozen H3 real-shape spec files below (sha256-pinned); the F4 cases skip when it is not set.
+_SPEC_DIR = os.environ.get("FASTVIDEO_H3_REAL_SHAPE_SPEC_DIR")
 _SPECS = {"h3-real-shape-spec-s085k32.json": "5fab7d309cc1a21d03ca72ba1ebd46d6a58396a0869dbaf422d3846af4584533",
           "h3-real-shape-spec.json": "f1c85686b55281e9cba8fcd09f8e4721875ae0d99a0d0452e3d093ff95a78b26",
           "h3-real-shape-spec-s050.json": "cd24cc2fcf0c1e606fab861c5fae9bed73cb385ef8f538abaaf164c922b7ad3e"}
@@ -824,7 +826,9 @@ def _real_docs(count, spec=None):
     for name, digest in _SPECS.items():
         if spec is not None and name != spec:
             continue
-        raw = (_SPEC_DIR / name).read_bytes()
+        if not _SPEC_DIR or not (Path(_SPEC_DIR) / name).is_file():
+            pytest.skip(f"set FASTVIDEO_H3_REAL_SHAPE_SPEC_DIR to the directory holding {name}")
+        raw = (Path(_SPEC_DIR) / name).read_bytes()
         assert hashlib.sha256(raw).hexdigest() == digest, name
         data = json.loads(raw)
         sparsity = float(data["attention"]["vsa"]["sparsity"])
@@ -975,19 +979,6 @@ def test_f1_cute_attention_ineligible_inputs_skip_the_op(monkeypatch, reach, cas
     grads = torch.autograd.grad(out, (q, k, v), dout)
     assert ops == 0 and reach["tail"] == []  # no op body ran; plain Q256 training autograd
     assert torch.isfinite(out).all() and all(torch.isfinite(g).all() for g in grads)
-
-
-def test_video_topk_integer_rule():
-    """The single host-int top-k: s085k32 == min((3n + 19) // 20, 32) for n = 1..300 (the cap binds from n = 207);
-    uncapped 0.75 / 0.5 equal the pre-existing compute_topk; 0.85 uncapped is (3n + 19) // 20 (no float overshoot)."""
-    from fastvideo.attention.backends.video_sparse_attn import compute_topk
-    from fastvideo.attention.backends.video_sparse_attn_h3 import _video_topk
-    for n in range(1, 301):
-        assert _video_topk(0.85, n, 32) == min((3 * n + 19) // 20, 32), n
-        assert _video_topk(0.85, n, None) == (3 * n + 19) // 20, n
-        for s in (0.75, 0.5):
-            assert _video_topk(s, n, None) == compute_topk(s, n), (s, n)
-    assert _video_topk(0.85, 206, 32) == 31 and _video_topk(0.85, 207, 32) == 32 and _video_topk(0.85, 300, 32) == 32
 
 
 

@@ -646,3 +646,16 @@ def test_compute_topk_is_exact(n_blocks):
     assert compute_topk(1e-9, n_blocks) == n_blocks
     for k in range(1, n_blocks + 1):  # the per-document midpoint encoding used to pin k through the sparsity
         assert compute_topk(1 - (k - 0.5) / n_blocks, n_blocks) == k
+
+
+def test_video_topk_integer_rule():
+    """The single host-int top-k: s085k32 == min((3n + 19) // 20, 32) for n = 1..300 (the cap binds from n = 207);
+    uncapped 0.75 / 0.5 equal the pre-existing compute_topk; 0.85 uncapped is (3n + 19) // 20 (no float overshoot)."""
+    from fastvideo.attention.backends.video_sparse_attn import compute_topk
+    from fastvideo.attention.backends.video_sparse_attn_h3 import _video_topk
+    for n in range(1, 301):
+        assert _video_topk(0.85, n, 32) == min((3 * n + 19) // 20, 32), n
+        assert _video_topk(0.85, n, None) == (3 * n + 19) // 20, n
+        for s in (0.75, 0.5):
+            assert _video_topk(s, n, None) == compute_topk(s, n), (s, n)
+    assert _video_topk(0.85, 206, 32) == 31 and _video_topk(0.85, 207, 32) == 32 and _video_topk(0.85, 300, 32) == 32
