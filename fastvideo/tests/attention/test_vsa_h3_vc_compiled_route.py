@@ -43,18 +43,18 @@ def h3(monkeypatch):
     torch._dynamo.reset()
 
 
-def _doc(h3, i, layout, seed=0, tile=256):
+def _doc(h3, i, layout, seed=0, tile=256, **build_kw):
     (t, hh, w), prefix = DOCS[i]
     layout_kw = dict(tile_layout=f"chunk{tile}", merge_prefix=True) if layout == "chunk" else {}
+    kw = dict(VSA_sparsity=0.85, topk_cap=32 if tile == 256 else 64, **layout_kw)
+    kw.update(build_kw)
     meta = h3.MiniMaxH3VSAMetadataBuilder().build(current_timestep=0,
                                                   raw_latent_shape=(t, 2 * hh, 2 * w),
                                                   patch_size=(1, 2, 2),
-                                                  VSA_sparsity=0.85,
                                                   prefix_segments=prefix,
                                                   device=torch.device("cuda"),
-                                                  topk_cap=32 if tile == 256 else 64,
                                                   tile_size=tile,
-                                                  **layout_kw)
+                                                  **kw)
     g = torch.Generator(device="cuda").manual_seed(100 * i + seed)
     qkv = torch.randn(3, meta.total_seq_length, HEADS, 128, device="cuda", dtype=torch.bfloat16, generator=g)
     return meta, qkv
@@ -196,6 +196,40 @@ def test_vc_route_tile128_vs_bf16(h3, monkeypatch, layout):
     sizes = torch.full((1, ), 64, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="tile must be 128 or 256"):
         torch.ops.fastvideo_kernel.vc_h3_prepare_fused(x, x, x, torch.arange(64, device="cuda"), sizes, 64)
+
+
+@pytest.mark.parametrize("tile", [256, 128])
+@torch.no_grad()
+def test_vc_dense_layer_sparsity0_and_gate(h3, tile):
+    """VC route with a dense layer, sparsity 0 and a gate: the dense layer (layer_idx in dense_layers eagerly, the
+    tensor-valued force_dense under fullgraph capture) equals sparsity 0 bitwise and differs from the sparse layer; a gate
+    adds exactly the pooled compression term of the producer's pools (compiled: within BF16 tolerance, since Inductor
+    fuses the combine without the intermediate BF16 roundings)."""
+    h3, _, impl, calls, _ = h3
+    sparse, qkv = _doc(h3, 1, "chunk", tile=tile)
+    dense, _ = _doc(h3, 1, "chunk", tile=tile, dense_layers=(impl.layer_idx, ))
+    zero, _ = _doc(h3, 1, "chunk", tile=tile, VSA_sparsity=0.0)
+    q, k, v = qkv.chunk(3, dim=0)
+
+    def fwd(meta, gate=None):
+        return impl.postprocess_output(impl.forward(q, k, v, gate, meta), meta)
+
+    compiled = torch.compile(fwd, backend="inductor", dynamic=True, fullgraph=True)
+    out_dense = fwd(dense)
+    assert torch.equal(out_dense, fwd(zero)) and not torch.equal(out_dense, fwd(sparse))
+    assert torch.equal(compiled(dense), out_dense)
+    gate = torch.randn_like(q)
+    sizes, untile = sparse.variable_block_sizes, sparse.untile_combined_index
+    tiled = impl.forward(q, k, v, None, sparse)
+    *_, pq, pk, pv = torch.ops.fastvideo_kernel.vc_h3_prepare_fused(q, k, v, untile, sizes, tile)
+    out_c = torch.softmax(pq @ pk.transpose(-2, -1) / q.shape[-1]**0.5, dim=-1) @ pv  # [B, H, n_tiles, D]
+    gate_tiled = torch.zeros_like(tiled)
+    gate_tiled[:, untile] = gate
+    expected = impl.postprocess_output(
+        tiled + out_c.permute(0, 2, 1, 3).to(tiled.dtype).repeat_interleave(tile, dim=1) * gate_tiled, sparse)
+    assert torch.equal(fwd(sparse, gate), expected)
+    torch.testing.assert_close(compiled(sparse, gate), expected, rtol=1.6e-2, atol=2e-3)  # a few BF16 ulps
+    assert len(calls) >= 6, "every call must take the fused VC route"
 
 
 def test_vc_route_unavailable_reason(monkeypatch):

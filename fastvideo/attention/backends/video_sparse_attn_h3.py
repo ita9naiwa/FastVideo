@@ -691,6 +691,19 @@ def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> 
     return output[:, untile]
 
 
+def _add_compress(out: torch.Tensor, scores: torch.Tensor, v_pooled: torch.Tensor, gate: torch.Tensor, n_tiles: int,
+                  tile: int) -> torch.Tensor:
+    """Wan-style compression branch: dense attention over pooled tiles, broadcast to each tile's rows, scaled by the tiled
+    gate. Out-of-place: on the CuTe backend ``out`` is the tensor FA4's autograd node saved for its backward, so an
+    in-place add would bump its version counter and backward dies with "one of the variables needed for gradient
+    computation has been modified"."""
+    out_c = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)  # [B, H, n_tiles, D]
+    out_c = out_c.permute(0, 2, 1, 3).to(out.dtype)  # [B, n_tiles, H, D]
+    batch, seq_len, heads, dim = out.shape
+    return (out.view(batch, n_tiles, tile, heads, dim) +
+            out_c.unsqueeze(2) * gate.view(batch, n_tiles, tile, heads, dim)).view(batch, seq_len, heads, dim)
+
+
 def _cute_backend() -> str:
     """fastvideo_kernel's tile-128/256 backend; imported at call time (fastvideo_kernel is optional)."""
     from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend as resolve_backend
@@ -958,6 +971,15 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                                                                        state[1], state[3])
         return self.preprocess_qkv(torch.cat([q, k, v], dim=0), attn_metadata).chunk(3, dim=0)
 
+    def _layer_sparsity(self, attn_metadata: MiniMaxH3VSAMetadata,
+                        compiling: bool) -> tuple[float, torch.Tensor | None]:
+        """(layer sparsity, force_dense). Probe-guided dense layers run with an all-True mask. Under a prepared capture the
+        decision is tensor-valued (force_dense, OR-ed into the mask) so every block instance reuses one graph instead of
+        specializing on the Python layer_idx; eager reads layer_idx."""
+        if compiling and self._compile_layer_idx is not None:
+            return attn_metadata.VSA_sparsity, (attn_metadata.dense_layers_tensor == self._compile_layer_idx).any()
+        return (0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity), None
+
     def _vc_fused_forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                           gate_compress: torch.Tensor | None, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
         """Fused VC route: one producer pass from packed rows to padded FP8 Q/K/V plus FP32 tile pools.
@@ -979,13 +1001,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         untile = attn_metadata.untile_combined_index
         q8, k8, v8, qs, ks, vs, *pools = torch.ops.fastvideo_kernel.vc_h3_prepare_fused(
             query, key, value, untile, sizes, tile)
-        # Dense-layer decision: tensor-valued under capture (one graph for every layer), as in forward().
-        force_dense = None
-        if torch.compiler.is_compiling() and self._compile_layer_idx is not None:
-            force_dense = (attn_metadata.dense_layers_tensor == self._compile_layer_idx).any()
-            layer_sparsity = attn_metadata.VSA_sparsity
-        else:
-            layer_sparsity = 0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity
+        layer_sparsity, force_dense = self._layer_sparsity(attn_metadata, torch.compiler.is_compiling())
         if layer_sparsity > 0.0:
             mask = torch.ops.fastvideo_kernel.vsa_h3_block_map_from_pools(pools[0], pools[1],
                                                                           attn_metadata.num_prefix_tiles,
@@ -999,12 +1015,10 @@ class MiniMaxH3VSAImpl(AttentionImpl):
                                                              attn_metadata.alias_guard_hint)
         if gate_compress is not None:
             scores = torch.matmul(pools[0], pools[1].transpose(-2, -1)) / (query.shape[-1]**0.5)
-            out_c = torch.matmul(torch.softmax(scores, dim=-1), pools[2]).permute(0, 2, 1, 3).to(out.dtype)
             batch, _, heads, dim = out.shape
             gate = gate_compress.new_zeros(batch, padded, heads, dim)
             gate[:, untile] = gate_compress
-            out = (out.view(batch, n_tiles, tile, heads, dim) +
-                   out_c.unsqueeze(2) * gate.view(batch, n_tiles, tile, heads, dim)).view(batch, padded, heads, dim)
+            out = _add_compress(out, scores, pools[2], gate, n_tiles, tile)
         return out
 
     def postprocess_output(self, output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
@@ -1073,18 +1087,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         logical_value = value[:, :logical_seq_len]
         logical_gate = gate_compress[:, :logical_seq_len] if gate_compress is not None else None
 
-        # Probe-guided per-layer opt-out: diffuse layers run dense (all-True
-        # mask) while the rest keep the configured sparsity. During any
-        # prepared capture, keep the layer decision tensor-valued so the 50
-        # block instances reuse one graph instead of specializing on the
-        # Python layer_idx attribute.
-        force_dense = None
-        compile_layer_idx = self._compile_layer_idx if compiling else None
-        if compile_layer_idx is not None:
-            force_dense = (attn_metadata.dense_layers_tensor == compile_layer_idx).any()
-            layer_sparsity = attn_metadata.VSA_sparsity
-        else:
-            layer_sparsity = 0.0 if self.layer_idx in attn_metadata.dense_layers else attn_metadata.VSA_sparsity
+        layer_sparsity, force_dense = self._layer_sparsity(attn_metadata, compiling)
         probe_dir = None if compiling else probe_enabled()
 
         scores = None
@@ -1262,21 +1265,9 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             )
 
         if logical_gate is not None:
-            # Wan-style compression branch: dense attention over pooled tiles,
-            # broadcast to each tile's rows, scaled by the learned gate
-            # (zero-initialized for H3 => branch contributes nothing until
-            # finetuned; the model layer skips it entirely for all-zero gates).
+            # The gate is zero-initialized for H3 (no contribution until finetuned; the model layer skips all-zero gates).
             v_pooled = _pool_tiles(logical_value, attn_metadata.variable_block_sizes, tile_elems)
-            out_c = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)  # [B, H, n_tiles, D]
-            out_c = out_c.permute(0, 2, 1, 3).to(out.dtype)  # [B, n_tiles, H, D]
-            batch, seq_len, heads, dim = out.shape
-            # Out-of-place: on the CuTe backend ``out`` is the tensor FA4's
-            # autograd node saved for its backward, so an in-place add here
-            # bumps its version counter and backward dies with "one of the
-            # variables needed for gradient computation has been modified".
-            out_tiled = out.view(batch, n_tiles, tile_elems, heads, dim)
-            gate_tiled = logical_gate.view(batch, n_tiles, tile_elems, heads, dim)
-            out = (out_tiled + out_c.unsqueeze(2) * gate_tiled).view(batch, seq_len, heads, dim)
+            out = _add_compress(out, scores, v_pooled, logical_gate, n_tiles, tile_elems)
         if query_sizes is not None:
             # Pin the trusted map (and its builder-recorded version) for postprocess_output. The pin is set in
             # traced caller code on a view: Dynamo rejects setattr on a custom op's tuple output element.
