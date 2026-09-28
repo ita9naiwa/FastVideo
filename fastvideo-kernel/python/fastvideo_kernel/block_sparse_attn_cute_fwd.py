@@ -568,8 +568,8 @@ def _vc_physical_sizes(sizes, block_size):
 
 def _vc_sparse_tensors(block_map, sizes, q_len, q_block_size, kv_block_size):
     if kv_block_size == 256:
-        block_map = block_map.repeat_interleave(2, -1)
-        sizes = _vc_physical_sizes(sizes, kv_block_size)
+        from fastvideo_kernel.block_sparse_attn_256 import _expand_mask_and_sizes_256_to_128
+        block_map, sizes = _expand_mask_and_sizes_256_to_128(block_map, sizes)
     sparse, _ = _build_sparse_tensors(
         block_map, sizes, q_len=q_len, q_block_size=q_block_size,
         kv_block_size=128, need_backward=False, force_q_sparse_block_size=q_block_size,
