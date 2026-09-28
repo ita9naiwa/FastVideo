@@ -1,10 +1,14 @@
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
-from fastvideo_kernel.block_sparse_attn_cute_fwd import _SingleQStageLength
-from flash_attn.cute import interface, utils
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+# Optional CuTe DSL / VC-enabled FA4 stack: skip this module (not the whole collection) when it is absent.
+cutlass = pytest.importorskip("cutlass")
+cute = pytest.importorskip("cutlass.cute")
+interface = pytest.importorskip("flash_attn.cute.interface")
+utils = pytest.importorskip("flash_attn.cute.utils")
+BlockSparseTensorsTorch = pytest.importorskip("flash_attn.cute.block_sparsity").BlockSparseTensorsTorch
+
+from fastvideo_kernel.block_sparse_attn_cute_fwd import _SingleQStageLength  # noqa: E402
 
 
 @cute.jit

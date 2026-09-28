@@ -4,6 +4,8 @@ import torch
 
 from fastvideo_kernel.triton_kernels.index import map_to_index
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
 
 def reference(mask):
     n = mask.shape[-1]
