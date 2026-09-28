@@ -60,20 +60,23 @@ def _maybe_compiler_disable(fn):
 def _forward_separate_qkv(attn_impl, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, original_seq_len: int,
                           freqs_cis: tuple[torch.Tensor, torch.Tensor] | None, attn_metadata, *gate:
                           None) -> tuple[torch.Tensor, None]:
-    """SP=1 path with no all-to-all to feed: the backend tiles q, k, v from their own tensors (no stacked copy of Q/K/V).
+    """SP=1 path with no all-to-all to feed: the backend tiles q, k, v (and a gate) from their own tensors, so no stacked
+    [3B|4B, S, H, D] copy is made.
 
-    ``gate`` is forwarded positionally ahead of the metadata (the VSA layer passes ``None``)."""
+    ``gate`` is forwarded positionally ahead of the metadata (the VSA layer passes one, possibly ``None``; the plain layer
+    none). A gate takes the backend's single-operand preprocess_qkv (the same row map as the stacked tile)."""
     pad_seq_len = q.shape[1] - original_seq_len
     q, k, v = (x[:, :original_seq_len] for x in (q, k, v))
     if freqs_cis is not None:
         cos, sin = freqs_cis
         q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
         k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+    gate = tuple(g if g is None else attn_impl.preprocess_qkv(g[:, :original_seq_len], attn_metadata) for g in gate)
     q, k, v = attn_impl.preprocess_q_k_v(q, k, v, attn_metadata)
     output = attn_impl.forward(q, k, v, *gate, attn_metadata)
     # Release the tiled q/k/v before postprocess_output allocates the untiled output: eager inference frees them here;
     # training keeps what autograd saved. Only after forward: the fused VC route reads the packed rows inside it.
-    del q, k, v
+    del q, k, v, gate
     output = attn_impl.postprocess_output(output, attn_metadata)
     return torch.nn.functional.pad(output, (0, 0, 0, 0, 0, pad_seq_len)), None
 
@@ -261,10 +264,10 @@ class DistributedAttention_VSA(DistributedAttention):
         ctx_attn_metadata = forward_context.attn_metadata
 
         batch_size, seq_len, num_heads, head_dim = q.shape
-        # Stack QKV (a caller with a structurally-zero gate passes None and
-        # skips the gate's share of the all-to-all/tile traffic)
-        if gate_compress is None and get_sp_world_size() == 1 and hasattr(self.attn_impl, "preprocess_q_k_v"):
-            return _forward_separate_qkv(self.attn_impl, q, k, v, original_seq_len, freqs_cis, ctx_attn_metadata, None)
+        # SP=1: no all-to-all to feed, so skip the stacked copy (a caller with a structurally-zero gate passes None)
+        if get_sp_world_size() == 1 and hasattr(self.attn_impl, "preprocess_q_k_v"):
+            return _forward_separate_qkv(self.attn_impl, q, k, v, original_seq_len, freqs_cis, ctx_attn_metadata,
+                                         gate_compress)
 
         stack = [q, k, v] if gate_compress is None else [q, k, v, gate_compress]
         qkvg = torch.cat(stack, dim=0)  # [3or4*batch, seq_len, num_heads, head_dim]
