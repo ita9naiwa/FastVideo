@@ -50,23 +50,20 @@ def _resolve_backend() -> str:
     return "triton"
 
 
-def _expand_mask_and_sizes_128_to_64(
-    logical_mask_128: torch.Tensor,
-    logical_kv_sizes_128: torch.Tensor,
+def _expand_mask_and_sizes_to_64(
+    logical_mask: torch.Tensor,
+    logical_kv_sizes: torch.Tensor,
+    factor: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Expand a [B, H, Qb128, KVb128] map to 64-token Triton tiles."""
-    expanded_mask = logical_mask_128.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
-    sizes_i32 = logical_kv_sizes_128.to(torch.int32)
-    offsets = torch.tensor(
-        [0, _KV_BLOCK_TRITON],
-        dtype=torch.int32,
-        device=sizes_i32.device,
-    )
-    expanded_sizes = torch.clamp(
-        sizes_i32[:, None] - offsets[None, :],
-        min=0,
-        max=_KV_BLOCK_TRITON,
-    ).reshape(-1)
+    """Expand a [B, H, Qb, KVb] map of (64 * factor)-token blocks to 64-token Triton tiles (route A).
+
+    Each logical edge becomes a factor x factor block of edges; each 64-token child's valid count is the
+    logical count clamped into the child's window.
+    """
+    expanded_mask = logical_mask.repeat_interleave(factor, dim=2).repeat_interleave(factor, dim=3)
+    sizes_i32 = logical_kv_sizes.to(torch.int32)
+    offsets = torch.arange(0, factor * _KV_BLOCK_TRITON, _KV_BLOCK_TRITON, dtype=torch.int32, device=sizes_i32.device)
+    expanded_sizes = torch.clamp(sizes_i32[:, None] - offsets[None, :], min=0, max=_KV_BLOCK_TRITON).reshape(-1)
     return expanded_mask, expanded_sizes
 
 
@@ -95,56 +92,32 @@ def _expand_mask_and_sizes_256_to_128(
     return expanded_mask, expanded_sizes
 
 
-def _expand_mask_and_sizes_256_to_64(
-    logical_mask_256: torch.Tensor,
-    logical_kv_sizes_256: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Expand a [B, H, Qb256, KVb256] map to [B, H, Qb64, KVb64] (route A).
-
-    Each logical 256-token tile splits 4-ways along both Q and KV. Sizes
-    are computed by chopping the logical count into 64-token strides.
-    """
-    expanded_mask = logical_mask_256.repeat_interleave(4, dim=2).repeat_interleave(4, dim=3)
-    sizes_i32 = logical_kv_sizes_256.to(torch.int32)
-    offsets = torch.tensor(
-        [0, _KV_BLOCK_TRITON, 2 * _KV_BLOCK_TRITON, 3 * _KV_BLOCK_TRITON],
-        dtype=torch.int32,
-        device=sizes_i32.device,
-    )
-    expanded_sizes = torch.clamp(
-        sizes_i32[:, None] - offsets[None, :],
-        min=0,
-        max=_KV_BLOCK_TRITON,
-    ).reshape(-1)
-    return expanded_mask, expanded_sizes
-
-
 def _triton_via_route_a(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    logical_mask_256: torch.Tensor,
-    logical_kv_sizes_256: torch.Tensor,
+    logical_mask: torch.Tensor,
+    logical_kv_sizes: torch.Tensor,
+    block: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton fallback for [B, H, S, D] inputs: expand the ``block``-token map to 64-token tiles and run the kernel."""
     from .triton_kernels.index import map_to_index as triton_map_to_index
 
-    mask_64, sizes_64 = _expand_mask_and_sizes_256_to_64(logical_mask_256, logical_kv_sizes_256)
+    mask_64, sizes_64 = _expand_mask_and_sizes_to_64(logical_mask, logical_kv_sizes, block // _KV_BLOCK_TRITON)
     q2k_idx, q2k_num = triton_map_to_index(mask_64.to(torch.bool))
     return block_sparse_attn_triton(q, k, v, q2k_idx, q2k_num, sizes_64)
 
 
-def _triton_via_route_a_128(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    logical_mask_128: torch.Tensor,
-    logical_kv_sizes_128: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    from .triton_kernels.index import map_to_index as triton_map_to_index
+def _triton_via_route_a_bshd(q, k, v, logical_mask, logical_kv_sizes, block):
+    """The Triton fallback for [B, S, H, D] inputs (the kernel takes BHSD)."""
+    out_bhsd, aux = _triton_via_route_a(*(t.transpose(1, 2).contiguous() for t in (q, k, v)), logical_mask,
+                                        logical_kv_sizes, block)
+    return out_bhsd.transpose(1, 2).contiguous(), aux
 
-    mask_64, sizes_64 = _expand_mask_and_sizes_128_to_64(logical_mask_128, logical_kv_sizes_128)
-    q2k_idx, q2k_num = triton_map_to_index(mask_64.to(torch.bool))
-    return block_sparse_attn_triton(q, k, v, q2k_idx, q2k_num, sizes_64)
+
+def _batched(block_map: torch.Tensor) -> torch.Tensor:
+    """Accept a single [H, Qb, KVb] map as batch 1."""
+    return block_map.unsqueeze(0) if block_map.dim() == 3 else block_map
 
 
 def _hint_kwargs(alias_guard):
@@ -162,11 +135,9 @@ def block_sparse_attn_128(
     alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-128 sparse-branch entrypoint for [B, H, S, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
-    if logical_block_map_128.dim() == 3:
-        logical_block_map_128 = logical_block_map_128.unsqueeze(0)
-
+    logical_block_map_128 = _batched(logical_block_map_128)
     if _resolve_backend() == "triton":
-        return _triton_via_route_a_128(q, k, v, logical_block_map_128, logical_variable_block_sizes_128)
+        return _triton_via_route_a(q, k, v, logical_block_map_128, logical_variable_block_sizes_128, 128)
 
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd
     return block_sparse_attn_cute_fwd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128,
@@ -183,18 +154,9 @@ def block_sparse_attn_128_bshd(
     alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-128 sparse-branch entrypoint for [B, S, H, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
-    if logical_block_map_128.dim() == 3:
-        logical_block_map_128 = logical_block_map_128.unsqueeze(0)
-
+    logical_block_map_128 = _batched(logical_block_map_128)
     if _resolve_backend() == "triton":
-        out_bhsd, aux = _triton_via_route_a_128(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-            logical_block_map_128,
-            logical_variable_block_sizes_128,
-        )
-        return out_bhsd.transpose(1, 2).contiguous(), aux
+        return _triton_via_route_a_bshd(q, k, v, logical_block_map_128, logical_variable_block_sizes_128, 128)
 
     # Native BF16 Q128: the tile-parameterized opaque ops (same op in eager and compiled mode, fullgraph-safe).
     hint = () if alias_guard is None else (
@@ -219,11 +181,9 @@ def block_sparse_attn_256(
     alias_guard=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """VSA-256 sparse-branch entrypoint for [B, H, S, D] inputs (``alias_guard`` as block_sparse_attn_256_bshd)."""
-    if logical_block_map_256.dim() == 3:
-        logical_block_map_256 = logical_block_map_256.unsqueeze(0)
-
+    logical_block_map_256 = _batched(logical_block_map_256)
     if _resolve_backend() == "triton":
-        return _triton_via_route_a(q, k, v, logical_block_map_256, logical_variable_block_sizes_256)
+        return _triton_via_route_a(q, k, v, logical_block_map_256, logical_variable_block_sizes_256, 256)
 
     mask_128, sizes_128 = _expand_mask_and_sizes_256_to_128(logical_block_map_256, logical_variable_block_sizes_256)
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd
@@ -260,18 +220,9 @@ def block_sparse_attn_256_bshd(
     ``qkv`` (optional, the contiguous ``[3B, S, H, D]`` tensor that q/k/v are
     dim-0 chunks of) lets native training return one fused gradient; other routes ignore it.
     """
-    if logical_block_map_256.dim() == 3:
-        logical_block_map_256 = logical_block_map_256.unsqueeze(0)
-
+    logical_block_map_256 = _batched(logical_block_map_256)
     if _resolve_backend() == "triton":
-        out_bhsd, aux = _triton_via_route_a(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-            logical_block_map_256,
-            logical_variable_block_sizes_256,
-        )
-        return out_bhsd.transpose(1, 2).contiguous(), aux
+        return _triton_via_route_a_bshd(q, k, v, logical_block_map_256, logical_variable_block_sizes_256, 256)
 
     from .block_sparse_attn_cute_fwd import block_sparse_attn_cute_fwd_bshd
     if vsa256_ops.training_eligible(q, k, v, logical_block_map_256):
