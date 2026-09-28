@@ -691,6 +691,12 @@ def vsa_h3_untile(output: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> 
     return output[:, untile]
 
 
+def _cute_backend() -> str:
+    """fastvideo_kernel's tile-128/256 backend; imported at call time (fastvideo_kernel is optional)."""
+    from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend as resolve_backend
+    return resolve_backend()
+
+
 def _trusted_tile_state(attn_metadata: MiniMaxH3VSAMetadata, rows: int) -> tuple | None:
     """The builder-certified ``_tile_index_state`` if it still names this metadata's index tensors and covers ``rows``."""
     state = getattr(attn_metadata, "_tile_index_state", None)
@@ -813,8 +819,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         FASTVIDEO_VSA_VC=1 when the fused VC ops can run: head 128, probe off, VC-enabled FA4 checkout importable."""
         if block_sparse_attn_256_bshd is None or device.type != "cuda":
             return None
-        from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
-        if _resolve_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
+        if _cute_backend() != "cutedsl" or torch.cuda.get_device_capability(device)[0] != 10:
             return None
         vc = os.environ.get("FASTVIDEO_VSA_VC", "0") == "1"
         # "vc" covers tiles 128 and 256 (_vc_fused_route; the vc_h3_* ops take the tile as a parameter).
@@ -851,7 +856,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         compiling = torch.compiler.is_compiling()
         regional_compiling = compiling and self._regional_compile_sm100a_enabled is True
         if regional_compiling:
-            sm100a_requested = bool(self._regional_compile_sm100a_enabled)
+            sm100a_requested = True
         elif compiling:
             # Training/generic compile keeps the long-standing Triton route.
             sm100a_requested = False
@@ -913,8 +918,7 @@ class MiniMaxH3VSAImpl(AttentionImpl):
         if (os.environ.get("FASTVIDEO_VSA_VC", "0") != "1" or not os.environ.get("FASTVIDEO_VSA_VC_ROOT")
                 or block_sparse_attn_256_bshd is None):
             return False
-        from fastvideo_kernel.block_sparse_attn_256 import _resolve_backend
-        return (_resolve_backend() == "cutedsl" and torch.cuda.get_device_capability(x.device)[0] == 10
+        return (_cute_backend() == "cutedsl" and torch.cuda.get_device_capability(x.device)[0] == 10
                 and probe_enabled() is None)
 
     def preprocess_qkv(self, qkv: torch.Tensor, attn_metadata: MiniMaxH3VSAMetadata) -> torch.Tensor:
@@ -1140,16 +1144,12 @@ class MiniMaxH3VSAImpl(AttentionImpl):
             grad_mode = torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad)
             use_sm100a = False
             if regional_compiling:
-                if self._regional_compile_sm100a_enabled is None:
-                    raise RuntimeError(
-                        "VSA-H3 sm_100a routing was not resolved before torch.compile; "
-                        "call prepare_for_regional_compile(device) on every MiniMaxH3VSAImpl after loading weights.")
                 # The preparation probe established module/device/kernel
                 # support.  Keep only static tensor/geometry facts here; no
                 # env access, device-capability query, or is_supported call may
                 # enter the Dynamo graph.
-                if not (self._regional_compile_sm100a_enabled and not grad_mode and q_bhsd.dtype == torch.bfloat16
-                        and q_bhsd.shape[-1] == 128 and sm100a_variable_block_sizes.numel() % 2 == 0):
+                if not (not grad_mode and q_bhsd.dtype == torch.bfloat16 and q_bhsd.shape[-1] == 128
+                        and sm100a_variable_block_sizes.numel() % 2 == 0):
                     raise RuntimeError(
                         "VSA-H3 regional fullgraph compile requires the prepared sm_100a BF16/head-128 route "
                         "on a supported device; disable inference_torch_compile for this request.")
